@@ -1,0 +1,66 @@
+# Case 1 smoke configuration.
+#
+# Deliberately tiny. Its purpose is to prove the plumbing end to end in under a
+# minute: config loads, run directory appears, metrics are written, crash
+# capture is armed. It is not a meaningful experiment and its numbers mean
+# nothing.
+#
+# Values marked PENDING below are placeholders awaiting a decision and are
+# printed as such at startup. See CONFIG.md.
+
+objective: case1
+tag: smoke
+
+dataset:
+  name: imagenet-100
+  root: ""                       # PENDING: dataset path on machine
+  source_url: ""                 # PENDING: which published subset
+  split: train
+  eval_split: val
+
+models:
+  a:
+    name: vit_base_patch16_224
+    pretrained: false            # random weights; the smoke run measures nothing
+    label: A
+  b: null                        # case 1 reads one model
+
+layer_pairs:
+  count: 3
+  matched_depth_only: true
+
+sweep:
+  metric: explained_variance
+  fit_tokens: 50000
+  out_file: sweeps/layer_sweep_smoke.json
+
+coder:
+  expansion: 8
+  sparsity:
+    mode: l1
+    coeff: 1e-3
+    normalize_decoder: true
+  dead_features:
+    track_window: 1000
+
+activations:
+  mode: on_the_fly
+  layers: ["A@blocks.6"]
+  extraction_batch_size: 32
+
+train:
+  tokens: 400000                 # smoke only; the real budget is PENDING
+  token_batch: 4096
+  lr: 1e-4
+  seed: 0
+  device: cpu                    # so the smoke run works anywhere
+  dtype: float32                 # float16 on CPU is slow and partly unsupported
+  log_every: 10
+  eval_every: 50
+  checkpoint_every: 1000
+
+logging:
+  backend: jsonl
+  run_root: runs
+  level: INFO
+  csv_mirror: true

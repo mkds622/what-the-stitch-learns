@@ -11,3 +11,11 @@ activations/
 mlruns/
 .ipynb_checkpoints/
 .DS_Store
+
+runs/
+crashes/
+mlruns/
+sweeps/
+__pycache__/
+*.pyc
+.pytest_cache/
