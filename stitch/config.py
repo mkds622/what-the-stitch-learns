@@ -52,6 +52,8 @@ class DatasetConfig:
     eval_split: str = "val"
     num_classes: int | None = None    # filled from the dataset when left unset
     notes: str = ""                   # e.g. which published ImageNet-100 subset
+    num_workers: int = 8
+    pin_memory: bool = True
 
     # PENDING(): full ImageNet or ImageNet-100 for the main grid. This
     # decides whether caching activations is viable at all, 361 GiB against 37.

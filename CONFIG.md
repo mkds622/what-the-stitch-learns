@@ -70,6 +70,8 @@ a merge path. Not present yet.
 | `split` / `eval_split` | `train` / `val` | Split names |
 | `num_classes` | `null` | Read from the dataset when unset |
 | `notes` | `""` | Free text, e.g. which published ImageNet-100 subset |
+| `num_workers` | `8` | Loader processes. 0 runs in the main process |
+| `pin_memory` | `true` | Ignored when the device is CPU |
 
 `root` and `source_url` are separate on purpose. The first is what the code
 opens; the second is what lets someone else reproduce the run on a different

@@ -13,7 +13,7 @@ tag: smoke
 
 dataset:
   name: imagenet-100
-  root: ""                       # PENDING: dataset path on machine
+  root: "data/imagenet-100"                       # PENDING: dataset path on machine
   source_url: ""                 # PENDING: which published subset
   split: train
   eval_split: val
