@@ -71,6 +71,7 @@ class ModelConfig:
     """
 
     name: str = "vit_base_patch16_224"
+    source: Literal["timm", "torchvision"] = "timm" 
     pretrained: bool = True
     checkpoint: str | None = None     # path to a local state dict, if any
     label: str = ""                   # short tag used in layer keys and run names
@@ -221,7 +222,7 @@ class ActivationsConfig:
 
     mode: Literal["on_the_fly", "cached"] = "on_the_fly"
     cache_dir: str | None = None      # required when mode == "cached"
-    layers: list[str] = field(default_factory=lambda: ["A@blocks.6"])
+    layers: list[str] = field(default_factory=lambda: ["A@add_14"])
     extraction_batch_size: int = 128  # measured optimum for ViT-B/16; see benchmarks
     shuffle_buffer_tokens: int = 2_000_000
     cache_dtype: Literal["float16", "float32"] = "float16"

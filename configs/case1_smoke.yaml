@@ -45,7 +45,7 @@ coder:
 
 activations:
   mode: on_the_fly
-  layers: ["A@blocks.6"]
+  layers: ["A@add_14"]
   extraction_batch_size: 32
 
 train:
