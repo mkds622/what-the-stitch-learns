@@ -19,3 +19,5 @@ sweeps/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+external/
