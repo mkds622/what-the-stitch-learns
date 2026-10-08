@@ -255,7 +255,7 @@ class DeadFeatureTracker(nn.Module):
 # ----------------------------------------------------------------------
 
 def compute_loss(coder: SparseCoder, x: Tensor, target: Tensor,
-                 coeff: float) -> tuple[Tensor, dict[str, float]]:
+                 coeff: float, tracker: "DeadFeatureTracker | None" = None) -> tuple[Tensor, dict[str, float]]:
     """One step's loss, with everything worth logging alongside it.
 
     Args:
@@ -265,12 +265,19 @@ def compute_loss(coder: SparseCoder, x: Tensor, target: Tensor,
             ``x`` when the coder reproduces its own input.
         coeff: weight on the sparsity penalty. Unused under topk, where
             sparsity is enforced rather than encouraged.
+        tracker: updated with this batch's features if given. Passed in rather
+            than fed separately because the caller would otherwise have to run
+            the encoder a second time to see them, which is about a sixth of
+            the step's arithmetic.
 
     Returns:
         ``(loss, metrics)``. The loss carries gradients; the metrics are plain
         floats, detached, ready to log.
     """
     reconstruction, latents = coder(x)
+
+    if tracker is not None:
+        tracker.update(latents)
 
     mse = torch.nn.functional.mse_loss(reconstruction, target)
 
@@ -298,7 +305,6 @@ def compute_loss(coder: SparseCoder, x: Tensor, target: Tensor,
             "l0": float((latents > 0).float().sum(dim=-1).mean()),
             "explained_variance": float(explained),
         }
-
     return loss, metrics
 
 

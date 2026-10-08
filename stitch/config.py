@@ -262,6 +262,7 @@ class TrainConfig:
     eval_every: int = 5_000
     checkpoint_every: int = 25_000
     grad_clip: float | None = 1.0
+    keep_checkpoints: int = 2
 
     # PENDING(): token budget. 1 billion is roughly four passes over
     # ImageNet and is an estimate, never confirmed. It is the single largest

@@ -371,3 +371,15 @@ def test_the_penalty_pushes_back_on_dictionary_growth():
     with_penalty = coder.decoder.weight.grad.clone()
 
     assert not torch.allclose(without, with_penalty)
+
+def test_the_tracker_sees_the_features_without_a_second_pass(coder, x):
+    """The loop would otherwise rerun the encoder to find out what fired."""
+    tracker = DeadFeatureTracker(coder.d_latent, window=1)
+    compute_loss(coder, x, x, coeff=0.0, tracker=tracker)
+
+    _, latents = coder(x)
+    assert torch.equal(tracker.steps_since_fired == 0, (latents > 0).any(dim=0))
+
+
+def test_no_tracker_is_fine(coder, x):
+    compute_loss(coder, x, x, coeff=0.0)

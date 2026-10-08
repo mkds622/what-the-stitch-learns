@@ -208,6 +208,7 @@ Nothing else in the extraction machinery changes between them.
 | `eval_every` | `5000` | Steps between Tier 0 evaluations |
 | `checkpoint_every` | `25000` | Steps between checkpoints |
 | `grad_clip` | `1.0` | Gradient norm clip, `null` to disable |
+| `keep_checkpoints` | `2` | Newest checkpoints to retain. 0 keeps all of them |
 
 Tokens rather than epochs, because the coder consumes tokens and the tokens per
 image depend on the backbone.
