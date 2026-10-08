@@ -20,7 +20,10 @@ same order, so a token in one layer still lines up with the same token in
 another, which is what makes a second layer usable as a target at all.
 
 The buffer is the memory cost of this module: ``shuffle_buffer_tokens`` times
-the width times four bytes, per layer.
+the width times four bytes, per layer. It is held once: the blocks are released
+as soon as they are concatenated, the scaling is applied in place, and batches
+are gathered through the permutation rather than the whole buffer being
+permuted into a second copy.
 
 Scaling happens here too. Activations are larger at some depths than others and
 differ between models, and the reconstruction error is measured in whatever
@@ -66,7 +69,7 @@ class ActivationSource(ABC):
         Recorded with the run, because evaluation has to apply the same numbers
         and anything reported in the original units has to divide them out.
         """
-    
+
     @abstractmethod
     def set_scales(self, scales: dict[str, float]) -> None:
         """Adopt scales measured elsewhere instead of measuring them.
@@ -188,21 +191,30 @@ class OnTheFlyActivations(ActivationSource):
 
             merged = {key: torch.cat([entry[key] for entry in held]) for key in held[0]}
 
-            # Scaled once per buffer rather than once per batch.
-            merged = {key: value * self._scales[key] for key, value in merged.items()}
+            # Released as soon as they are copied. Holding the blocks while the
+            # concatenation exists doubles the buffer for no reason.
+            held.clear()
 
-            # One permutation for every layer, so tokens stay aligned across them.
+            # Scaled once per buffer rather than once per batch, and in place,
+            # since the concatenation is not shared with anything.
+            for key, value in merged.items():
+                value.mul_(self._scales[key])
+
+            # One permutation for every layer, so tokens stay aligned across
+            # them. Batches are gathered through it rather than the whole buffer
+            # being permuted first, which would allocate a second copy of it.
             order = torch.randperm(count, generator=self.generator)
-            merged = {key: value[order] for key, value in merged.items()}
+            if merged:
+                order = order.to(next(iter(merged.values())).device)
 
             # The tail shorter than a step is dropped rather than carried over.
             # Every step then sees the same number of tokens, and the loss is a
             # few thousand tokens out of the buffer.
             for start in range(0, count - self.token_batch + 1, self.token_batch):
-                stop = start + self.token_batch
-                yield {key: value[start:stop] for key, value in merged.items()}
+                rows = order[start:start + self.token_batch]
+                yield {key: value[rows] for key, value in merged.items()}
 
-            held, count = [], 0
+            count = 0
 
     def widths(self) -> dict[str, int]:
         """Widths, taken from what the model actually produces.
@@ -219,7 +231,7 @@ class OnTheFlyActivations(ActivationSource):
         """The scalar each layer is multiplied by, measuring it if necessary."""
         self._measure_scales()
         return dict(self._scales)
-    
+
     def set_scales(self, scales: dict[str, float]) -> None:
         """Adopt scales measured elsewhere instead of measuring them."""
         self._scales = dict(scales)
