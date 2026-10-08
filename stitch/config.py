@@ -290,6 +290,20 @@ class LoggingConfig:
     level: str = "INFO"
     csv_mirror: bool = True               # metrics also as CSV, for plotting
 
+# ----------------------------------------------------------------------
+# evaluation
+# ----------------------------------------------------------------------
+
+@dataclass
+class EvalConfig:
+    batches: int = 50
+    images: int = 5000
+    min_explained_variance: float = 0.5
+    min_l0: float = 1.0
+    max_l0: float = 256.0
+    max_never_fired: float = 0.5
+    max_feature_frequency: float = 0.9
+
 
 # ----------------------------------------------------------------------
 # top level
@@ -314,6 +328,7 @@ class Config:
     activations: ActivationsConfig = field(default_factory=ActivationsConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    eval: EvalConfig = field(default_factory=EvalConfig)
 
     # ------------------------------------------------------------------
 
@@ -355,6 +370,13 @@ class Config:
                 raise ValueError(
                     f"layer key {key!r} must be '<model label>@<node name>', "
                     f"for example 'A@blocks.6'")
+        
+        if self.eval.batches < 1:
+            raise ValueError("eval.batches must be at least 1")
+        
+        if self.eval.min_l0 > self.eval.max_l0:
+            raise ValueError(
+                f"eval.min_l0 ({self.eval.min_l0}) is above eval.max_l0 ({self.eval.max_l0})")
 
     # ------------------------------------------------------------------
 
@@ -405,6 +427,10 @@ class Config:
             out.append("activations.shuffle_buffer_tokens is a placeholder")
         if self.layer_pairs.count == 3 and self.layer_pairs.ranking_file is None:
             out.append("layer_pairs.count is a placeholder and no sweep ranking exists yet")
+        thresholds = (self.eval.min_explained_variance, self.eval.min_l0, self.eval.max_l0,
+                      self.eval.max_never_fired, self.eval.max_feature_frequency)
+        if thresholds == (0.5, 1.0, 256.0, 0.5, 0.9):
+            out.append("eval gate thresholds are the unconfirmed defaults(placeholders)")
         return out
 
 
@@ -521,6 +547,7 @@ _NESTED = {
         "activations": ActivationsConfig,
         "train": TrainConfig,
         "logging": LoggingConfig,
+        "eval": EvalConfig,
     },
 }
 

@@ -231,6 +231,22 @@ The process log and crash capture are written to the run directory regardless of
 backend, so a crash stays diagnosable even when the tracking backend is what
 failed.
 
+### `eval`
+
+| Key | Default | Meaning |
+|---|---|---|
+| `batches` | `50` | Held-out token batches the reconstruction metrics average over |
+| `images` | `5000` | Images used for the substitution measurement |
+| `min_explained_variance` | `0.5` | Below this the coder is not reconstructing |
+| `min_l0` | `1.0` | Below this it has collapsed to firing nothing |
+| `max_l0` | `256.0` | Above this it is dense and nothing is disentangled |
+| `max_never_fired` | `0.5` | Share of the dictionary allowed to be silent |
+| `max_feature_frequency` | `0.9` | A feature active on more tokens than this is a bias |
+
+The five thresholds are gates, not targets. They mark the point below which a
+run is not worth comparing with anything, and every one of them is a placeholder
+until the control runs say where the real boundary sits.
+
 ---
 
 ## Run directory layout
