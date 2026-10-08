@@ -174,6 +174,8 @@ dictionary size, which corrupts any comparison between dictionaries.
 | `extraction_batch_size` | `128` | Measured optimum for ViT-B/16 |
 | `shuffle_buffer_tokens` | `2000000` | Token-level shuffle buffer |
 | `cache_dtype` | `float16` | Two bytes per value; `float32` doubles storage |
+| `scaling` | `unit_norm` | Divide each layer by a fixed scalar so a typical token has the norm an isotropic unit-variance vector of that width would. none to disable |
+| `scale_tokens` | `100000` | Tokens used to measure those scalars, once, at the start of a run |
 
 `mode` selects between two implementations of one interface, so the training
 loop is identical either way:

@@ -3,13 +3,14 @@
 A four-channel toy model over random images, so these run on CPU in under a
 second with no dataset and no backbone download. The properties under test are
 about the stream, not about any particular model: batch shape, alignment
-between layers, and reproducibility from the seed.
+between layers, scaling, and reproducibility from the seed.
 
     python -m pytest tests/test_activations.py -q
 """
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -80,6 +81,11 @@ def cfg(node_names):
     c.activations.mode = "on_the_fly"
     c.activations.layers = [f"A@{first}", f"A@{second}"]
     c.activations.shuffle_buffer_tokens = 64
+
+    # Off by default here, so the properties below are exact. The tests that
+    # are about scaling turn it on themselves.
+    c.activations.scaling = "none"
+    c.activations.scale_tokens = 256
     return c
 
 
@@ -191,6 +197,79 @@ def test_tokens_are_not_in_model_order(cfg, traced, loader):
         straight = traced(images).reshape(-1, WIDTH)[:cfg.train.token_batch] * 1
 
     assert not torch.allclose(shuffled, straight, atol=1e-5)
+
+
+# ----------------------------------------------------------------------
+# scaling
+#
+# The reconstruction error is measured in whatever units the activations
+# arrive in, and those differ between depths and between models. Without a
+# fixed scale, one sparsity coefficient would mean a different trade at every
+# layer and in every case.
+# ----------------------------------------------------------------------
+
+@needs_nn_lib
+def test_scaling_off_leaves_the_tokens_alone(cfg, traced, loader):
+    from stitch.activations import build_source
+
+    scales = build_source(cfg, {"A": traced}, loader).scales()
+    assert all(value == 1.0 for value in scales.values())
+
+
+@needs_nn_lib
+def test_there_is_one_scale_per_layer(cfg, traced, loader):
+    from stitch.activations import build_source
+
+    cfg.activations.scaling = "unit_norm"
+    scales = build_source(cfg, {"A": traced}, loader).scales()
+    assert sorted(scales) == sorted(cfg.activations.layers)
+
+
+@needs_nn_lib
+def test_a_larger_layer_gets_a_smaller_scale(cfg, traced, loader):
+    """The second layer is twice the first, so its scale must be half."""
+    from stitch.activations import build_source
+
+    cfg.activations.scaling = "unit_norm"
+    first, second = cfg.activations.layers
+    scales = build_source(cfg, {"A": traced}, loader).scales()
+    assert scales[second] == pytest.approx(scales[first] / 2, rel=1e-3)
+
+
+@needs_nn_lib
+def test_scaling_puts_a_typical_token_at_the_expected_norm(cfg, traced, loader):
+    """Which is what makes the error comparable across layers and models."""
+    from stitch.activations import build_source
+
+    cfg.activations.scaling = "unit_norm"
+    source = build_source(cfg, {"A": traced}, loader)
+    key = cfg.activations.layers[0]
+
+    tokens = torch.cat([batch[key] for batch in first_batches(source, 8)])
+    assert float(tokens.norm(dim=-1).mean()) == pytest.approx(math.sqrt(WIDTH), rel=0.2)
+
+
+@needs_nn_lib
+def test_layers_stay_aligned_after_scaling(cfg, traced, loader):
+    """Scaling must not disturb the pairing a second layer depends on."""
+    from stitch.activations import build_source
+
+    cfg.activations.scaling = "unit_norm"
+    first, second = cfg.activations.layers
+    source = build_source(cfg, {"A": traced}, loader)
+
+    factor = 2 * source.scales()[second] / source.scales()[first]
+    for batch in first_batches(source, 3):
+        assert torch.allclose(batch[second], batch[first] * factor, atol=1e-5)
+
+
+@needs_nn_lib
+def test_an_unknown_scaling_mode_raises(cfg, traced, loader):
+    from stitch.activations import build_source
+
+    cfg.activations.scaling = "zscore"
+    with pytest.raises(ValueError, match="activations.scaling"):
+        build_source(cfg, {"A": traced}, loader)
 
 
 # ----------------------------------------------------------------------

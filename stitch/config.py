@@ -228,6 +228,8 @@ class ActivationsConfig:
     extraction_batch_size: int = 128  # measured optimum for ViT-B/16; see benchmarks
     shuffle_buffer_tokens: int = 2_000_000
     cache_dtype: Literal["float16", "float32"] = "float16"
+    scaling: str = "unit_norm"
+    scale_tokens: int = 100_000
 
     # PENDING(): shuffle buffer size. Token-level shuffling decorrelates
     # the batch, and is also what turns a sequential read into a strided one.

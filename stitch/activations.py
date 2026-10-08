@@ -21,11 +21,19 @@ another, which is what makes a second layer usable as a target at all.
 
 The buffer is the memory cost of this module: ``shuffle_buffer_tokens`` times
 the width times four bytes, per layer.
+
+Scaling happens here too. Activations are larger at some depths than others and
+differ between models, and the reconstruction error is measured in whatever
+units they arrive in. Left alone, one sparsity coefficient would mean a
+different trade at every layer and in every case. Each layer is therefore
+divided by a scalar fixed once at the start of the run, chosen so a typical
+token has the norm an isotropic unit-variance vector of that width would have.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from abc import ABC, abstractmethod
 from typing import Iterator
 
@@ -51,6 +59,14 @@ class ActivationSource(ABC):
     def widths(self) -> dict[str, int]:
         """Activation width per layer key, which sets the coder's dimensions."""
 
+    @abstractmethod
+    def scales(self) -> dict[str, float]:
+        """The scalar each layer is multiplied by.
+
+        Recorded with the run, because evaluation has to apply the same numbers
+        and anything reported in the original units has to divide them out.
+        """
+
 
 class OnTheFlyActivations(ActivationSource):
     """Runs the frozen backbones every step.
@@ -70,6 +86,7 @@ class OnTheFlyActivations(ActivationSource):
 
         Raises:
             KeyError: if a layer names a model that was not supplied.
+            ValueError: on an unknown scaling mode.
         """
         self.cfg = cfg
         self.loader = loader
@@ -78,6 +95,13 @@ class OnTheFlyActivations(ActivationSource):
 
         # At least one step's worth, or the buffer cannot fill a batch.
         self.buffer_tokens = max(cfg.activations.shuffle_buffer_tokens, self.token_batch)
+
+        self.scaling = cfg.activations.scaling
+        if self.scaling not in ("unit_norm", "none"):
+            raise ValueError(
+                f"unknown activations.scaling {self.scaling!r}, "
+                f"expected 'unit_norm' or 'none'")
+        self.scale_tokens = cfg.activations.scale_tokens
 
         parsed = [parse_layer_key(key) for key in cfg.activations.layers]
         self.extractors: dict[str, nn.Module] = {}
@@ -90,11 +114,12 @@ class OnTheFlyActivations(ActivationSource):
 
         self.generator = torch.Generator().manual_seed(cfg.train.seed)
         self._widths: dict[str, int] = {}
+        self._scales: dict[str, float] | None = None
 
     # ------------------------------------------------------------------
 
     def _blocks(self) -> Iterator[TokenBatch]:
-        """One entry per image batch, flattened to tokens, forever."""
+        """One entry per image batch, flattened to tokens, unscaled."""
         while True:
             for images, _ in self.loader:
                 images = images.to(self.device, non_blocking=True)
@@ -103,23 +128,59 @@ class OnTheFlyActivations(ActivationSource):
                     for label, extractor in self.extractors.items():
                         for node, value in extractor(images).items():
                             block[layer_key(label, node)] = value.reshape(-1, value.shape[-1])
+
+                if not self._widths:
+                    self._widths = {key: value.shape[-1] for key, value in block.items()}
                 yield block
 
+    def _measure_scales(self) -> None:
+        """Fix one scalar per layer from the opening tokens of the run.
+
+        Measured once rather than per batch, so the units do not drift as
+        training proceeds and a checkpoint resumed later means the same thing.
+        """
+        if self._scales is not None:
+            return
+
+        if self.scaling == "none":
+            self._scales = {key: 1.0 for key in self.widths()}
+            return
+
+        totals: dict[str, float] = {}
+        seen = 0
+        for block in self._blocks():
+            for key, value in block.items():
+                totals[key] = totals.get(key, 0.0) + float(value.norm(dim=-1).sum())
+            seen += next(iter(block.values())).shape[0]
+            if seen >= self.scale_tokens:
+                break
+
+        self._scales = {}
+        for key, total in totals.items():
+            mean_norm = total / seen
+            # A layer that is identically zero has no scale worth setting.
+            self._scales[key] = math.sqrt(self._widths[key]) / mean_norm if mean_norm > 0 else 1.0
+
+        log.info("activation scales: %s",
+                 {key: round(value, 4) for key, value in self._scales.items()})
+
     def batches(self) -> Iterator[TokenBatch]:
-        """Shuffled token batches, forever."""
+        """Shuffled, scaled token batches, forever."""
+        self._measure_scales()
+
         held: list[TokenBatch] = []
         count = 0
 
         for block in self._blocks():
-            if not self._widths:
-                self._widths = {key: value.shape[-1] for key, value in block.items()}
-
             held.append(block)
             count += next(iter(block.values())).shape[0]
             if count < self.buffer_tokens:
                 continue
 
             merged = {key: torch.cat([entry[key] for entry in held]) for key in held[0]}
+
+            # Scaled once per buffer rather than once per batch.
+            merged = {key: value * self._scales[key] for key, value in merged.items()}
 
             # One permutation for every layer, so tokens stay aligned across them.
             order = torch.randperm(count, generator=self.generator)
@@ -142,9 +203,13 @@ class OnTheFlyActivations(ActivationSource):
         at a width the backbone does not produce.
         """
         if not self._widths:
-            block = next(iter(self._blocks()))
-            self._widths = {key: value.shape[-1] for key, value in block.items()}
+            next(iter(self._blocks()))
         return dict(self._widths)
+
+    def scales(self) -> dict[str, float]:
+        """The scalar each layer is multiplied by, measuring it if necessary."""
+        self._measure_scales()
+        return dict(self._scales)
 
 
 def build_source(cfg, models: dict[str, nn.Module], loader: DataLoader) -> ActivationSource:
