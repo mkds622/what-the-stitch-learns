@@ -142,6 +142,7 @@ class SweepConfig:
     fit_tokens: int = 500_000         # tokens used for the least-squares fit
     eval_images: int = 10_000         # images used when metric == "accuracy"
     out_file: str = "sweeps/layer_sweep.json"
+    ridge: float = 1e-3
 
 
 # ----------------------------------------------------------------------

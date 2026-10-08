@@ -242,6 +242,7 @@ failed.
 | `max_l0` | `256.0` | Above this it is dense and nothing is disentangled |
 | `max_never_fired` | `0.5` | Share of the dictionary allowed to be silent |
 | `max_feature_frequency` | `0.9` | A feature active on more tokens than this is a bias |
+| `ridge` | `1e-3` | Added to the covariance diagonal, as a fraction of its mean |
 
 The five thresholds are gates, not targets. They mark the point below which a
 run is not worth comparing with anything, and every one of them is a placeholder
