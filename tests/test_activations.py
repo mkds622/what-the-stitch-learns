@@ -271,6 +271,18 @@ def test_an_unknown_scaling_mode_raises(cfg, traced, loader):
     with pytest.raises(ValueError, match="activations.scaling"):
         build_source(cfg, {"A": traced}, loader)
 
+@needs_nn_lib
+def test_scales_can_be_adopted_from_another_source(cfg, traced, loader):
+    """An evaluation stream has to measure in the units training measured in."""
+    from stitch.activations import build_source
+
+    cfg.activations.scaling = "unit_norm"
+    training = build_source(cfg, {"A": traced}, loader)
+    evaluation = build_source(cfg, {"A": traced}, loader)
+    evaluation.set_scales(training.scales())
+
+    assert evaluation.scales() == training.scales()
+
 
 # ----------------------------------------------------------------------
 # selection and errors

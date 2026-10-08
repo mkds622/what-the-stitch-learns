@@ -66,6 +66,15 @@ class ActivationSource(ABC):
         Recorded with the run, because evaluation has to apply the same numbers
         and anything reported in the original units has to divide them out.
         """
+    
+    @abstractmethod
+    def set_scales(self, scales: dict[str, float]) -> None:
+        """Adopt scales measured elsewhere instead of measuring them.
+
+        An evaluation stream has to use the numbers the training stream
+        measured. Measuring its own would put the two in different units, and
+        every comparison between them would be off by a factor nobody recorded.
+        """
 
 
 class OnTheFlyActivations(ActivationSource):
@@ -210,6 +219,10 @@ class OnTheFlyActivations(ActivationSource):
         """The scalar each layer is multiplied by, measuring it if necessary."""
         self._measure_scales()
         return dict(self._scales)
+    
+    def set_scales(self, scales: dict[str, float]) -> None:
+        """Adopt scales measured elsewhere instead of measuring them."""
+        self._scales = dict(scales)
 
 
 def build_source(cfg, models: dict[str, nn.Module], loader: DataLoader) -> ActivationSource:
