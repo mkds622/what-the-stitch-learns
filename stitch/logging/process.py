@@ -85,7 +85,7 @@ def setup_logging(run_dir: str | Path, level: str = "INFO",
 
 
 def install_crash_handler(run_dir: str | Path,
-                          crash_dir: str | Path = "crashes",
+                          crash_dir: str | Path = "runs/crashes",
                           logger: Any = None,
                           context: dict | None = None) -> None:
     """Capture unhandled exceptions and fatal signals.
