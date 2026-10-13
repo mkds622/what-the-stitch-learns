@@ -218,7 +218,7 @@ def substitution_accuracy(coder: SparseCoder, upper: nn.Module, lower: nn.Module
 # validity gates
 # ----------------------------------------------------------------------
 
-def check_gates(metrics: dict[str, float], cfg) -> dict[str, bool]:
+def check_gates(metrics: dict[str, float], cfg, latents: int) -> dict[str, bool]:
     """Whether a coder is in a state worth comparing with anything.
 
     These are not a measure of quality. Each one catches a way a run can finish
@@ -232,8 +232,9 @@ def check_gates(metrics: dict[str, float], cfg) -> dict[str, bool]:
         with every feature off, the reconstruction is a constant and the
         sparsity is perfect.
     ``not_dense``
-        with every feature on, the reconstruction is good and nothing has been
-        disentangled.
+        with most of the dictionary on at once, the reconstruction is good and
+        nothing has been disentangled. Judged as a fraction of the dictionary,
+        so the same standard applies at every expansion factor.
     ``features_alive``
         a coder with most of its dictionary dead is a smaller coder than its
         configuration says, so comparing it against one with none dead compares
@@ -249,7 +250,7 @@ def check_gates(metrics: dict[str, float], cfg) -> dict[str, bool]:
         "finite": all(math.isfinite(value) for value in metrics.values()),
         "reconstructs": metrics["eval_explained_variance"] >= cfg.eval.min_explained_variance,
         "not_collapsed": metrics["eval_l0"] >= cfg.eval.min_l0,
-        "not_dense": metrics["eval_l0"] <= cfg.eval.max_l0,
+        "not_dense": metrics["eval_l0"] <= cfg.eval.max_l0_frac * latents,
         "features_alive": metrics["eval_never_fired"] <= cfg.eval.max_never_fired,
         "no_always_on_feature":
             metrics["eval_max_feature_frequency"] <= cfg.eval.max_feature_frequency,
@@ -273,6 +274,6 @@ def evaluate(coder: SparseCoder, batches: Iterator[dict[str, Tensor]],
     """
     metrics = reconstruction_metrics(
         coder, batches, source_key, target_key, cfg.eval.batches, device)
-    gates = check_gates(metrics, cfg)
+    gates = check_gates(metrics, cfg, coder.d_latent)
     metrics.update({f"gate_{name}": float(value) for name, value in gates.items()})
     return metrics

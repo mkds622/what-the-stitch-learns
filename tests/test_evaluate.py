@@ -88,7 +88,7 @@ def cfg():
     c.eval.images = 32
     c.eval.min_explained_variance = 0.5
     c.eval.min_l0 = 1.0
-    c.eval.max_l0 = 16.0
+    c.eval.max_l0_frac = 0.25
     c.eval.max_never_fired = 0.5
     c.eval.max_feature_frequency = 0.9
     return c
@@ -262,7 +262,7 @@ def passing(**overrides):
 
 
 def test_a_healthy_coder_passes(cfg):
-    assert check_gates(passing(), cfg)["passed"]
+    assert check_gates(passing(), cfg, 64)["passed"]
 
 
 @pytest.mark.parametrize("gate, metrics", [
@@ -275,20 +275,20 @@ def test_a_healthy_coder_passes(cfg):
     ("no_always_on_feature", {"eval_max_feature_frequency": 0.99}),
 ])
 def test_each_gate_catches_its_own_failure(cfg, gate, metrics):
-    result = check_gates(passing(**metrics), cfg)
+    result = check_gates(passing(**metrics), cfg, 64)
     assert result[gate] is False
     assert result["passed"] is False
 
 
 def test_one_failure_is_enough_to_fail(cfg):
-    result = check_gates(passing(eval_l0=0.0), cfg)
+    result = check_gates(passing(eval_l0=0.0), cfg, 64)
     assert result["reconstructs"] is True
     assert result["passed"] is False
 
 
 def test_a_collapsed_coder_is_caught_despite_perfect_sparsity(cfg):
     """Every feature off gives a perfect sparsity score and no information."""
-    result = check_gates(passing(eval_l0=0.0, eval_explained_variance=0.0), cfg)
+    result = check_gates(passing(eval_l0=0.0, eval_explained_variance=0.0), cfg, 64)
     assert result["not_collapsed"] is False
 
 

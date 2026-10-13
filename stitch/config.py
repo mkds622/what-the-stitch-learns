@@ -301,7 +301,7 @@ class EvalConfig:
     images: int = 5000
     min_explained_variance: float = 0.5
     min_l0: float = 1.0
-    max_l0: float = 256.0
+    max_l0_frac: float = 0.05
     max_never_fired: float = 0.5
     max_feature_frequency: float = 0.9
 
