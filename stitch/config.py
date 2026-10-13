@@ -375,9 +375,9 @@ class Config:
         if self.eval.batches < 1:
             raise ValueError("eval.batches must be at least 1")
         
-        if self.eval.min_l0 > self.eval.max_l0:
+        if not 0 < self.eval.max_l0_frac <= 1:
             raise ValueError(
-                f"eval.min_l0 ({self.eval.min_l0}) is above eval.max_l0 ({self.eval.max_l0})")
+                f"eval.max_l0_frac ({self.eval.max_l0_frac}) must be in (0, 1]")
 
     # ------------------------------------------------------------------
 
@@ -428,9 +428,9 @@ class Config:
             out.append("activations.shuffle_buffer_tokens is a placeholder")
         if self.layer_pairs.count == 3 and self.layer_pairs.ranking_file is None:
             out.append("layer_pairs.count is a placeholder and no sweep ranking exists yet")
-        thresholds = (self.eval.min_explained_variance, self.eval.min_l0, self.eval.max_l0,
+        thresholds = (self.eval.min_explained_variance, self.eval.min_l0, self.eval.max_l0_frac,
                       self.eval.max_never_fired, self.eval.max_feature_frequency)
-        if thresholds == (0.5, 1.0, 256.0, 0.5, 0.9):
+        if thresholds == (0.5, 1.0, 0.05, 0.5, 0.9):
             out.append("eval gate thresholds are the unconfirmed defaults(placeholders)")
         return out
 
