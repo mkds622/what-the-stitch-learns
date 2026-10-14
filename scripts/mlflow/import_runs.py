@@ -107,7 +107,17 @@ def import_run(directory: Path, experiment: str, dry_run: bool = False) -> bool:
                  directory.name, len(params), len(metrics), len(summary))
         return False
 
-    with mlflow.start_run(experiment_id=experiment_id, run_name=directory.name):
+    started = status.get("started")
+    elapsed = status.get("elapsed_s")
+    start_ms = int(started * 1000) if started else None
+    end_ms = int((started + elapsed) * 1000) if started and elapsed else None
+
+    # Created through the client rather than start_run, which would stamp the
+    # import time. The run's own clock is in its status file.
+    created = client.create_run(experiment_id=experiment_id,
+                                start_time=start_ms, run_name=directory.name)
+
+    with mlflow.start_run(run_id=created.info.run_id):
         mlflow.set_tag("source_run", directory.name)
         mlflow.set_tag("status", status.get("status", "UNKNOWN"))
 
@@ -133,6 +143,9 @@ def import_run(directory: Path, experiment: str, dry_run: bool = False) -> bool:
             if path.exists():
                 mlflow.log_artifact(str(path))
 
+    if end_ms:
+        client.set_terminated(created.info.run_id,
+                              status=status.get("status", "FINISHED"), end_time=end_ms)
     log.info("imported %s: %d metric rows", directory.name, len(metrics))
     return True
 
