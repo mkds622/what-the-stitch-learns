@@ -1,0 +1,84 @@
+# Main pair, second objective: the coder reads one model and reconstructs
+# the other at the same depth. Same models and settings as case1_control, so
+# the two differ only in what the coder is asked to produce, which is the
+# comparison the project is about.
+#
+# Values marked PENDING are placeholders awaiting a decision and are printed
+# as such at startup. See CONFIG.md.
+
+objective: case2
+tag: main
+
+dataset:
+  name: imagenet-100
+  root: "data/imagenet-100"
+  source_url: ""                 # PENDING: which published subset
+  split: train
+  eval_split: val
+  num_workers: 8
+  pin_memory: true
+
+models:
+  a:
+    name: vit_base_patch16_224.augreg_in21k_ft_in1k
+    source: timm
+    pretrained: true
+    label: A
+  b:
+    name: deit_base_patch16_224.fb_in1k
+    source: timm
+    pretrained: true
+    label: B
+
+layer_pairs:
+  count: 3                       # read by the sweep only; a run's depth is set
+  matched_depth_only: true       # by activations.layers below
+
+sweep:
+  metric: explained_variance
+  fit_tokens: 500000
+  ridge: 1e-3
+  out_file: sweeps/layer_sweep_main.json
+
+coder:
+  expansion: 16
+  sparsity:
+    mode: l1
+    coeff: 0.005
+    normalize_decoder: true
+  dead_features:
+    track_window: 1000
+
+activations:
+  mode: on_the_fly
+  # Two entries: read the first, reconstruct the second. Both models are
+  # resident, and both are run on every batch.
+  layers: ["A@add_12", "B@add_12"]
+  extraction_batch_size: 128
+  scaling: unit_norm
+  scale_tokens: 100000
+  shuffle_buffer_tokens: 500000  # PENDING
+
+train:
+  tokens: 200000000
+  token_batch: 4096
+  lr: 1e-4
+  optimizer: adam
+  seed: 0
+  device: cuda
+  dtype: float16
+  log_every: 100
+  eval_every: 5000
+  checkpoint_every: 25000
+  keep_checkpoints: 2
+  grad_clip: 1.0
+
+logging:
+  backend: jsonl
+  run_root: runs
+  level: INFO
+  csv_mirror: true
+
+eval:
+  batches: 50
+  images: 5000
