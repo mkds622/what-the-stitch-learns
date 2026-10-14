@@ -1,0 +1,82 @@
+# Main pair: the models the comparison is actually run on. Same two recipes as
+# the control pair, at four times the width.
+#
+# Values marked PENDING are placeholders awaiting a decision and are printed
+# as such at startup. See CONFIG.md.
+
+objective: case1
+tag: main
+
+dataset:
+  name: imagenet-100
+  root: "data/imagenet-100"
+  source_url: ""                 # PENDING: which published subset
+  split: train
+  eval_split: val
+  num_workers: 8
+  pin_memory: true
+
+models:
+  a:
+    name: vit_base_patch16_224.augreg_in21k_ft_in1k
+    source: timm
+    pretrained: true
+    label: A
+  b:                             # unused by case 1, read by the sweep
+    name: deit_base_patch16_224.fb_in1k
+    source: timm
+    pretrained: true
+    label: B
+
+layer_pairs:
+  count: 3                       # PENDING: no sweep ranking exists yet
+  matched_depth_only: true
+
+sweep:
+  metric: explained_variance
+  fit_tokens: 500000
+  ridge: 1e-3
+  out_file: sweeps/layer_sweep_main.json
+
+coder:
+  expansion: 16                 
+  sparsity:
+    mode: l1
+    coeff: 0.005
+    normalize_decoder: true
+  dead_features:
+    track_window: 1000
+
+activations:
+  mode: on_the_fly
+  # One entry: read and reconstruct the same layer.
+  # Two entries: read the first, reconstruct the second.
+  layers: ["A@add_14"]           # PENDING: confirm against this model
+  extraction_batch_size: 128
+  scaling: unit_norm
+  scale_tokens: 100000
+  shuffle_buffer_tokens: 500000  # PENDING
+
+train:
+  tokens: 200000000
+  token_batch: 4096
+  lr: 1e-4
+  optimizer: adam
+  seed: 0
+  device: cuda
+  dtype: float16
+  log_every: 100
+  eval_every: 5000
+  checkpoint_every: 25000
+  keep_checkpoints: 2
+  grad_clip: 1.0
+
+logging:
+  backend: jsonl
+  run_root: runs
+  level: INFO
+  csv_mirror: true
+
+eval:
+  batches: 50
+  images: 5000

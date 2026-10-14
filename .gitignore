@@ -17,7 +17,6 @@ crashes/
 mlruns/
 mlflow.db
 mlartifacts/
-sweeps/
 __pycache__/
 *.pyc
 .pytest_cache/

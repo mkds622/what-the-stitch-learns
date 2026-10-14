@@ -277,19 +277,21 @@ def run_sweep(cfg) -> list[dict]:
     if cfg.models.b is None:
         raise ValueError("a sweep compares two models, so models.b must be set")
 
+    device = torch.device(cfg.train.device)
     specs = {"A": cfg.models.a, "B": cfg.models.b}
     backbones, models = {}, {}
     for label, spec in specs.items():
         backbones[label] = load_backbone(spec.name, pretrained=spec.pretrained,
                                          checkpoint=spec.checkpoint, source=spec.source)
-        models[label] = trace(backbones[label])
+        # Traced on CPU, then moved: the extractors run where the images are.
+        models[label] = trace(backbones[label]).to(device).eval()
         log.info("loaded %s as %s", spec.name, label)
 
     transform = build_transform(backbones["A"])
     loader = build_loader(cfg, build_dataset(cfg, cfg.dataset.split, transform),
                           cfg.activations.extraction_batch_size, shuffle=True)
 
-    probe = next(iter(loader))[0][:2]
+    probe = next(iter(loader))[0][:2].to(device)
     nodes, widths = {}, {}
     for label, model in models.items():
         found = block_outputs(model, probe)

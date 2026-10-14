@@ -1,0 +1,86 @@
+{
+  "context": {
+    "models": {
+      "A": "vit_base_patch16_224.augreg_in21k_ft_in1k",
+      "B": "deit_base_patch16_224.fb_in1k"
+    },
+    "dataset": "imagenet-100",
+    "tokens": 504320,
+    "ridge": 0.001,
+    "matched_depth_only": true
+  },
+  "ranking": [
+    {
+      "source": "A@add_2",
+      "target": "B@add_2",
+      "explained_variance": 0.9400698058347704,
+      "rank": 0
+    },
+    {
+      "source": "A@add_4",
+      "target": "B@add_4",
+      "explained_variance": 0.8895668665896104,
+      "rank": 1
+    },
+    {
+      "source": "A@add_6",
+      "target": "B@add_6",
+      "explained_variance": 0.8197691328793414,
+      "rank": 2
+    },
+    {
+      "source": "A@add_8",
+      "target": "B@add_8",
+      "explained_variance": 0.7326599224502179,
+      "rank": 3
+    },
+    {
+      "source": "A@add_10",
+      "target": "B@add_10",
+      "explained_variance": 0.635564604540733,
+      "rank": 4
+    },
+    {
+      "source": "A@add_12",
+      "target": "B@add_12",
+      "explained_variance": 0.4759820193424025,
+      "rank": 5
+    },
+    {
+      "source": "A@add_14",
+      "target": "B@add_14",
+      "explained_variance": 0.3286071036810822,
+      "rank": 6
+    },
+    {
+      "source": "A@add_24",
+      "target": "B@add_24",
+      "explained_variance": 0.27480481011690916,
+      "rank": 7
+    },
+    {
+      "source": "A@add_16",
+      "target": "B@add_16",
+      "explained_variance": 0.2592579823269292,
+      "rank": 8
+    },
+    {
+      "source": "A@add_22",
+      "target": "B@add_22",
+      "explained_variance": 0.24595902489621288,
+      "rank": 9
+    },
+    {
+      "source": "A@add_18",
+      "target": "B@add_18",
+      "explained_variance": 0.2318983705361579,
+      "rank": 10
+    },
+    {
+      "source": "A@add_20",
+      "target": "B@add_20",
+      "explained_variance": 0.21636200429356617,
+      "rank": 11
+    }
+  ]
+}
