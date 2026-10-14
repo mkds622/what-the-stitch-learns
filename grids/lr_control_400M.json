@@ -1,0 +1,113 @@
+[
+  {
+    "point": {
+      "train.lr": 5e-05
+    },
+    "reused": false,
+    "hash": "82e132edd817",
+    "run_name": "case1-control-x16-l1-s0-82e132",
+    "scales": {
+      "A@add_14": 0.9142115415472076
+    },
+    "loss": 0.2926848530769348,
+    "mse": 0.14850158989429474,
+    "sparsity_penalty": 28.836652755737305,
+    "l0": 79.12451171875,
+    "explained_variance": 0.9465202689170837,
+    "grad_norm": 0.011517337523400784,
+    "tokens": 400003072.0,
+    "dead_fraction": 0.008463541977107525,
+    "eval_mse": 0.14616540044546128,
+    "eval_l0": 79.554248046875,
+    "eval_explained_variance": 0.9512723684310913,
+    "eval_never_fired": 0.008463541977107525,
+    "eval_max_feature_frequency": 0.04347167909145355,
+    "eval_tokens": 204800.0,
+    "gate_finite": 1.0,
+    "gate_reconstructs": 1.0,
+    "gate_not_collapsed": 1.0,
+    "gate_not_dense": 1.0,
+    "gate_features_alive": 1.0,
+    "gate_no_always_on_feature": 1.0,
+    "gate_passed": 1.0,
+    "plain_top1": 0.0,
+    "substituted_top1": 0.0,
+    "top1_drop": 0.0,
+    "agreement": 0.8501700340068014,
+    "images": 4999.0
+  },
+  {
+    "point": {
+      "train.lr": 0.0001
+    },
+    "reused": false,
+    "hash": "e871f4c302ad",
+    "run_name": "case1-control-x16-l1-s0-e871f4",
+    "scales": {
+      "A@add_14": 0.9142115415472076
+    },
+    "loss": 0.2917598783969879,
+    "mse": 0.14858435094356537,
+    "sparsity_penalty": 28.63510513305664,
+    "l0": 75.6982421875,
+    "explained_variance": 0.9464915990829468,
+    "grad_norm": 0.024958595633506775,
+    "tokens": 400003072.0,
+    "dead_fraction": 0.010904948227107525,
+    "eval_mse": 0.1468826314806938,
+    "eval_l0": 75.95896484375,
+    "eval_explained_variance": 0.9510332942008972,
+    "eval_never_fired": 0.010904948227107525,
+    "eval_max_feature_frequency": 0.03947753831744194,
+    "eval_tokens": 204800.0,
+    "gate_finite": 1.0,
+    "gate_reconstructs": 1.0,
+    "gate_not_collapsed": 1.0,
+    "gate_not_dense": 1.0,
+    "gate_features_alive": 1.0,
+    "gate_no_always_on_feature": 1.0,
+    "gate_passed": 1.0,
+    "plain_top1": 0.0,
+    "substituted_top1": 0.0,
+    "top1_drop": 0.0,
+    "agreement": 0.8495699139827966,
+    "images": 4999.0
+  },
+  {
+    "point": {
+      "train.lr": 0.0003
+    },
+    "reused": false,
+    "hash": "214fd838766a",
+    "run_name": "case1-control-x16-l1-s0-214fd8",
+    "scales": {
+      "A@add_14": 0.9142115415472076
+    },
+    "loss": 0.29144465923309326,
+    "mse": 0.1492198407649994,
+    "sparsity_penalty": 28.444965362548828,
+    "l0": 70.123291015625,
+    "explained_variance": 0.946264386177063,
+    "grad_norm": 0.0135114174336195,
+    "tokens": 400003072.0,
+    "dead_fraction": 0.0390625,
+    "eval_mse": 0.14878295719623566,
+    "eval_l0": 70.480576171875,
+    "eval_explained_variance": 0.9503997564315796,
+    "eval_never_fired": 0.0392252616584301,
+    "eval_max_feature_frequency": 0.0411376953125,
+    "eval_tokens": 204800.0,
+    "gate_finite": 1.0,
+    "gate_reconstructs": 1.0,
+    "gate_not_collapsed": 1.0,
+    "gate_not_dense": 1.0,
+    "gate_features_alive": 1.0,
+    "gate_no_always_on_feature": 1.0,
+    "gate_passed": 1.0,
+    "plain_top1": 0.0,
+    "substituted_top1": 0.0,
+    "top1_drop": 0.0,
+    "agreement": 0.8501700340068014,
+    "images": 4999.0
+  }
+]

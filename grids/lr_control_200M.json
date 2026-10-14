@@ -1,0 +1,76 @@
+[
+  {
+    "point": {
+      "train.lr": 0.0001
+    },
+    "reused": false,
+    "hash": "f5503d827e73",
+    "run_name": "case1-control-x16-l1-s0-f5503d",
+    "scales": {
+      "A@add_14": 0.9142115415472076
+    },
+    "loss": 0.2930043935775757,
+    "mse": 0.14892777800559998,
+    "sparsity_penalty": 28.815322875976562,
+    "l0": 78.15771484375,
+    "explained_variance": 0.9464715719223022,
+    "grad_norm": 0.025645017623901367,
+    "tokens": 200003584.0,
+    "dead_fraction": 0.01123046875,
+    "eval_mse": 0.14657822579145433,
+    "eval_l0": 78.94349609375,
+    "eval_explained_variance": 0.9510208964347839,
+    "eval_never_fired": 0.01123046875,
+    "eval_max_feature_frequency": 0.03999999910593033,
+    "eval_tokens": 204800.0,
+    "gate_finite": 1.0,
+    "gate_reconstructs": 1.0,
+    "gate_not_collapsed": 1.0,
+    "gate_not_dense": 1.0,
+    "gate_features_alive": 1.0,
+    "gate_no_always_on_feature": 1.0,
+    "gate_passed": 1.0,
+    "plain_top1": 0.0,
+    "substituted_top1": 0.0,
+    "top1_drop": 0.0,
+    "agreement": 0.8529705941188238,
+    "images": 4999.0
+  },
+  {
+    "point": {
+      "train.lr": 0.0003
+    },
+    "reused": false,
+    "hash": "3e5770dd078e",
+    "run_name": "case1-control-x16-l1-s0-3e5770",
+    "scales": {
+      "A@add_14": 0.9142115415472076
+    },
+    "loss": 0.29207104444503784,
+    "mse": 0.1494317352771759,
+    "sparsity_penalty": 28.527860641479492,
+    "l0": 70.87646484375,
+    "explained_variance": 0.9462915658950806,
+    "grad_norm": 0.04566708952188492,
+    "tokens": 200003584.0,
+    "dead_fraction": 0.0421549491584301,
+    "eval_mse": 0.14891009628772736,
+    "eval_l0": 71.478173828125,
+    "eval_explained_variance": 0.9502416849136353,
+    "eval_never_fired": 0.0428059920668602,
+    "eval_max_feature_frequency": 0.04200683534145355,
+    "eval_tokens": 204800.0,
+    "gate_finite": 1.0,
+    "gate_reconstructs": 1.0,
+    "gate_not_collapsed": 1.0,
+    "gate_not_dense": 1.0,
+    "gate_features_alive": 1.0,
+    "gate_no_always_on_feature": 1.0,
+    "gate_passed": 1.0,
+    "plain_top1": 0.0,
+    "substituted_top1": 0.0,
+    "top1_drop": 0.0,
+    "agreement": 0.8471694338867773,
+    "images": 4999.0
+  }
+]
