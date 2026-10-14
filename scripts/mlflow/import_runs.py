@@ -14,10 +14,10 @@ Crashes are loaded into an experiment of their own, so that the table view is
 one row per failure with the exception, the message and the configuration hash
 as columns, rather than something to be found by filtering a list of runs.
 
-    python scripts/import_runs.py                       # everything in runs/
-    python scripts/import_runs.py --run runs/case1-control-x16-l1-s0-c2a98d
-    python scripts/import_runs.py --tracking-uri sqlite:///mlflow.db
-    python scripts/import_runs.py --no-crashes          # runs only
+    python scripts/mlflow/import_runs.py                  # everything in runs/
+    python scripts/mlflow/import_runs.py --run runs/case1-main-x16-l1-s0-d3df20
+    python scripts/mlflow/import_runs.py --tracking-uri sqlite:///mlflow.db
+    python scripts/mlflow/import_runs.py --no-crashes     # runs only
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import argparse
 import json
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -107,17 +108,7 @@ def import_run(directory: Path, experiment: str, dry_run: bool = False) -> bool:
                  directory.name, len(params), len(metrics), len(summary))
         return False
 
-    started = status.get("started")
-    elapsed = status.get("elapsed_s")
-    start_ms = int(started * 1000) if started else None
-    end_ms = int((started + elapsed) * 1000) if started and elapsed else None
-
-    # Created through the client rather than start_run, which would stamp the
-    # import time. The run's own clock is in its status file.
-    created = client.create_run(experiment_id=experiment_id,
-                                start_time=start_ms, run_name=directory.name)
-
-    with mlflow.start_run(run_id=created.info.run_id):
+    with mlflow.start_run(experiment_id=experiment_id, run_name=directory.name):
         mlflow.set_tag("source_run", directory.name)
         mlflow.set_tag("status", status.get("status", "UNKNOWN"))
 
@@ -143,11 +134,36 @@ def import_run(directory: Path, experiment: str, dry_run: bool = False) -> bool:
             if path.exists():
                 mlflow.log_artifact(str(path))
 
-    if end_ms:
-        client.set_terminated(created.info.run_id,
-                              status=status.get("status", "FINISHED"), end_time=end_ms)
     log.info("imported %s: %d metric rows", directory.name, len(metrics))
     return True
+
+
+def crash_time(path: Path, report: dict) -> int | None:
+    """When the crash happened, in milliseconds, or None if it cannot be told.
+
+    Preferred from the report itself. Failing that, from the filename, which
+    the handler stamps as ``<date>_<time>_<run>.json``. Failing that, from when
+    the file was written, which is close enough for a crash.
+    """
+    stamp = report.get("time") or report.get("timestamp")
+    if isinstance(stamp, (int, float)):
+        return int(stamp * 1000)
+    if isinstance(stamp, str):
+        try:
+            return int(datetime.fromisoformat(stamp).timestamp() * 1000)
+        except ValueError:
+            pass
+
+    head = "_".join(path.stem.split("_")[:2])
+    try:
+        return int(datetime.strptime(head, "%Y%m%d_%H%M%S").timestamp() * 1000)
+    except ValueError:
+        pass
+
+    try:
+        return int(path.stat().st_mtime * 1000)
+    except OSError:
+        return None
 
 
 def import_crash(path: Path, experiment: str, dry_run: bool = False) -> bool:
@@ -174,7 +190,15 @@ def import_crash(path: Path, experiment: str, dry_run: bool = False) -> bool:
         return False
 
     context = report.get("context", {})
-    with mlflow.start_run(experiment_id=experiment_id, run_name=path.stem):
+
+    # Created through the client so the row carries the time of the crash
+    # rather than the time of the import. A crash report has no duration, so
+    # only the start is set.
+    created = client.create_run(experiment_id=experiment_id,
+                                start_time=crash_time(path, report),
+                                run_name=path.stem)
+
+    with mlflow.start_run(run_id=created.info.run_id):
         mlflow.set_tag("source_run", path.name)
         mlflow.log_params({
             "exception": str(report.get("exception", ""))[:480],
