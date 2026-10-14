@@ -180,3 +180,46 @@ def test_an_empty_tradeoff_raises(tmp_path):
     pytest.importorskip("matplotlib")
     with pytest.raises(ValueError, match="nothing to plot"):
         plot_tradeoff([], tmp_path / "t.png")
+
+
+# ----------------------------------------------------------------------
+# the comparison figure
+# ----------------------------------------------------------------------
+
+def comparison_summary(**overrides):
+    """A summary of the shape ``stitch.compare.summarise`` produces."""
+    bins = 20
+    summary = {
+        "random": 0.19,
+        "within": {"n": 10, "mean": 0.72, "std": 0.01, "min": 0.70, "max": 0.74},
+        "across": {"n": 25, "mean": 0.45, "std": 0.02, "min": 0.42, "max": 0.48},
+        "random_shape": [1.0 / bins] * bins,
+        "within_shape": [1.0 / bins] * bins,
+        "across_shape": [1.0 / bins] * bins,
+    }
+    summary.update(overrides)
+    return summary
+
+
+def test_the_comparison_figure_is_written(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_comparison
+    path = plot_comparison(comparison_summary(), tmp_path / "figures" / "c.png",
+                           title="block 6")
+    assert path.exists() and path.stat().st_size > 0
+
+
+def test_a_summary_without_distributions_raises(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_comparison
+    with pytest.raises(ValueError, match="no distributions"):
+        plot_comparison({"random": 0.1}, tmp_path / "c.png")
+
+
+def test_the_figure_draws_without_a_measurement_to_place(tmp_path):
+    """Seed repeats alone, before the grid: the upper panel still means something."""
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_comparison
+    summary = comparison_summary(across={"n": 0})
+    summary.pop("across_shape")
+    assert plot_comparison(summary, tmp_path / "c.png").exists()
