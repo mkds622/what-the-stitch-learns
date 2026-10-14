@@ -59,7 +59,7 @@ activations:
   shuffle_buffer_tokens: 500000  # PENDING
 
 train:
-  tokens: 400000000
+  tokens: 200000000
   token_batch: 4096
   lr: 1e-4                       
   optimizer: adam
