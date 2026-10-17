@@ -109,6 +109,13 @@ def build_halves(cfg, models: dict[str, object]):
     The upper half comes from the model the coder reads. The lower half comes
     from the model it reconstructs, which is the same one when the coder
     reproduces its own input and a different one otherwise.
+
+    Returns:
+        ``(upper, lower, reference_upper)``. The third is the target model's own
+        upper half, and is None when the two halves already come from one model.
+        It exists so that the unmodified prediction is the target model cut and
+        rejoined, rather than the source model's activation handed to the target
+        model's layers, which is not a model and predicts at chance.
     """
     from stitch.models import downstream, upstream
 
@@ -116,8 +123,12 @@ def build_halves(cfg, models: dict[str, object]):
     source_label, source_node = parse_layer_key(source_key)
     target_label, target_node = parse_layer_key(target_key)
 
-    return (upstream(models[source_label], source_node),
-            downstream(models[target_label], target_node))
+    upper = upstream(models[source_label], source_node)
+    lower = downstream(models[target_label], target_node)
+    reference_upper = (None if source_label == target_label
+                       else upstream(models[target_label], target_node))
+
+    return upper, lower, reference_upper
 
 
 # ----------------------------------------------------------------------
@@ -177,12 +188,13 @@ def run(cfg, resume: Path | None = None) -> dict:
     logger.log_metrics(held_out, step=int(final.get("tokens", 0)))
 
     # The expensive one: does the model still work with the reconstruction in place.
-    upper, lower = build_halves(cfg, models)
+    upper, lower, reference_upper = build_halves(cfg, models)
     substitution = substitution_accuracy(
         coder, upper, lower, eval_loader,
         scale_in=scales[source_key], scale_out=scales[target_key],
         max_images=cfg.eval.images, device=cfg.train.device,
-        label_map=label_map_for(cfg, eval_loader.dataset))
+        label_map=label_map_for(cfg, eval_loader.dataset),
+        reference_upper=reference_upper)
     logger.log_metrics(substitution, step=int(final.get("tokens", 0)))
 
     summary = {"hash": config_hash, "run_name": name,

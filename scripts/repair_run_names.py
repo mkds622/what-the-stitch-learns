@@ -30,14 +30,17 @@ def summaries(run_root: Path) -> list[Path]:
     return sorted(run_root.glob("*/summary.json"))
 
 
-def repair_summaries(run_root: Path, dry_run: bool) -> dict[str, str]:
+def repair_summaries(run_root: Path, dry_run: bool) -> tuple[dict[str, str], int]:
     """Point every summary at its own directory.
 
     Returns:
-        A map from the name that was recorded to the directory's name, for the
-        grid files to be rewritten with.
+        ``(renames, disagreed)``. ``renames`` maps every name a run has ever
+        been recorded under to its directory, which is what the grid files are
+        rewritten with and which includes runs repaired on an earlier pass.
+        ``disagreed`` counts only the summaries this pass had to change.
     """
     renames: dict[str, str] = {}
+    disagreed = 0
 
     for path in summaries(run_root):
         directory = path.parent.name
@@ -47,12 +50,19 @@ def repair_summaries(run_root: Path, dry_run: bool) -> dict[str, str]:
             log.error("%s is not readable: %s", path, error)
             continue
 
+        # Both names map to this directory. The second matters when a summary
+        # was repaired while a sweep was still running: the grid file is written
+        # at the end and records the name as it was, which by then no summary
+        # claims any more.
+        for name in (summary.get("recorded_run_name"), summary.get("run_name")):
+            if name and name != directory:
+                renames[name] = directory
+
         recorded = summary.get("run_name")
         if recorded == directory:
             continue
-        if recorded:
-            renames[recorded] = directory
 
+        disagreed += 1
         log.info("%s recorded itself as %s", directory, recorded)
         if dry_run:
             continue
@@ -63,7 +73,7 @@ def repair_summaries(run_root: Path, dry_run: bool) -> dict[str, str]:
             summary["recorded_run_name"] = recorded
         path.write_text(json.dumps(summary, indent=2))
 
-    return renames
+    return renames, disagreed
 
 
 def repair_grids(paths: list[Path], renames: dict[str, str], dry_run: bool) -> int:
@@ -125,10 +135,10 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     grid_files = sorted(args.grids.glob("*.json"))
-    renames = repair_summaries(args.run_root, args.dry_run)
+    renames, disagreed = repair_summaries(args.run_root, args.dry_run)
     changed = repair_grids(grid_files, renames, args.dry_run)
 
-    print(f"\n{len(renames)} summaries disagreed with their directory")
+    print(f"\n{disagreed} summaries disagreed with their directory")
     print(f"{changed} of {len(grid_files)} grid files {'would be' if args.dry_run else ''} updated")
 
     if not args.dry_run:

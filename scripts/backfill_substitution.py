@@ -157,13 +157,14 @@ def redo(run_dir: Path, reference: str | None = None, dry_run: bool = False) -> 
 
     models, backbones = load_models(cfg)
     loader = eval_loader_for(cfg, backbones)
-    upper, lower = build_halves(cfg, models)
+    upper, lower, reference_upper = build_halves(cfg, models)
 
     result = substitution_accuracy(
         coder, upper, lower, loader,
         scale_in=scales[source_key], scale_out=scales[target_key],
         max_images=cfg.eval.images, device=cfg.train.device,
-        label_map=label_map_for(cfg, loader.dataset))
+        label_map=label_map_for(cfg, loader.dataset),
+        reference_upper=reference_upper)
 
     before = summary.get("substituted_top1")
     summary.update(result)

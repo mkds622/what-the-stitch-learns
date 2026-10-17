@@ -147,6 +147,7 @@ def substitution_accuracy(coder: SparseCoder, upper: nn.Module, lower: nn.Module
                           loader, scale_in: float, scale_out: float,
                           max_images: int, device: torch.device | str = "cpu",
                           label_map: Tensor | None = None,
+                          reference_upper: nn.Module | None = None,
                           ) -> dict[str, float]:
     """What the model predicts when the coder's output replaces the activation.
 
@@ -169,17 +170,31 @@ def substitution_accuracy(coder: SparseCoder, upper: nn.Module, lower: nn.Module
             already agree, which is the case when the loader sees every class
             the model was trained on. Only the two accuracies depend on it;
             agreement compares two predictions and never reads a label.
+        reference_upper: the upper half of the model ``lower`` belongs to, used
+            to produce the unmodified prediction. Required whenever ``upper``
+            and ``lower`` come from different models: there, feeding ``upper``'s
+            activation straight into ``lower`` is not a model at all, it is one
+            network's activation handed to another's layers, and it predicts at
+            chance. Left as None when both halves come from one model, where
+            the activation already in hand is the right one and a second
+            forward pass would buy nothing.
 
     Returns:
         Top-1 accuracy of the unmodified model, top-1 with the reconstruction
         substituted, the gap between them, and the share of images where both
         predict the same class. Agreement is the stricter of the two: a coder
         can preserve accuracy while changing which images are right.
+
+        The unmodified model is the one the coder reconstructs into, cut at the
+        same depth and rejoined with nothing in between, so the only difference
+        between the two is the coder itself.
     """
     device = torch.device(device)
     coder = coder.to(device).eval()
     upper = upper.to(device).eval()
     lower = lower.to(device).eval()
+    if reference_upper is not None:
+        reference_upper = reference_upper.to(device).eval()
 
     if label_map is not None:
         label_map = label_map.to(device)
@@ -196,7 +211,7 @@ def substitution_accuracy(coder: SparseCoder, upper: nn.Module, lower: nn.Module
             labels = label_map[labels]
 
         activation = upper(images)
-        plain = lower(activation)
+        plain = lower(activation if reference_upper is None else reference_upper(images))
 
         flat = activation.reshape(-1, activation.shape[-1]) * scale_in
         reconstruction, _ = coder(flat)

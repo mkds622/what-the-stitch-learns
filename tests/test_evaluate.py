@@ -310,6 +310,57 @@ def test_with_the_map_a_perfect_model_scores_one(scattered_loader):
     assert result["substituted_top1"] == 1.0
 
 
+# ----------------------------------------------------------------------
+# the reference the stitch is compared against
+#
+# When the two halves come from different models, feeding the first model's
+# activation straight into the second model's layers is not a model. It
+# predicts at chance, and comparing the stitch against it says nothing. These
+# fix the reference as the target model cut and rejoined.
+# ----------------------------------------------------------------------
+
+class ZeroUpper(nn.Module):
+    """An upper half whose activation the lower half cannot use."""
+
+    def forward(self, x):
+        return torch.zeros_like(x)
+
+
+def test_without_a_reference_the_baseline_is_the_broken_hybrid(scattered_loader):
+    """The defect this exists to prevent, reproduced deliberately."""
+    result = substitution_accuracy(PerfectCoder(), ZeroUpper(), ScatterLower(),
+                                   scattered_loader, scale_in=1.0, scale_out=1.0,
+                                   max_images=20,
+                                   label_map=torch.tensor(SUBSET_TO_FULL))
+    # Both sides are the same useless thing, so they agree perfectly and the
+    # accuracy says nothing about the coder.
+    assert result["plain_top1"] == result["substituted_top1"]
+    assert result["agreement"] == 1.0
+
+
+def test_a_reference_upper_supplies_the_unmodified_prediction(scattered_loader):
+    """`plain` comes from the target model's own upper half, not the source's."""
+    result = substitution_accuracy(PerfectCoder(), ZeroUpper(), ScatterLower(),
+                                   scattered_loader, scale_in=1.0, scale_out=1.0,
+                                   max_images=20,
+                                   label_map=torch.tensor(SUBSET_TO_FULL),
+                                   reference_upper=Identity())
+    assert result["plain_top1"] == 1.0
+    assert result["substituted_top1"] < 1.0
+    assert result["top1_drop"] > 0.0
+
+
+def test_the_reference_is_ignored_when_both_halves_are_one_model(scattered_loader):
+    """Passing the same upper half twice changes nothing."""
+    without = substitution_accuracy(PerfectCoder(), Identity(), ScatterLower(),
+                                    scattered_loader, scale_in=1.0, scale_out=1.0,
+                                    max_images=20)
+    with_same = substitution_accuracy(PerfectCoder(), Identity(), ScatterLower(),
+                                      scattered_loader, scale_in=1.0, scale_out=1.0,
+                                      max_images=20, reference_upper=Identity())
+    assert without == with_same
+
+
 def test_agreement_does_not_depend_on_the_map(scattered_loader):
     """It compares two predictions, so no labels enter it either way."""
     without = substitution_accuracy(PerfectCoder(), Identity(), ScatterLower(),
