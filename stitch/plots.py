@@ -37,6 +37,17 @@ class Point:
     n: int
 
 
+def format_x(value: float) -> str:
+    """An axis value, readable whether it is a token count or a coefficient.
+
+    Token budgets read best with thousands separators and no decimals, which is
+    what every curve was originally plotted against. A sparsity coefficient
+    below one prints as ``0`` under that format, so a perfectly good sweep reads
+    as six points stacked at the origin.
+    """
+    return f"{value:,.0f}" if abs(value) >= 1000 else f"{value:g}"
+
+
 def series(results: list[dict], x: str, metric: str) -> list[Point]:
     """One point per distinct value of ``x``, averaged over everything else.
 
@@ -141,7 +152,7 @@ def plot_curve(points: list[Point], metric: str, x_label: str, path: Path,
         flat = flattening_point(points, tolerance)
         if flat is not None:
             axes.axvline(flat, linestyle="--", linewidth=1)
-            axes.annotate(f"flat from {flat:,.0f}", xy=(flat, means[xs.index(flat)]),
+            axes.annotate(f"flat from {format_x(flat)}", xy=(flat, means[xs.index(flat)]),
                           xytext=(6, 8), textcoords="offset points", fontsize=9)
 
     if log_x:

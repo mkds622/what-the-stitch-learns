@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stitch.grid import read_results                                  # noqa: E402
 from stitch.plots import (                                            # noqa: E402
-    flattening_point, noise_from, plot_curve, plot_tradeoff, series,
+    flattening_point, format_x, noise_from, plot_curve, plot_tradeoff, series,
 )
 
 
@@ -59,11 +59,12 @@ def main(argv=None) -> int:
     points = series(results, args.x, args.metric)
     for point in points:
         spread = "" if point.std is None else f"  +/- {point.std:.5g}"
-        print(f"  {args.x}={point.x:<14,.0f} {args.metric}={point.mean:.5g}{spread}  n={point.n}")
+        print(f"  {args.x}={format_x(point.x):<14} "
+              f"{args.metric}={point.mean:.5g}{spread}  n={point.n}")
 
     if tolerance is not None:
         flat = flattening_point(points, tolerance)
-        print(f"\nflattens at {flat:,.0f}" if flat is not None
+        print(f"\nflattens at {format_x(flat)}" if flat is not None
               else "\nstill moving at the largest value measured")
 
     plot_curve(points, args.metric, args.x, args.out,
