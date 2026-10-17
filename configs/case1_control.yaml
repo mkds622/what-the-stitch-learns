@@ -44,7 +44,7 @@ coder:
   expansion: 16                  
   sparsity:
     mode: l1
-    coeff: 0.005                  
+    coeff: 30.72                  
     normalize_decoder: true
   dead_features:
     track_window: 1000

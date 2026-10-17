@@ -210,7 +210,7 @@ class DeadFeatureTracker(nn.Module):
     Nothing is done about them yet. Dead features are commonly revived by
     periodic resampling or by an auxiliary term that makes them fire; which, if
     either, is needed depends on how large the fraction actually gets, so we will
-    measure it first. TODO: add a mechanism to revive dead features if required, 
+    measure it first. TODO: add a mechanism to revive dead features if required,
     and a test that it works.
     """
 
@@ -284,10 +284,17 @@ def compute_loss(coder: SparseCoder, x: Tensor, target: Tensor,
     if coder.sparsity == "l1":
         # Weighted by dictionary vector length, so the penalty measures the size
         # of the contribution a feature makes rather than a number the decoder
-        # is free to rescale. With normalisation on the weights are one and this
-        # is the plain sum. Not decoder_norms(), which is detached for
-        # reporting; the penalty has to be able to push back on a vector growing.
-        penalty = (latents * coder.decoder.weight.norm(dim=0)).sum(dim=-1).mean()
+        # is free to rescale. With normalisation on the weights are one. Not
+        # decoder_norms(), which is detached for reporting; the penalty has to
+        # be able to push back on a vector growing.
+        #
+        # Averaged over the dictionary, not summed over it. The reconstruction
+        # term is a mean over elements and does not grow with width, so a summed
+        # penalty would grow with dictionary size and the coefficient between
+        # them would mean a different amount of pressure at every width and
+        # expansion factor. Both terms are per-unit quantities here, so one
+        # coefficient means the same thing on either model pair.
+        penalty = (latents * coder.decoder.weight.norm(dim=0)).mean(dim=-1).mean()
         loss = mse + coeff * penalty
     else:
         penalty = torch.zeros((), device=x.device)
@@ -331,7 +338,7 @@ def build_coder(cfg, d_in: int, d_out: int) -> tuple[SparseCoder, DeadFeatureTra
         k=k,
         normalize_decoder=cfg.coder.sparsity.normalize_decoder,
     )
-   
+
     tracker = DeadFeatureTracker(coder.d_latent, cfg.coder.dead_features.track_window)
 
     log.info("coder %d -> %d latents -> %d, %s sparsity",

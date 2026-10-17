@@ -142,7 +142,7 @@ cross-coder writing into a differently shaped space needs no extra setting.
 | Key | Default | Meaning |
 |---|---|---|
 | `mode` | `l1` | `l1` or `topk` |
-| `coeff` | `1e-3` | L1 penalty weight. Ignored under `topk` |
+| `coeff` | `6.0` | L1 penalty weight. Averaged over the dictionary, so it is a ratio between two per-unit quantities and means the same pressure at any width or expansion. Ignored under `topk` |
 | `k` | `null` | Exact active count. Ignored under `l1` |
 | `k_frac` | `0.01` | Fallback for `k`, as a fraction of width |
 | `normalize_decoder` | `true` | Unit-norm decoder columns |

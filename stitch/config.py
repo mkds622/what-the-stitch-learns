@@ -166,7 +166,7 @@ class SparsityConfig:
     """
 
     mode: Literal["l1", "topk"] = "l1"
-    coeff: float = 1e-3               # L1 penalty weight; ignored under topk
+    coeff: float = 6.0                # L1 penalty weight, per latent; ignored under topk
     k: int | None = None              # exact active count; ignored under l1
     k_frac: float = 0.01              # fallback for k, as a fraction of width
     normalize_decoder: bool = True    # unit-norm decoder columns, standard for SAEs
