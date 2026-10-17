@@ -1,0 +1,40 @@
+[
+  {
+    "point": {
+      "coder.sparsity.coeff": 1
+    },
+    "reused": false,
+    "hash": "cb9854422591",
+    "run_name": "case2-main-x16-l1-s0-c599a2",
+    "scales": {
+      "A@add_12": 2.3130884711750213,
+      "B@add_12": 0.8669581804801552
+    },
+    "loss": 0.3610436022281647,
+    "mse": 0.3459605574607849,
+    "sparsity_penalty": 0.01508304849267006,
+    "l0": 1083.800048828125,
+    "explained_variance": 0.6290193796157837,
+    "grad_norm": 0.36052414774894714,
+    "tokens": 50003968.0,
+    "dead_fraction": 0.1273600310087204,
+    "eval_mse": 0.33601870000362394,
+    "eval_l0": 1088.1727294921875,
+    "eval_explained_variance": 0.6214011907577515,
+    "eval_never_fired": 0.1979166716337204,
+    "eval_max_feature_frequency": 0.9197118878364563,
+    "eval_tokens": 204800.0,
+    "gate_finite": 1.0,
+    "gate_reconstructs": 1.0,
+    "gate_not_collapsed": 1.0,
+    "gate_not_dense": 0.0,
+    "gate_features_alive": 1.0,
+    "gate_no_always_on_feature": 0.0,
+    "gate_passed": 0.0,
+    "plain_top1": 0.000600120024004801,
+    "substituted_top1": 0.7865573114622925,
+    "top1_drop": -0.7859571914382877,
+    "agreement": 0.00020004000800160032,
+    "images": 4999.0
+  }
+]

@@ -134,19 +134,25 @@ def run(cfg, resume: Path | None = None) -> dict:
 
     set_seed(cfg.train.seed)
 
+    # The run's identity is fixed here, before anything can change the
+    # configuration. Opening the dataset writes the class count it found back
+    # into cfg, and the hash covers every field, so a name computed later in
+    # this function names a different run than the directory being written to.
+    name, config_hash = cfg.run_name(), cfg.hash()
+
     logger = get_logger(cfg)
-    logger.start_run(cfg.run_name())
+    logger.start_run(name)
     run_dir = Path(logger.run_dir)
 
     setup_logging(run_dir, console=True)
     install_crash_handler(run_dir, crash_dir=Path(cfg.logging.run_root) / "crashes",
-                          logger=logger, context={"hash": cfg.hash()})
+                          logger=logger, context={"hash": config_hash})
 
     for note in cfg.pending_decisions():
         log.warning("pending: %s", note)
 
     logger.log_params(cfg.flat())
-    logger.log_dict({"hash": cfg.hash(), "pending": cfg.pending_decisions()}, "config.json")
+    logger.log_dict({"hash": config_hash, "pending": cfg.pending_decisions()}, "config.json")
 
     models, backbones = load_models(cfg)
     training, evaluation, eval_loader = build_streams(cfg, models, backbones)
@@ -179,7 +185,7 @@ def run(cfg, resume: Path | None = None) -> dict:
         label_map=label_map_for(cfg, eval_loader.dataset))
     logger.log_metrics(substitution, step=int(final.get("tokens", 0)))
 
-    summary = {"hash": cfg.hash(), "run_name": cfg.run_name(),
+    summary = {"hash": config_hash, "run_name": name,
                "scales": scales, **final, **held_out, **substitution}
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     logger.end_run()

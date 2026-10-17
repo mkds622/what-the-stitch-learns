@@ -181,14 +181,21 @@ def test_a_tiny_run_produces_a_summary(cfg, tmp_path):
 
     summary = run(cfg)
 
-    assert summary["hash"] == cfg.hash()
+    # The identity has to name the directory the run actually wrote into. It
+    # used to be recomputed at the end, by which time opening the dataset had
+    # written the class count back into the configuration and changed the hash,
+    # so a run's summary named a run that did not exist.
+    run_dir = tmp_path / "runs" / summary["run_name"]
+    assert run_dir.is_dir()
+    assert run_dir.name.endswith(summary["hash"][:6])
+
     for key in ("mse", "eval_explained_variance", "gate_passed",
                 "plain_top1", "substituted_top1", "agreement"):
         assert key in summary
 
-    written = json.loads(
-        (next((tmp_path / "runs").iterdir()) / "summary.json").read_text())
+    written = json.loads((run_dir / "summary.json").read_text())
     assert written["hash"] == summary["hash"]
+    assert written["run_name"] == summary["run_name"]
 
 
 @needs_everything
