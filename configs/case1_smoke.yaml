@@ -17,6 +17,7 @@ dataset:
   source_url: ""                 # PENDING: which published subset
   split: train
   eval_split: val
+  label_reference: "/data/datasets/imagenet/train"
 
 models:
   a:

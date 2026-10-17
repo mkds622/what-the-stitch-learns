@@ -245,6 +245,84 @@ def test_accuracy_is_a_proportion(loader):
 
 
 # ----------------------------------------------------------------------
+# substitution against the right class numbering
+#
+# The bug these exist to prevent: the loader numbers a subset's classes from
+# zero, the model predicts over the full set, and comparing the two gives
+# almost exactly zero rather than an error. The model below is right on every
+# image by construction, so anything other than a perfect score is the
+# numbering and not the model.
+# ----------------------------------------------------------------------
+
+FULL_CLASSES = 10
+#: Where each of the five subset classes sits in the model's numbering. None of
+#: them coincides with its own position, so an untranslated comparison scores
+#: zero rather than something that could be mistaken for a weak model.
+SUBSET_TO_FULL = [3, 7, 1, 9, 5]
+
+
+class ScatterLower(nn.Module):
+    """Predicts ``SUBSET_TO_FULL[j]`` for an image that is one-hot at ``j``."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(WIDTH, FULL_CLASSES, bias=False)
+        with torch.no_grad():
+            self.fc.weight.zero_()
+            for subset_index, full_index in enumerate(SUBSET_TO_FULL):
+                self.fc.weight[full_index, subset_index] = 1.0
+
+    def forward(self, x):
+        return self.fc(x)
+
+
+class Identity(nn.Module):
+    """An upper half that passes the activation through untouched."""
+
+    def forward(self, x):
+        return x
+
+
+@pytest.fixture
+def scattered_loader():
+    """One-hot images labelled in the loader's own numbering, zero to four."""
+    subset_labels = torch.arange(CLASSES).repeat(4)          # 20 images
+    images = torch.zeros(subset_labels.shape[0], WIDTH)
+    images[torch.arange(subset_labels.shape[0]), subset_labels] = 1.0
+    return [(images[:10], subset_labels[:10]), (images[10:], subset_labels[10:])]
+
+
+def test_without_the_map_a_perfect_model_scores_zero(scattered_loader):
+    """The symptom the defect produced in every run before this."""
+    result = substitution_accuracy(PerfectCoder(), Identity(), ScatterLower(),
+                                   scattered_loader, scale_in=1.0, scale_out=1.0,
+                                   max_images=20)
+    assert result["plain_top1"] == 0.0
+    assert result["substituted_top1"] == 0.0
+
+
+def test_with_the_map_a_perfect_model_scores_one(scattered_loader):
+    result = substitution_accuracy(PerfectCoder(), Identity(), ScatterLower(),
+                                   scattered_loader, scale_in=1.0, scale_out=1.0,
+                                   max_images=20,
+                                   label_map=torch.tensor(SUBSET_TO_FULL))
+    assert result["plain_top1"] == 1.0
+    assert result["substituted_top1"] == 1.0
+
+
+def test_agreement_does_not_depend_on_the_map(scattered_loader):
+    """It compares two predictions, so no labels enter it either way."""
+    without = substitution_accuracy(PerfectCoder(), Identity(), ScatterLower(),
+                                    scattered_loader, scale_in=1.0, scale_out=1.0,
+                                    max_images=20)
+    with_map = substitution_accuracy(PerfectCoder(), Identity(), ScatterLower(),
+                                     scattered_loader, scale_in=1.0, scale_out=1.0,
+                                     max_images=20,
+                                     label_map=torch.tensor(SUBSET_TO_FULL))
+    assert without["agreement"] == with_map["agreement"] == 1.0
+
+
+# ----------------------------------------------------------------------
 # validity gates
 # ----------------------------------------------------------------------
 
@@ -292,6 +370,25 @@ def test_a_collapsed_coder_is_caught_despite_perfect_sparsity(cfg):
     assert result["not_collapsed"] is False
 
 
+def test_density_is_judged_against_the_activation_not_the_dictionary(cfg):
+    """A code using most of the activation's own width is dense, however wide
+    the dictionary is.
+
+    Six active features describing an eight-wide activation is dense: it is
+    most of what it takes to reach any point in that space at all. Against a
+    thirty-two entry dictionary the same six would read as comfortably sparse,
+    which is the reading this gate used to take.
+    """
+    assert check_gates(passing(eval_l0=6.0), cfg, WIDTH)["not_dense"] is False
+    assert check_gates(passing(eval_l0=6.0), cfg, LATENT)["not_dense"] is True
+
+
+def test_the_threshold_scales_with_the_activation_width(cfg):
+    """The same fraction at twice the width permits twice the active features."""
+    assert check_gates(passing(eval_l0=3.0), cfg, 8)["not_dense"] is False
+    assert check_gates(passing(eval_l0=3.0), cfg, 16)["not_dense"] is True
+
+
 # ----------------------------------------------------------------------
 # the hook
 # ----------------------------------------------------------------------
@@ -312,3 +409,14 @@ def test_evaluate_fails_a_coder_that_fires_nothing(cfg):
     metrics = evaluate(ZeroCoder(), stream(), KEY, KEY, cfg)
     assert metrics["gate_passed"] == 0.0
     assert metrics["gate_not_collapsed"] == 0.0
+
+
+def test_evaluate_judges_density_against_the_output_width(cfg):
+    """The hook passes the reconstruction's width, not the dictionary's.
+
+    Eight features active, an eight-wide activation, a thirty-two entry
+    dictionary. Dense against the activation, sparse against the dictionary.
+    """
+    metrics = evaluate(PerfectCoder(active=8), stream(), KEY, KEY, cfg)
+    assert metrics["eval_l0"] == pytest.approx(8.0)
+    assert metrics["gate_not_dense"] == 0.0

@@ -17,6 +17,7 @@ dataset:
   eval_split: val
   num_workers: 8
   pin_memory: true
+  label_reference: "/data/datasets/imagenet/train"
 
 models:
   a:

@@ -31,6 +31,7 @@ from stitch.coder import build_coder
 from stitch.config import load_config
 from stitch.data import build_loader, build_transform, build_dataset
 from stitch.evaluate import evaluate, substitution_accuracy
+from stitch.labels import label_map_for
 from stitch.models import parse_layer_key, trace
 from stitch.train import resolve_layers, set_seed, train
 
@@ -174,7 +175,8 @@ def run(cfg, resume: Path | None = None) -> dict:
     substitution = substitution_accuracy(
         coder, upper, lower, eval_loader,
         scale_in=scales[source_key], scale_out=scales[target_key],
-        max_images=cfg.eval.images, device=cfg.train.device)
+        max_images=cfg.eval.images, device=cfg.train.device,
+        label_map=label_map_for(cfg, eval_loader.dataset))
     logger.log_metrics(substitution, step=int(final.get("tokens", 0)))
 
     summary = {"hash": cfg.hash(), "run_name": cfg.run_name(),

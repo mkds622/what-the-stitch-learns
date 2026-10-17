@@ -70,6 +70,7 @@ a merge path. Not present yet.
 | `split` / `eval_split` | `train` / `val` | Split names |
 | `num_classes` | `null` | Read from the dataset when unset |
 | `notes` | `""` | Free text, e.g. which published ImageNet-100 subset |
+| `label_reference` | `""` | Split directory of the dataset the models were trained on. Empty when the loader already sees every class the model knows |
 | `num_workers` | `8` | Loader processes. 0 runs in the main process |
 | `pin_memory` | `true` | Ignored when the device is CPU |
 
@@ -239,7 +240,7 @@ failed.
 | `images` | `5000` | Images used for the substitution measurement |
 | `min_explained_variance` | `0.5` | Below this the coder is not reconstructing |
 | `min_l0` | `1.0` | Below this it has collapsed to firing nothing |
-| `max_l0` | `256.0` | Above this it is dense and nothing is disentangled |
+| `max_l0_frac` | `0.5` | Active features allowed per token, as a fraction of the width of the activation being reconstructed. Above it any target is reachable and nothing is disentangled |
 | `max_never_fired` | `0.5` | Share of the dictionary allowed to be silent |
 | `max_feature_frequency` | `0.9` | A feature active on more tokens than this is a bias |
 | `ridge` | `1e-3` | Added to the covariance diagonal, as a fraction of its mean |

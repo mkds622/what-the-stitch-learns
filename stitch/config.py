@@ -52,6 +52,8 @@ class DatasetConfig:
     eval_split: str = "val"
     num_classes: int | None = None    # filled from the dataset when left unset
     notes: str = ""                   # e.g. which published ImageNet-100 subset
+    label_reference: str = ""         # split dir of the dataset the models were
+                                      # trained on, whose class order is theirs
     num_workers: int = 8
     pin_memory: bool = True
 
@@ -301,7 +303,7 @@ class EvalConfig:
     images: int = 5000
     min_explained_variance: float = 0.5
     min_l0: float = 1.0
-    max_l0_frac: float = 0.05
+    max_l0_frac: float = 0.5          # fraction of the reconstructed activation's width
     max_never_fired: float = 0.5
     max_feature_frequency: float = 0.9
 
@@ -430,7 +432,7 @@ class Config:
             out.append("layer_pairs.count is a placeholder and no sweep ranking exists yet")
         thresholds = (self.eval.min_explained_variance, self.eval.min_l0, self.eval.max_l0_frac,
                       self.eval.max_never_fired, self.eval.max_feature_frequency)
-        if thresholds == (0.5, 1.0, 0.05, 0.5, 0.9):
+        if thresholds == (0.5, 1.0, 0.5, 0.5, 0.9):
             out.append("eval gate thresholds are the unconfirmed defaults(placeholders)")
         return out
 
