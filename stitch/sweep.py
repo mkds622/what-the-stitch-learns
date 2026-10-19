@@ -22,6 +22,12 @@ twelve of those; every pair against every other is 144.
 
 Scaling is not applied here. The score is a ratio of variances, so it is
 unchanged by scaling either side.
+
+The map is fitted on one split and scored on another. A linear map from 768
+dimensions to 768 chooses enough coefficients that scoring it on the tokens it
+was fitted to flatters it, and the coder it is a baseline for is always scored
+on held-out tokens. Measuring the two the same way is the only way the
+comparison between them means anything.
 """
 
 from __future__ import annotations
@@ -170,6 +176,58 @@ def fit_linear(moments: CrossMoments, source: str, target: str,
     return weight.to(torch.float32), bias.to(torch.float32), score
 
 
+def score_linear(moments: CrossMoments, source: str, target: str,
+                 weight: Tensor, bias: Tensor) -> float:
+    """How much of the target's variance a given map accounts for, on these tokens.
+
+    Separate from :func:`fit_linear` so that a map can be fitted on one split
+    and scored on another. Everything is computed from the accumulated sums, so
+    no predictions are formed and the tokens are never held.
+
+    Writing the map as ``x W + b``, the residual sum of squares expands into
+    terms the moments already carry::
+
+        sum |y|^2  -  2 [ sum(W * sum_xy) + b . sum_y ]
+                   +  sum(W * (sum_xx W))  +  2 (sum_x W) . b  +  n |b|^2
+
+    Args:
+        moments: sums over the tokens to score on.
+        source: the layer read.
+        target: the layer reconstructed.
+        weight: ``(width_source, width_target)``.
+        bias: ``(width_target,)``.
+
+    Returns:
+        One minus residual over total variance. Unlike the in-sample score this
+        can be negative, which means the map does worse on these tokens than
+        predicting the target's mean, and is the honest answer when a fit does
+        not generalise.
+    """
+    if moments.tokens == 0:
+        raise ValueError("no tokens were accumulated")
+
+    n = moments.tokens
+    w = weight.to(torch.float64)
+    b = bias.to(torch.float64)
+
+    sum_x = moments.sum_x[source]
+    sum_xx = moments.sum_xx[source]
+    sum_y = moments.sum_y[target]
+    sum_y2 = moments.sum_y2[target]
+    sum_xy = moments.sum_xy[(source, target)]
+
+    residual = (float(sum_y2.sum())
+                - 2.0 * (float((w * sum_xy).sum()) + float(sum_y @ b))
+                + float((w * (sum_xx @ w)).sum())
+                + 2.0 * float((sum_x @ w) @ b)
+                + n * float(b @ b))
+
+    mean_y = sum_y / n
+    total = float(sum_y2.sum()) - n * float(mean_y @ mean_y)
+
+    return 1.0 - residual / total if total > 0 else 0.0
+
+
 class LinearStitch(nn.Module):
     """A fitted linear map, shaped like a coder so it can be evaluated like one.
 
@@ -220,17 +278,32 @@ def accumulate(extractor, loader, pairs, widths, fit_tokens: int,
     if moments.tokens == 0:
         raise ValueError("the loader produced no images")
 
-    log.info("fitted over %d tokens", moments.tokens)
+    log.info("accumulated %d tokens", moments.tokens)
     return moments
 
 
-def rank(moments: CrossMoments, ridge: float) -> list[dict]:
-    """Every pair, scored and sorted best first."""
+def rank(moments: CrossMoments, ridge: float,
+         held_out: CrossMoments | None = None) -> list[dict]:
+    """Every pair, scored and sorted best first.
+
+    Args:
+        moments: the sums the map is fitted on.
+        ridge: damping for the fit.
+        held_out: sums over different tokens. Given, the reported score is
+            measured on those and the in-sample one is kept alongside it.
+            Omitted, the reported score is in-sample, which is what a run
+            without a second split can offer.
+    """
     records = []
     for source, target in moments.pairs:
-        _, _, score = fit_linear(moments, source, target, ridge)
-        records.append({"source": source, "target": target,
-                        "explained_variance": score})
+        weight, bias, in_sample = fit_linear(moments, source, target, ridge)
+        record = {"source": source, "target": target,
+                  "explained_variance": in_sample,
+                  "explained_variance_in_sample": in_sample}
+        if held_out is not None:
+            record["explained_variance"] = score_linear(
+                held_out, source, target, weight, bias)
+        records.append(record)
 
     records.sort(key=lambda record: record["explained_variance"], reverse=True)
     for position, record in enumerate(records):
@@ -290,6 +363,9 @@ def run_sweep(cfg) -> list[dict]:
     transform = build_transform(backbones["A"])
     loader = build_loader(cfg, build_dataset(cfg, cfg.dataset.split, transform),
                           cfg.activations.extraction_batch_size, shuffle=True)
+    held_out_loader = build_loader(
+        cfg, build_dataset(cfg, cfg.dataset.eval_split, transform),
+        cfg.activations.extraction_batch_size, shuffle=False)
 
     probe = next(iter(loader))[0][:2].to(device)
     nodes, widths = {}, {}
@@ -316,12 +392,16 @@ def run_sweep(cfg) -> list[dict]:
 
     moments = accumulate(extract, loader, pairs, widths,
                          cfg.sweep.fit_tokens, cfg.train.device)
-    records = rank(moments, cfg.sweep.ridge)
+    held_out = accumulate(extract, held_out_loader, pairs, widths,
+                          cfg.sweep.fit_tokens, cfg.train.device)
+    records = rank(moments, cfg.sweep.ridge, held_out=held_out)
 
     write_ranking(records, Path(cfg.sweep.out_file), context={
         "models": {label: spec.name for label, spec in specs.items()},
         "dataset": cfg.dataset.name,
         "tokens": moments.tokens,
+        "held_out_tokens": held_out.tokens,
+        "held_out_split": cfg.dataset.eval_split,
         "ridge": cfg.sweep.ridge,
         "matched_depth_only": cfg.layer_pairs.matched_depth_only,
     })

@@ -25,7 +25,7 @@ torch = pytest.importorskip("torch")
 
 from stitch.sweep import (                                              # noqa: E402
     CrossMoments, LinearStitch, accumulate, candidate_pairs, fit_linear,
-    rank, read_ranking, top_pairs, write_ranking,
+    rank, read_ranking, score_linear, top_pairs, write_ranking,
 )
 
 WIDTH = 6
@@ -151,6 +151,72 @@ def test_fitting_nothing_raises():
 
 
 # ----------------------------------------------------------------------
+# scoring a map on tokens it was not fitted to
+#
+# The coder this is a baseline for is always scored on held-out tokens. A map
+# with 768 coefficients per output dimension scored on its own fitting tokens
+# flatters itself, so the two would not be comparable.
+# ----------------------------------------------------------------------
+
+def test_a_linear_relation_is_scored_perfectly_on_unseen_tokens():
+    torch.manual_seed(10)
+    weight_true = torch.randn(WIDTH, WIDTH)
+    bias_true = torch.randn(WIDTH)
+
+    fit_x = torch.randn(TOKENS, WIDTH)
+    weight, bias, _ = fit_linear(
+        moments_from(fit_x, fit_x @ weight_true + bias_true), A, B, ridge=1e-9)
+
+    unseen = torch.randn(TOKENS, WIDTH)
+    held_out = moments_from(unseen, unseen @ weight_true + bias_true)
+
+    assert score_linear(held_out, A, B, weight, bias) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_scoring_the_fitting_tokens_matches_the_in_sample_score():
+    """The two formulas are the same quantity when the tokens are the same."""
+    torch.manual_seed(11)
+    x = torch.randn(20_000, WIDTH)
+    y = x @ torch.randn(WIDTH, WIDTH) + torch.randn(20_000, WIDTH) * 2.0
+
+    moments = moments_from(x, y)
+    weight, bias, in_sample = fit_linear(moments, A, B, ridge=1e-9)
+
+    assert score_linear(moments, A, B, weight, bias) == pytest.approx(in_sample, abs=1e-4)
+
+
+def test_a_map_that_does_not_generalise_scores_below_zero():
+    """Worse than predicting the target's mean, which in-sample could never report."""
+    torch.manual_seed(12)
+    fit_x = torch.randn(TOKENS, WIDTH)
+    weight, bias, _ = fit_linear(
+        moments_from(fit_x, fit_x @ torch.randn(WIDTH, WIDTH)), A, B, ridge=1e-9)
+
+    unrelated = moments_from(torch.randn(TOKENS, WIDTH), torch.randn(TOKENS, WIDTH))
+
+    assert score_linear(unrelated, A, B, weight, bias) < 0.0
+
+
+def test_scoring_without_tokens_raises():
+    weight, bias, _ = fit_linear(
+        moments_from(torch.randn(TOKENS, WIDTH), torch.randn(TOKENS, WIDTH)),
+        A, B, ridge=1e-6)
+    empty = CrossMoments(pairs=[(A, B)], widths={A: WIDTH, B: WIDTH})
+
+    with pytest.raises(ValueError, match="no tokens"):
+        score_linear(empty, A, B, weight, bias)
+
+
+def test_a_constant_target_scores_zero_rather_than_dividing_by_zero_held_out():
+    weight, bias, _ = fit_linear(
+        moments_from(torch.randn(TOKENS, WIDTH), torch.randn(TOKENS, WIDTH)),
+        A, B, ridge=1e-6)
+    constant = moments_from(torch.randn(TOKENS, WIDTH), torch.ones(TOKENS, WIDTH))
+
+    assert score_linear(constant, A, B, weight, bias) == 0.0
+
+
+# ----------------------------------------------------------------------
 # accumulating in pieces
 # ----------------------------------------------------------------------
 
@@ -227,6 +293,45 @@ def test_rank_positions_start_at_zero():
     assert [record["rank"] for record in records] == [0, 1, 2]
 
 
+def test_ranking_without_held_out_reports_the_in_sample_score():
+    for record in rank(three_pairs(), ridge=1e-6):
+        assert record["explained_variance"] == record["explained_variance_in_sample"]
+
+
+def test_held_out_tokens_decide_the_reported_score():
+    """And the in-sample number is kept, so the gap between them is visible."""
+    records = rank(three_pairs(), ridge=1e-6, held_out=three_pairs())
+    assert all("explained_variance_in_sample" in record for record in records)
+
+    identical = next(r for r in records if r["source"] == "A@three")
+    assert identical["explained_variance"] == pytest.approx(1.0, abs=1e-4)
+
+
+def test_held_out_scoring_can_reorder_the_ranking():
+    """A pair that fitted noise in-sample falls when scored on other tokens."""
+    torch.manual_seed(13)
+    pairs = [("A@one", "B@one"), ("A@two", "B@two")]
+    widths = {name: WIDTH for pair in pairs for name in pair}
+
+    weight = torch.randn(WIDTH, WIDTH)
+
+    def built(tokens):
+        x_real = torch.randn(tokens, WIDTH)
+        x_noise = torch.randn(tokens, WIDTH)
+        moments = CrossMoments(pairs=pairs, widths=widths)
+        moments.update({
+            # Genuinely linear, so it holds up on any tokens.
+            "A@one": x_real, "B@one": x_real @ weight,
+            # Unrelated, so whatever the fit found does not survive new tokens.
+            "A@two": x_noise, "B@two": torch.randn(tokens, WIDTH),
+        })
+        return moments
+
+    records = rank(built(400), ridge=1e-6, held_out=built(4000))
+    assert records[0]["source"] == "A@one"
+    assert records[-1]["explained_variance"] < records[-1]["explained_variance_in_sample"]
+
+
 # ----------------------------------------------------------------------
 # the file the training grid reads
 # ----------------------------------------------------------------------
@@ -291,4 +396,3 @@ def test_the_fitted_map_holds_no_gradients():
         moments_from(torch.randn(TOKENS, WIDTH), torch.randn(TOKENS, WIDTH)), A, B, 1e-6)
     stitch = LinearStitch(weight, bias)
     assert not any(parameter.requires_grad for parameter in stitch.parameters())
-    
