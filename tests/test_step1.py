@@ -63,6 +63,30 @@ def test_cached_mode_requires_cache_dir():
         cfg.validate()
 
 
+def test_a_control_run_is_a_valid_configuration():
+    """Drawing tokens from measured statistics rather than from images."""
+    cfg = Config()
+    cfg.activations.mode = "gaussian"
+    cfg.layer_pairs.ranking_file = "sweeps/layer_sweep_control.json"
+    cfg.validate()
+
+
+def test_a_control_run_without_a_sweep_is_refused():
+    """It draws from statistics something had to measure, and silently falling
+    back to an unmatched Gaussian would control for nothing."""
+    cfg = Config()
+    cfg.activations.mode = "gaussian"
+    cfg.layer_pairs.ranking_file = None
+    with pytest.raises(ValueError, match="ranking_file"):
+        cfg.validate()
+
+
+def test_a_sweep_ranking_is_not_required_of_an_ordinary_run():
+    cfg = Config()
+    cfg.layer_pairs.ranking_file = None
+    cfg.validate()
+
+
 def test_layer_key_format_is_enforced():
     cfg = Config()
     cfg.activations.layers = ["blocks.6"]
