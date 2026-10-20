@@ -93,6 +93,7 @@ class CrossMoments:
     sum_xx: dict[str, Tensor] = field(default_factory=dict)
     sum_y: dict[str, Tensor] = field(default_factory=dict)
     sum_y2: dict[str, Tensor] = field(default_factory=dict)
+    sum_yy: dict[str, Tensor] = field(default_factory=dict)
     sum_xy: dict[tuple[str, str], Tensor] = field(default_factory=dict)
     tokens: int = 0
 
@@ -103,6 +104,12 @@ class CrossMoments:
             self.sum_xx.setdefault(source, zeros(self.widths[source], self.widths[source]))
             self.sum_y.setdefault(target, zeros(self.widths[target]))
             self.sum_y2.setdefault(target, zeros(self.widths[target]))
+            # The target's full covariance, not only its diagonal. The fit needs
+            # the diagonal alone, since it only ever divides by a total
+            # variance, but a control that has to generate activations with the
+            # same second-order structure needs every off-diagonal term too, and
+            # accumulating it afterwards would mean a second pass over the data.
+            self.sum_yy.setdefault(target, zeros(self.widths[target], self.widths[target]))
             self.sum_xy.setdefault(
                 (source, target), zeros(self.widths[source], self.widths[target]))
 
@@ -124,6 +131,7 @@ class CrossMoments:
             if name in self.sum_y:
                 self.sum_y[name] += tensor.sum(dim=0)
                 self.sum_y2[name] += (tensor ** 2).sum(dim=0)
+                self.sum_yy[name] += tensor.T @ tensor
 
         for source, target in self.pairs:
             self.sum_xy[(source, target)] += values[source].T @ values[target]
@@ -311,6 +319,82 @@ def rank(moments: CrossMoments, ridge: float,
     return records
 
 
+def save_moments(moments: CrossMoments, path: Path) -> Path:
+    """Write the accumulated sums beside the ranking.
+
+    They are expensive to produce, costing a pass over the data through both
+    backbones, and they are the same sums for every coder trained at that
+    depth. Two things read them afterwards: the matched-rank baseline, which
+    needs a solve at whatever rank a run turned out to use, and the
+    covariance-matched control, which needs second-order statistics to generate
+    activations from. Keeping them turns both into arithmetic on a file.
+
+    Args:
+        moments: what :func:`accumulate` produced.
+        path: where to write. The parent is created.
+
+    Returns:
+        The path written.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    torch.save({
+        "pairs": moments.pairs,
+        "widths": moments.widths,
+        "tokens": moments.tokens,
+        "sum_x": moments.sum_x,
+        "sum_xx": moments.sum_xx,
+        "sum_y": moments.sum_y,
+        "sum_y2": moments.sum_y2,
+        "sum_yy": moments.sum_yy,
+        "sum_xy": {f"{source}|{target}": value
+                   for (source, target), value in moments.sum_xy.items()},
+    }, path)
+
+    log.info("wrote moments over %d tokens to %s", moments.tokens, path)
+    return path
+
+
+def load_moments(path: Path, device: torch.device | str = "cpu") -> CrossMoments:
+    """Read sums written by :func:`save_moments`.
+
+    Raises:
+        FileNotFoundError: if the file is not there, which usually means the
+            sweep that would have written it has not been run since moments
+            were kept.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"no moments at {path}; run the sweep for this model pair first")
+
+    state = torch.load(path, map_location=torch.device(device), weights_only=False)
+
+    moments = CrossMoments(pairs=[tuple(pair) for pair in state["pairs"]],
+                           widths=state["widths"],
+                           device=torch.device(device))
+    moments.tokens = int(state["tokens"])
+    moments.sum_x = state["sum_x"]
+    moments.sum_xx = state["sum_xx"]
+    moments.sum_y = state["sum_y"]
+    moments.sum_y2 = state["sum_y2"]
+    moments.sum_yy = state["sum_yy"]
+    moments.sum_xy = {tuple(key.split("|", 1)): value
+                      for key, value in state["sum_xy"].items()}
+    return moments
+
+
+def moments_path(ranking_file: str | Path, split: str) -> Path:
+    """Where one split's moments sit, given the ranking they belong to.
+
+    Derived rather than configured, so a ranking and its moments cannot be
+    pointed at different sweeps.
+    """
+    path = Path(ranking_file)
+    return path.with_name(f"{path.stem}_moments_{split}.pt")
+
+
 def write_ranking(records: list[dict], path: Path, context: dict | None = None) -> None:
     """Write the ranking where the training grid will read it."""
     path = Path(path)
@@ -424,6 +508,12 @@ def run_sweep(cfg) -> list[dict]:
     held_out = accumulate(extract, held_out_loader, pairs, widths,
                           cfg.sweep.fit_tokens, cfg.train.device)
     records = rank(moments, cfg.sweep.ridge, held_out=held_out)
+
+    # Kept rather than discarded: every coder trained at any of these depths is
+    # judged against a baseline and a control built from exactly these sums, and
+    # reproducing them later would mean another pass through both backbones.
+    save_moments(moments, moments_path(cfg.sweep.out_file, cfg.dataset.split))
+    save_moments(held_out, moments_path(cfg.sweep.out_file, cfg.dataset.eval_split))
 
     write_ranking(records, Path(cfg.sweep.out_file), context={
         "models": {label: spec.name for label, spec in specs.items()},

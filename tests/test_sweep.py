@@ -25,7 +25,8 @@ torch = pytest.importorskip("torch")
 
 from stitch.sweep import (                                              # noqa: E402
     CrossMoments, LinearStitch, accumulate, candidate_pairs, fit_for, fit_linear,
-    rank, read_ranking, score_linear, top_pairs, write_ranking,
+    load_moments, moments_path, rank, read_ranking, save_moments, score_linear,
+    top_pairs, write_ranking,
 )
 
 WIDTH = 6
@@ -420,6 +421,76 @@ def test_the_direction_of_the_pair_matters(tmp_path):
     assert fit_for(path, A, B) == pytest.approx(0.5)
     with pytest.raises(KeyError):
         fit_for(path, B, A)
+
+
+# ----------------------------------------------------------------------
+# keeping the sums
+#
+# They cost a pass through both backbones and every coder trained at that depth
+# is judged against something built from them, so they are written out rather
+# than produced again.
+# ----------------------------------------------------------------------
+
+def test_the_target_s_full_covariance_is_accumulated():
+    """The fit only ever needs the diagonal. A control that has to generate
+    activations needs every off-diagonal term as well."""
+    torch.manual_seed(14)
+    x = torch.randn(TOKENS, WIDTH)
+    y = x @ torch.randn(WIDTH, WIDTH)
+    moments = moments_from(x, y)
+
+    assert moments.sum_yy[B].shape == (WIDTH, WIDTH)
+    assert torch.allclose(moments.sum_yy[B], (y.T @ y).to(torch.float64), atol=1e-2)
+    assert torch.allclose(torch.diagonal(moments.sum_yy[B]), moments.sum_y2[B], atol=1e-2)
+
+
+def test_the_sums_survive_a_round_trip(tmp_path):
+    torch.manual_seed(15)
+    x = torch.randn(TOKENS, WIDTH)
+    moments = moments_from(x, x @ torch.randn(WIDTH, WIDTH))
+
+    path = save_moments(moments, tmp_path / "sweeps" / "m.pt")
+    back = load_moments(path)
+
+    assert back.tokens == moments.tokens
+    assert back.pairs == moments.pairs
+    assert back.widths == moments.widths
+    for name in (A,):
+        assert torch.allclose(back.sum_x[name], moments.sum_x[name])
+        assert torch.allclose(back.sum_xx[name], moments.sum_xx[name])
+    assert torch.allclose(back.sum_yy[B], moments.sum_yy[B])
+    assert torch.allclose(back.sum_xy[(A, B)], moments.sum_xy[(A, B)])
+
+
+def test_a_reloaded_fit_is_the_same_fit(tmp_path):
+    """What the file is for: the solve does not have to see the data again."""
+    torch.manual_seed(16)
+    x = torch.randn(TOKENS, WIDTH)
+    moments = moments_from(x, x @ torch.randn(WIDTH, WIDTH) + torch.randn(TOKENS, WIDTH))
+
+    direct = fit_linear(moments, A, B, ridge=1e-6)
+    reloaded = fit_linear(load_moments(save_moments(moments, tmp_path / "m.pt")),
+                          A, B, ridge=1e-6)
+
+    assert torch.allclose(direct[0], reloaded[0])
+    assert direct[2] == pytest.approx(reloaded[2])
+
+
+def test_missing_sums_say_what_to_do(tmp_path):
+    with pytest.raises(FileNotFoundError, match="run the sweep"):
+        load_moments(tmp_path / "absent.pt")
+
+
+def test_the_sums_are_named_after_the_ranking_and_the_split():
+    """Derived rather than configured, so a ranking and its sums cannot be
+    pointed at two different sweeps."""
+    train = moments_path("sweeps/layer_sweep_main.json", "train")
+    val = moments_path("sweeps/layer_sweep_main.json", "val")
+
+    assert train.name == "layer_sweep_main_moments_train.pt"
+    assert val.name == "layer_sweep_main_moments_val.pt"
+    assert train.parent == Path("sweeps")
+    assert train != val
 
 
 # ----------------------------------------------------------------------
