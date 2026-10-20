@@ -149,6 +149,23 @@ def test_silent_features_are_reported():
     assert metrics["eval_never_fired"] == pytest.approx(31 / 32)
 
 
+def test_sparsity_is_reported_against_the_activation_width():
+    """Three active features describing an eight-wide activation."""
+    metrics = reconstruction_metrics(PerfectCoder(active=3), stream(), KEY, KEY, count=4)
+    assert metrics["eval_l0_frac"] == pytest.approx(3 / WIDTH)
+
+
+def test_effective_expansion_counts_only_features_that_fired():
+    """The configured dictionary is four times the width; one entry is in use."""
+    metrics = reconstruction_metrics(PerfectCoder(active=1), stream(), KEY, KEY, count=4)
+    assert metrics["eval_effective_expansion"] == pytest.approx(1 / WIDTH)
+
+
+def test_a_fully_alive_dictionary_reports_its_configured_expansion():
+    metrics = reconstruction_metrics(DenseCoder(), stream(), KEY, KEY, count=4)
+    assert metrics["eval_effective_expansion"] == pytest.approx(LATENT / WIDTH)
+
+
 def test_an_always_on_feature_is_reported():
     """A feature active on every token is a bias, not a feature."""
     metrics = reconstruction_metrics(DenseCoder(), stream(), KEY, KEY, count=4)

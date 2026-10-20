@@ -80,6 +80,47 @@ def series(results: list[dict], x: str, metric: str) -> list[Point]:
     return points
 
 
+def _sortable(label: str):
+    """Order a split's labels numerically where they are numbers."""
+    try:
+        return (0, float(label), "")
+    except ValueError:
+        return (1, 0.0, label)
+
+
+def split_series(results: list[dict], x: str, metric: str,
+                 split_by: str) -> dict[str, list[Point]]:
+    """One series per distinct value of another setting.
+
+    :func:`series` averages over everything that is not the axis, which is
+    right for a grid that varied one thing and wrong for one that varied two:
+    the second setting disappears into the mean rather than being the
+    comparison. This keeps it, as one curve per value.
+
+    Args:
+        results: records from a grid.
+        x: the axis to plot along.
+        metric: the number to plot.
+        split_by: the setting that separates the curves, such as
+            ``coder.expansion``.
+
+    Returns:
+        Label to series, numerically ordered where the labels are numbers.
+        Records that failed or do not carry ``split_by`` are left out.
+    """
+    groups: dict[str, list[dict]] = {}
+    for record in results:
+        if "error" in record:
+            continue
+        point = record.get("point", {})
+        if split_by not in point:
+            continue
+        groups.setdefault(str(point[split_by]), []).append(record)
+
+    return {label: series(groups[label], x, metric)
+            for label in sorted(groups, key=_sortable)}
+
+
 def flattening_point(points: list[Point], tolerance: float) -> float | None:
     """The first position where the curve stopped moving.
 
@@ -120,40 +161,54 @@ def noise_from(results: list[dict], metric: str, across: str = "train.seed") -> 
 # drawing
 # ----------------------------------------------------------------------
 
-def plot_curve(points: list[Point], metric: str, x_label: str, path: Path,
-               tolerance: float | None = None, log_x: bool = True) -> Path:
+def plot_curve(points: list[Point] | dict[str, list[Point]], metric: str,
+               x_label: str, path: Path, tolerance: float | None = None,
+               log_x: bool = True, legend_title: str | None = None) -> Path:
     """One metric against one axis, with the spread shown where there is any.
 
     Args:
-        points: from :func:`series`.
+        points: from :func:`series`, or from :func:`split_series` for several
+            curves on one pair of axes.
         metric: for the vertical label.
         x_label: for the horizontal one.
         path: where the image goes.
-        tolerance: if given, the flattening point is marked.
+        tolerance: if given, the flattening point is marked, once per curve.
         log_x: budgets are usually chosen by doubling, which reads better on a
             logarithmic axis.
+        legend_title: what separates the curves, when there are several.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    if not points:
+    grouped = points if isinstance(points, dict) else {None: points}
+    if not any(grouped.values()):
         raise ValueError("nothing to plot")
 
     figure, axes = plt.subplots(figsize=(7, 4.5))
-    xs = [point.x for point in points]
-    means = [point.mean for point in points]
 
-    if any(point.n > 1 for point in points):
-        axes.fill_between(xs, [p.low for p in points], [p.high for p in points], alpha=0.18)
-    axes.plot(xs, means, marker="o")
+    for label, curve in grouped.items():
+        if not curve:
+            continue
+        xs = [point.x for point in curve]
+        means = [point.mean for point in curve]
 
-    if tolerance is not None:
-        flat = flattening_point(points, tolerance)
-        if flat is not None:
-            axes.axvline(flat, linestyle="--", linewidth=1)
-            axes.annotate(f"flat from {format_x(flat)}", xy=(flat, means[xs.index(flat)]),
-                          xytext=(6, 8), textcoords="offset points", fontsize=9)
+        if any(point.n > 1 for point in curve):
+            axes.fill_between(xs, [p.low for p in curve], [p.high for p in curve],
+                              alpha=0.18)
+        line, = axes.plot(xs, means, marker="o", label=label)
+
+        if tolerance is not None:
+            flat = flattening_point(curve, tolerance)
+            if flat is not None:
+                axes.axvline(flat, linestyle="--", linewidth=1, color=line.get_color())
+                axes.annotate(f"flat from {format_x(flat)}",
+                              xy=(flat, means[xs.index(flat)]),
+                              xytext=(6, 8), textcoords="offset points", fontsize=9,
+                              color=line.get_color())
+
+    if any(label is not None for label in grouped):
+        axes.legend(title=legend_title, fontsize=9)
 
     if log_x:
         axes.set_xscale("log")

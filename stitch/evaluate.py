@@ -85,6 +85,18 @@ def reconstruction_metrics(coder: SparseCoder, batches: Iterator[dict[str, Tenso
         ``eval_explained_variance`` is the quantity defined at the top of this
         module, accumulated over every token read rather than averaged per
         batch.
+
+        ``eval_l0_frac`` is the active features per token over that
+        width, which is the unit sparsity is compared in: at one, the code has
+        as many degrees of freedom as the thing it describes.
+
+        ``eval_effective_expansion`` is the features that fired at least once
+        over the same width, which is how overcomplete the dictionary is in
+        practice rather than in configuration. Below one the live dictionary
+        cannot span the activation, so nothing that was superposed in it can
+        be separated out. The denominator is the width being reconstructed,
+        while the configured expansion is built from the width being read, so
+        the two are the same base only when a coder reproduces its own input.
     """
     device = torch.device(device)
     coder = coder.to(device).eval()
@@ -127,11 +139,16 @@ def reconstruction_metrics(coder: SparseCoder, batches: Iterator[dict[str, Tenso
 
     frequencies = fired / tokens
 
+    l0 = totals["l0"] / tokens
+    alive = float((frequencies > 0).float().sum())
+
     return {
         "eval_mse": totals["mse"] / tokens,
-        "eval_l0": totals["l0"] / tokens,
+        "eval_l0": l0,
+        "eval_l0_frac": l0 / coder.d_out,
         "eval_explained_variance": explained,
         "eval_never_fired": float((frequencies == 0).float().mean()),
+        "eval_effective_expansion": alive / coder.d_out,
         "eval_max_feature_frequency": float(frequencies.max()),
         "eval_tokens": float(tokens),
     }

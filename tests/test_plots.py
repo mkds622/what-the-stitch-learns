@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stitch.plots import (                                            # noqa: E402
     Point, flattening_point, noise_from, plot_curve, plot_tradeoff, series,
+    split_series,
 )
 
 
@@ -76,6 +77,64 @@ def test_records_off_the_axis_are_left_out():
 
 def test_an_empty_grid_gives_an_empty_series():
     assert series([], "train.tokens", "eval_l0") == []
+
+
+# ----------------------------------------------------------------------
+# a grid that varied two things
+#
+# series averages over everything that is not the axis, which turns a second
+# setting into part of the mean. These keep it as the comparison instead.
+# ----------------------------------------------------------------------
+
+def two_axis_grid():
+    """Two expansions, two coefficients, a different metric value at each."""
+    return [{"point": {"coder.sparsity.coeff": c, "coder.expansion": e}, "eval_l0": v}
+            for e, c, v in ((8, 1.0, 40.0), (8, 2.0, 20.0),
+                            (16, 1.0, 90.0), (16, 2.0, 50.0))]
+
+
+def test_each_value_gets_its_own_curve():
+    curves = split_series(two_axis_grid(), "coder.sparsity.coeff", "eval_l0",
+                          "coder.expansion")
+    assert list(curves) == ["8", "16"]
+    assert [point.mean for point in curves["8"]] == [40.0, 20.0]
+    assert [point.mean for point in curves["16"]] == [90.0, 50.0]
+
+
+def test_the_curves_are_ordered_numerically():
+    """Labels are strings, so plain sorting would put 16 before 8."""
+    curves = split_series(two_axis_grid() + [
+        {"point": {"coder.sparsity.coeff": 1.0, "coder.expansion": 32}, "eval_l0": 1.0}],
+        "coder.sparsity.coeff", "eval_l0", "coder.expansion")
+    assert list(curves) == ["8", "16", "32"]
+
+
+def test_splitting_keeps_what_averaging_would_have_lost():
+    """One curve through the mean of both expansions says nothing about either."""
+    averaged = series(two_axis_grid(), "coder.sparsity.coeff", "eval_l0")
+    assert [point.n for point in averaged] == [2, 2]
+    assert averaged[0].mean == pytest.approx(65.0)
+
+    curves = split_series(two_axis_grid(), "coder.sparsity.coeff", "eval_l0",
+                          "coder.expansion")
+    assert all(point.n == 1 for curve in curves.values() for point in curve)
+
+
+def test_records_without_the_split_setting_are_left_out():
+    records = two_axis_grid() + [{"point": {"coder.sparsity.coeff": 1.0}, "eval_l0": 7.0}]
+    curves = split_series(records, "coder.sparsity.coeff", "eval_l0", "coder.expansion")
+    assert sum(point.n for curve in curves.values() for point in curve) == 4
+
+
+def test_failed_runs_are_left_out_of_a_split():
+    records = two_axis_grid() + [
+        {"point": {"coder.sparsity.coeff": 1.0, "coder.expansion": 8}, "error": "boom"}]
+    curves = split_series(records, "coder.sparsity.coeff", "eval_l0", "coder.expansion")
+    assert [point.n for point in curves["8"]] == [1, 1]
+
+
+def test_splitting_an_empty_grid_gives_no_curves():
+    assert split_series([], "coder.sparsity.coeff", "eval_l0", "coder.expansion") == {}
 
 
 # ----------------------------------------------------------------------
@@ -160,6 +219,30 @@ def test_an_empty_curve_raises(tmp_path):
     pytest.importorskip("matplotlib")
     with pytest.raises(ValueError, match="nothing to plot"):
         plot_curve([], "eval_l0", "tokens", tmp_path / "curve.png")
+
+
+def test_several_curves_are_written(tmp_path):
+    pytest.importorskip("matplotlib")
+    curves = split_series(two_axis_grid(), "coder.sparsity.coeff", "eval_l0",
+                          "coder.expansion")
+    path = plot_curve(curves, "eval_l0", "coeff", tmp_path / "split.png",
+                      legend_title="expansion")
+    assert path.exists() and path.stat().st_size > 0
+
+
+def test_curves_with_a_tolerance_are_written(tmp_path):
+    """Each curve gets its own flattening mark rather than one for all of them."""
+    pytest.importorskip("matplotlib")
+    curves = split_series(two_axis_grid(), "coder.sparsity.coeff", "eval_l0",
+                          "coder.expansion")
+    assert plot_curve(curves, "eval_l0", "coeff", tmp_path / "split_tol.png",
+                      tolerance=25.0).exists()
+
+
+def test_an_empty_set_of_curves_raises(tmp_path):
+    pytest.importorskip("matplotlib")
+    with pytest.raises(ValueError, match="nothing to plot"):
+        plot_curve({"8": [], "16": []}, "eval_l0", "tokens", tmp_path / "c.png")
 
 
 def test_a_tradeoff_is_written(tmp_path):
