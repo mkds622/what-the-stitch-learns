@@ -33,6 +33,7 @@ from stitch.data import build_loader, build_transform, build_dataset
 from stitch.evaluate import evaluate, substitution_accuracy
 from stitch.labels import label_map_for
 from stitch.models import parse_layer_key, trace
+from stitch.sweep import fit_for
 from stitch.train import resolve_layers, set_seed, train
 
 log = logging.getLogger(__name__)
@@ -103,6 +104,49 @@ def build_streams(cfg, models: dict[str, object], backbones: dict[str, object]):
     return training, evaluation, eval_loader
 
 
+def resolve_linear_fit(cfg) -> float:
+    """How much of the target a linear map reaches at this run's depth.
+
+    The reconstruction gate asks for a share of this, so it has to be the
+    number for the pair this run actually trains at rather than a fixed one.
+    Two cases:
+
+    A coder reproducing its own input is judged against one. The best linear
+    map from a layer to itself is the identity, which reconstructs it exactly,
+    so there is nothing to look up and nothing a sweep could add.
+
+    A coder writing into another model's activation is judged against what the
+    sweep measured for that pair. Anything else would compare a coder against a
+    depth it was not trained at.
+
+    Returns:
+        The fit, for ``cfg.eval.linear_fit``.
+
+    Raises:
+        ValueError: if the sweep found nothing to stitch at this depth, since
+            a share of nothing is not a threshold and the run would be
+            measuring a dictionary that describes nothing.
+        KeyError: if the pair is absent from the ranking file.
+    """
+    source_key, target_key = resolve_layers(cfg)
+
+    if source_key == target_key:
+        return 1.0
+
+    if not cfg.layer_pairs.ranking_file:
+        log.warning("no layer_pairs.ranking_file, so the reconstruction gate uses "
+                    "the configured eval.linear_fit of %g", cfg.eval.linear_fit)
+        return cfg.eval.linear_fit
+
+    fit = fit_for(Path(cfg.layer_pairs.ranking_file), source_key, target_key)
+    if fit <= 0:
+        raise ValueError(
+            f"a linear map from {source_key} to {target_key} explains {fit:.4f} "
+            f"of the target, so there is nothing to stitch at this depth and "
+            f"nothing for a coder to be judged against")
+    return fit
+
+
 def build_halves(cfg, models: dict[str, object]):
     """The parts of the model above and below the cut, for substitution.
 
@@ -158,6 +202,14 @@ def run(cfg, resume: Path | None = None) -> dict:
     setup_logging(run_dir, console=True)
     install_crash_handler(run_dir, crash_dir=Path(cfg.logging.run_root) / "crashes",
                           logger=logger, context={"hash": config_hash})
+
+    # What the reconstruction gate judges this coder against. Resolved after
+    # the identity is pinned, because it is already determined by the ranking
+    # file and the layer pair, both of which the hash covers. Putting it in the
+    # hash as well would rename every run whenever a sweep was repeated.
+    cfg.eval.linear_fit = resolve_linear_fit(cfg)
+    log.info("judged against %g of a linear fit of %g",
+             cfg.eval.fit_fraction, cfg.eval.linear_fit)
 
     for note in cfg.pending_decisions():
         log.warning("pending: %s", note)

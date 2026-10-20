@@ -25,8 +25,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 torch = pytest.importorskip("torch")
 
-from stitch.config import Config, dump_config                          # noqa: E402
-from stitch.run import describe, load_models, main                     # noqa: E402
+from stitch.config import Config, ModelConfig, dump_config             # noqa: E402
+from stitch.run import (                                               # noqa: E402
+    describe, load_models, main, resolve_linear_fit,
+)
+from stitch.sweep import write_ranking                                 # noqa: E402
 
 DATA = Path("data/imagenet-100")
 
@@ -133,6 +136,84 @@ def test_asking_for_a_missing_gpu_stops_before_any_work(config_file):
         pytest.skip("this machine has a GPU")
     with pytest.raises(SystemExit, match="cuda"):
         main(["--config", str(config_file), "--set", "train.device=cuda"])
+
+
+# ----------------------------------------------------------------------
+# what the reconstruction gate judges this run against
+#
+# The gate asks for a share of what a linear map reaches at the same depth, so
+# every run has to arrive at the number for the pair it actually trains at. No
+# backbone is involved: the pair comes from the configuration and the number
+# from the sweep's ranking file.
+# ----------------------------------------------------------------------
+
+def cross(cfg, ranking=None):
+    """The same config, reading one model and reconstructing another."""
+    cfg.objective = "case2"
+    cfg.models.b = ModelConfig(label="B")
+    cfg.activations.layers = ["A@add_14", "B@add_14"]
+    if ranking is not None:
+        cfg.layer_pairs.ranking_file = str(ranking)
+    return cfg
+
+
+def ranking_file(tmp_path, score, source="A@add_14", target="B@add_14"):
+    path = tmp_path / "sweeps" / "ranking.json"
+    write_ranking([{"source": source, "target": target,
+                    "explained_variance": score, "rank": 0}], path)
+    return path
+
+
+def test_reproducing_its_own_input_is_judged_against_one(cfg):
+    """The best linear map from a layer to itself is the identity."""
+    assert resolve_linear_fit(cfg) == 1.0
+
+
+def test_a_cross_model_run_takes_its_fit_from_the_ranking(cfg, tmp_path):
+    assert resolve_linear_fit(
+        cross(cfg, ranking_file(tmp_path, 0.4744))) == pytest.approx(0.4744)
+
+
+def test_each_depth_gets_its_own_fit(cfg, tmp_path):
+    """Which is the whole point: one threshold would mean different demands."""
+    path = tmp_path / "sweeps" / "ranking.json"
+    write_ranking([{"source": "A@add_2", "target": "B@add_2",
+                    "explained_variance": 0.94, "rank": 0},
+                   {"source": "A@add_24", "target": "B@add_24",
+                    "explained_variance": 0.22, "rank": 1}], path)
+
+    shallow = cross(Config(), path)
+    shallow.activations.layers = ["A@add_2", "B@add_2"]
+    deep = cross(Config(), path)
+    deep.activations.layers = ["A@add_24", "B@add_24"]
+
+    assert resolve_linear_fit(shallow) == pytest.approx(0.94)
+    assert resolve_linear_fit(deep) == pytest.approx(0.22)
+
+
+def test_a_depth_with_nothing_to_stitch_stops_the_run(cfg, tmp_path):
+    """A share of nothing is not a threshold, and the dictionary would
+    describe nothing."""
+    with pytest.raises(ValueError, match="nothing to stitch"):
+        resolve_linear_fit(cross(cfg, ranking_file(tmp_path, -0.02)))
+
+
+def test_a_fit_of_exactly_zero_stops_the_run_too(cfg, tmp_path):
+    with pytest.raises(ValueError, match="nothing to stitch"):
+        resolve_linear_fit(cross(cfg, ranking_file(tmp_path, 0.0)))
+
+
+def test_a_pair_missing_from_the_ranking_raises(cfg, tmp_path):
+    path = ranking_file(tmp_path, 0.5, source="A@add_2", target="B@add_2")
+    with pytest.raises(KeyError, match="A@add_14"):
+        resolve_linear_fit(cross(cfg, path))
+
+
+def test_without_a_ranking_file_the_configured_value_stands(cfg):
+    """Smoke runs and tests have no sweep behind them."""
+    cfg = cross(cfg)
+    cfg.eval.linear_fit = 0.5
+    assert resolve_linear_fit(cfg) == 0.5
 
 
 # ----------------------------------------------------------------------

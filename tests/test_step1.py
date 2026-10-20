@@ -153,6 +153,50 @@ def test_pending_decisions_are_reported():
 
 
 # ----------------------------------------------------------------------
+# the reconstruction gate's two settings
+#
+# The gate is an explained variance against a share of another explained
+# variance. Both are fractions of a variance, so a value outside (0, 1] is
+# not a looser or stricter threshold, it is a number that means nothing.
+# ----------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", [0.0, -0.3, 1.5])
+def test_the_linear_fit_must_be_a_share_of_the_variance(value):
+    cfg = Config()
+    cfg.eval.linear_fit = value
+    with pytest.raises(ValueError, match="linear_fit"):
+        cfg.validate()
+
+
+@pytest.mark.parametrize("value", [0.0, -0.3, 1.2])
+def test_the_fit_fraction_must_be_a_share_of_the_fit(value):
+    cfg = Config()
+    cfg.eval.fit_fraction = value
+    with pytest.raises(ValueError, match="fit_fraction"):
+        cfg.validate()
+
+
+def test_the_whole_fit_is_a_permitted_demand():
+    """Asking a coder to match the linear map exactly is strict, not invalid."""
+    cfg = Config()
+    cfg.eval.fit_fraction = 1.0
+    cfg.eval.linear_fit = 1.0
+    cfg.validate()
+
+
+def test_an_unset_linear_fit_is_reported_as_pending():
+    """Left at the default the gate asks for a perfect reconstruction, which is
+    a placeholder rather than a decision."""
+    assert any("linear_fit" in note for note in Config().pending_decisions())
+
+
+def test_a_resolved_linear_fit_is_not_pending():
+    cfg = Config()
+    cfg.eval.linear_fit = 0.4744
+    assert not any("linear_fit" in note for note in cfg.pending_decisions())
+
+
+# ----------------------------------------------------------------------
 # logging
 # ----------------------------------------------------------------------
 

@@ -324,6 +324,35 @@ def read_ranking(path: Path) -> list[dict]:
     return json.loads(Path(path).read_text())["ranking"]
 
 
+def fit_for(path: Path, source: str, target: str) -> float:
+    """What a linear map reached between these two layers.
+
+    The number a trained coder at that depth is judged against. Read from the
+    ranking rather than recomputed, so the coder and its baseline are compared
+    on one measurement rather than two made at different times.
+
+    Args:
+        path: a ranking written by :func:`write_ranking`.
+        source: the layer read, as ``<model label>@<node name>``.
+        target: the layer reconstructed.
+
+    Returns:
+        The reported explained variance for that pair, which is the held-out
+        score when the sweep that wrote the file had a second split.
+
+    Raises:
+        KeyError: if the pair is not in the file. Silently falling back to some
+            other number would judge a coder against a depth it was not
+            trained at.
+    """
+    records = read_ranking(path)
+    for record in records:
+        if record["source"] == source and record["target"] == target:
+            return float(record["explained_variance"])
+    raise KeyError(
+        f"{source} -> {target} is not in {path}, which holds {len(records)} pairs")
+
+
 def top_pairs(path: Path, count: int) -> list[tuple[str, str]]:
     """The best few pairs, as layer names.
 

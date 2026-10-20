@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 torch = pytest.importorskip("torch")
 
 from stitch.sweep import (                                              # noqa: E402
-    CrossMoments, LinearStitch, accumulate, candidate_pairs, fit_linear,
+    CrossMoments, LinearStitch, accumulate, candidate_pairs, fit_for, fit_linear,
     rank, read_ranking, score_linear, top_pairs, write_ranking,
 )
 
@@ -372,6 +372,54 @@ def test_top_pairs_asking_for_more_than_exist_is_fine(tmp_path):
     path = tmp_path / "ranking.json"
     write_ranking(rank(three_pairs(), ridge=1e-6), path)
     assert len(top_pairs(path, 99)) == 3
+
+
+# ----------------------------------------------------------------------
+# the fit a trained coder is judged against
+#
+# The reconstruction gate asks for a share of what a linear map reached at the
+# same depth. That number comes from here rather than being measured again, so
+# the coder and its baseline are one comparison and not two.
+# ----------------------------------------------------------------------
+
+def test_the_fit_for_a_pair_is_that_pairs_score(tmp_path):
+    path = tmp_path / "ranking.json"
+    records = rank(three_pairs(), ridge=1e-6)
+    write_ranking(records, path)
+
+    for record in records:
+        assert fit_for(path, record["source"], record["target"]) == pytest.approx(
+            record["explained_variance"])
+
+
+def test_the_fit_is_the_reported_score_not_the_in_sample_one(tmp_path):
+    """In-sample flatters a map with this many coefficients, so it is not the one."""
+    path = tmp_path / "ranking.json"
+    write_ranking([{"source": A, "target": B, "rank": 0,
+                    "explained_variance": 0.4744,
+                    "explained_variance_in_sample": 0.9112}], path)
+
+    assert fit_for(path, A, B) == pytest.approx(0.4744)
+
+
+def test_a_pair_the_sweep_never_saw_raises(tmp_path):
+    """Falling back to another pair's number would judge a coder against a
+    depth it was not trained at."""
+    path = tmp_path / "ranking.json"
+    write_ranking(rank(three_pairs(), ridge=1e-6), path)
+
+    with pytest.raises(KeyError, match="A@nine"):
+        fit_for(path, "A@nine", "B@nine")
+
+
+def test_the_direction_of_the_pair_matters(tmp_path):
+    """Reading A and writing B is not the same map as reading B and writing A."""
+    path = tmp_path / "ranking.json"
+    write_ranking([{"source": A, "target": B, "rank": 0, "explained_variance": 0.5}], path)
+
+    assert fit_for(path, A, B) == pytest.approx(0.5)
+    with pytest.raises(KeyError):
+        fit_for(path, B, A)
 
 
 # ----------------------------------------------------------------------
