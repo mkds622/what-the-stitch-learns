@@ -58,6 +58,49 @@ log = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------------
+# how the firing is spread across the dictionary
+# ----------------------------------------------------------------------
+
+def frequency_concentration(frequencies: Tensor) -> dict[str, float]:
+    """Whether the live dictionary shares the work or a few features do it all.
+
+    Sparsity says how many features fire per token. It says nothing about
+    whether the same few fire every time. A dictionary where a handful of
+    features carry almost all the firing is closer to a dense code in a small
+    basis than to a sparse code in a large one, and the two are not
+    distinguishable by L0.
+
+    Measured over the features that fired at least once. Dead features have
+    their own metric, and counting them here would make this a second reading
+    of that one rather than a statement about the dictionary in use.
+
+    Args:
+        frequencies: share of tokens each feature fired on, from
+            :func:`feature_frequencies` or accumulated alongside the metrics.
+
+    Returns:
+        ``gini``, zero when every live feature fires equally often and
+        approaching one when a single feature does everything, and ``median``,
+        the typical live feature's share of tokens. Both are zero when nothing
+        fired, which the collapse gate catches separately.
+    """
+    live = frequencies[frequencies > 0].to(torch.float64)
+    n = live.numel()
+    if n == 0:
+        return {"gini": 0.0, "median": 0.0}
+
+    ordered = torch.sort(live).values
+    total = float(ordered.sum())
+    if total <= 0:
+        return {"gini": 0.0, "median": 0.0}
+
+    rank = torch.arange(1, n + 1, dtype=torch.float64, device=ordered.device)
+    gini = 2.0 * float((rank * ordered).sum()) / (n * total) - (n + 1) / n
+
+    return {"gini": max(0.0, gini), "median": float(ordered.median())}
+
+
+# ----------------------------------------------------------------------
 # reconstruction
 # ----------------------------------------------------------------------
 
@@ -97,6 +140,10 @@ def reconstruction_metrics(coder: SparseCoder, batches: Iterator[dict[str, Tenso
         be separated out. The denominator is the width being reconstructed,
         while the configured expansion is built from the width being read, so
         the two are the same base only when a coder reproduces its own input.
+
+        ``eval_frequency_gini`` and ``eval_median_feature_frequency`` describe
+        how the firing is spread across the live dictionary, which L0 does not
+        say. See :func:`frequency_concentration`.
     """
     device = torch.device(device)
     coder = coder.to(device).eval()
@@ -141,6 +188,7 @@ def reconstruction_metrics(coder: SparseCoder, batches: Iterator[dict[str, Tenso
 
     l0 = totals["l0"] / tokens
     alive = float((frequencies > 0).float().sum())
+    concentration = frequency_concentration(frequencies)
 
     return {
         "eval_mse": totals["mse"] / tokens,
@@ -150,6 +198,8 @@ def reconstruction_metrics(coder: SparseCoder, batches: Iterator[dict[str, Tenso
         "eval_never_fired": float((frequencies == 0).float().mean()),
         "eval_effective_expansion": alive / coder.d_out,
         "eval_max_feature_frequency": float(frequencies.max()),
+        "eval_median_feature_frequency": concentration["median"],
+        "eval_frequency_gini": concentration["gini"],
         "eval_tokens": float(tokens),
     }
 

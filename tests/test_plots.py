@@ -17,8 +17,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stitch.plots import (                                            # noqa: E402
-    Point, flattening_point, noise_from, plot_curve, plot_tradeoff, series,
-    split_series,
+    Point, flattening_point, noise_from, plot_curve, plot_feature_frequencies,
+    plot_tradeoff, series, split_series,
 )
 
 
@@ -263,6 +263,41 @@ def test_an_empty_tradeoff_raises(tmp_path):
     pytest.importorskip("matplotlib")
     with pytest.raises(ValueError, match="nothing to plot"):
         plot_tradeoff([], tmp_path / "t.png")
+
+
+# ----------------------------------------------------------------------
+# the frequency distribution
+# ----------------------------------------------------------------------
+
+def test_a_frequency_distribution_is_written(tmp_path):
+    pytest.importorskip("matplotlib")
+    path = plot_feature_frequencies([0.5, 0.2, 0.05, 0.0, 0.0],
+                                    tmp_path / "figures" / "freq.png",
+                                    title="block 6")
+    assert path.exists() and path.stat().st_size > 0
+
+
+def test_several_distributions_are_written(tmp_path):
+    pytest.importorskip("matplotlib")
+    path = plot_feature_frequencies({"coeff 12": [0.4, 0.3, 0.2, 0.1],
+                                     "coeff 48": [0.9, 0.01, 0.0, 0.0]},
+                                    tmp_path / "freqs.png",
+                                    legend_title="setting")
+    assert path.exists() and path.stat().st_size > 0
+
+
+def test_a_dictionary_that_never_fired_raises(tmp_path):
+    """A logarithmic axis has nothing to show, and an empty figure would read
+    as a drawing failure rather than a dead coder."""
+    pytest.importorskip("matplotlib")
+    with pytest.raises(ValueError, match="no feature ever fired"):
+        plot_feature_frequencies([0.0, 0.0, 0.0], tmp_path / "dead.png")
+
+
+def test_one_dead_curve_among_live_ones_is_fine(tmp_path):
+    pytest.importorskip("matplotlib")
+    assert plot_feature_frequencies({"alive": [0.3, 0.1], "dead": [0.0, 0.0]},
+                                    tmp_path / "mixed.png").exists()
 
 
 # ----------------------------------------------------------------------

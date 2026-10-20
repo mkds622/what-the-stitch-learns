@@ -24,8 +24,8 @@ from torch import nn                                                    # noqa: 
 from stitch.coder import SparseCoder                                    # noqa: E402
 from stitch.config import Config                                        # noqa: E402
 from stitch.evaluate import (                                           # noqa: E402
-    check_gates, evaluate, feature_frequencies, reconstruction_metrics,
-    substitution_accuracy,
+    check_gates, evaluate, feature_frequencies, frequency_concentration,
+    reconstruction_metrics, substitution_accuracy,
 )
 
 WIDTH = 8
@@ -205,6 +205,71 @@ def test_a_different_target_is_used_as_the_target():
 
     metrics = reconstruction_metrics(PerfectCoder(), crossed(), KEY, "B@add_2", count=4)
     assert metrics["eval_mse"] > 0.1
+
+
+# ----------------------------------------------------------------------
+# how the firing is spread
+#
+# L0 says how many features fire per token and nothing about whether the same
+# few fire every time. These pin the measure that does, against distributions
+# whose answer is known by construction.
+# ----------------------------------------------------------------------
+
+def test_a_dictionary_sharing_the_work_evenly_is_not_concentrated():
+    result = frequency_concentration(torch.full((64,), 0.25))
+    assert result["gini"] == pytest.approx(0.0, abs=1e-9)
+    assert result["median"] == pytest.approx(0.25)
+
+
+def test_one_feature_doing_everything_is_concentrated():
+    frequencies = torch.zeros(64)
+    frequencies[0] = 1.0
+    frequencies[1:] = 1e-9
+    assert frequency_concentration(frequencies)["gini"] > 0.95
+
+
+def test_dead_features_are_not_counted():
+    """They have their own metric, and counting them here would repeat it."""
+    even = torch.full((32,), 0.25)
+    padded = torch.cat([even, torch.zeros(96)])
+    assert frequency_concentration(padded) == frequency_concentration(even)
+
+
+def test_concentration_sits_between_the_two_extremes():
+    """Half the live features at four times the rate of the other half."""
+    frequencies = torch.cat([torch.full((32,), 0.4), torch.full((32,), 0.1)])
+    gini = frequency_concentration(frequencies)["gini"]
+    assert 0.0 < gini < 1.0
+
+
+def test_the_median_is_the_typical_live_feature():
+    frequencies = torch.tensor([0.0, 0.0, 0.1, 0.2, 0.3])
+    assert frequency_concentration(frequencies)["median"] == pytest.approx(0.2)
+
+
+def test_a_dictionary_that_never_fired_is_not_concentrated():
+    """A collapsed coder is caught by its own gate, not by this reading as 1.0."""
+    assert frequency_concentration(torch.zeros(16)) == {"gini": 0.0, "median": 0.0}
+
+
+def test_concentration_is_scale_free():
+    """Doubling every rate changes how often features fire, not how unevenly."""
+    frequencies = torch.tensor([0.05, 0.1, 0.2, 0.4])
+    assert frequency_concentration(frequencies * 2)["gini"] == pytest.approx(
+        frequency_concentration(frequencies)["gini"])
+
+
+def test_the_metrics_carry_the_concentration():
+    """One feature in use out of thirty-two, so what is live is perfectly even."""
+    metrics = reconstruction_metrics(PerfectCoder(active=1), stream(), KEY, KEY, count=4)
+    assert metrics["eval_frequency_gini"] == pytest.approx(0.0, abs=1e-9)
+    assert metrics["eval_median_feature_frequency"] == pytest.approx(1.0)
+
+
+def test_concentration_is_reported_even_for_a_dead_coder():
+    metrics = reconstruction_metrics(ZeroCoder(), stream(), KEY, KEY, count=4)
+    assert metrics["eval_frequency_gini"] == 0.0
+    assert metrics["eval_median_feature_frequency"] == 0.0
 
 
 # ----------------------------------------------------------------------

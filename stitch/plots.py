@@ -268,6 +268,77 @@ def plot_tradeoff(results: list[dict], path: Path, label_by: str | None = None,
     return path
 
 
+def plot_feature_frequencies(frequencies, path: Path, title: str | None = None,
+                             legend_title: str | None = None) -> Path:
+    """How often each feature fires, best first.
+
+    The summary numbers say how concentrated the firing is; this says what the
+    concentration looks like. A dictionary sharing the work evenly is a shallow
+    line, one where a few features carry everything falls off a cliff, and the
+    point where a line stops is where the live dictionary ends.
+
+    Both axes are logarithmic because the interesting range spans several
+    orders of magnitude: a feature on one token in ten thousand and a feature
+    on one in three are both ordinary, and on a linear axis the first is
+    indistinguishable from dead.
+
+    Args:
+        frequencies: a sequence of per-feature firing rates, or a mapping of
+            label to sequence for several runs on one pair of axes.
+        path: where the image goes.
+        title: a heading, usually which run or setting this is.
+        legend_title: what separates the curves, when there are several.
+
+    Returns:
+        The path written.
+
+    Raises:
+        ValueError: if no curve has a feature that ever fired, which means
+            there is nothing a logarithmic axis can show.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    grouped = frequencies if isinstance(frequencies, dict) else {None: frequencies}
+
+    # Dead features sit at zero, which a logarithmic axis cannot place. They
+    # are dropped from the line and reported as where it ends instead.
+    live = {label: sorted((float(value) for value in values if float(value) > 0),
+                          reverse=True)
+            for label, values in grouped.items()}
+    if not any(live.values()):
+        raise ValueError("nothing to plot: no feature ever fired")
+
+    figure, axes = plt.subplots(figsize=(7, 4.5))
+
+    for label, values in live.items():
+        if not values:
+            continue
+        total = len(grouped[label])
+        shown = label if label is None else f"{label}  ({len(values)} of {total} alive)"
+        axes.plot(range(1, len(values) + 1), values, label=shown)
+
+    if any(label is not None for label in grouped):
+        axes.legend(title=legend_title, fontsize=9)
+
+    axes.set_xscale("log")
+    axes.set_yscale("log")
+    axes.set_xlabel("feature, most active first")
+    axes.set_ylabel("share of tokens it fires on")
+    axes.grid(alpha=0.25, which="both")
+    if title:
+        axes.set_title(title, fontsize=11)
+    figure.tight_layout()
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
+    log.info("wrote %s", path)
+    return path
+
+
 # ----------------------------------------------------------------------
 # what two dictionaries have in common
 # ----------------------------------------------------------------------
