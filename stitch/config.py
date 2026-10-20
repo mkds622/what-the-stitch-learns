@@ -75,7 +75,7 @@ class ModelConfig:
     """
 
     name: str = "vit_base_patch16_224"
-    source: Literal["timm", "torchvision"] = "timm" 
+    source: Literal["timm", "torchvision"] = "timm"
     pretrained: bool = True
     checkpoint: str | None = None     # path to a local state dict, if any
     label: str = ""                   # short tag used in layer keys and run names
@@ -299,9 +299,26 @@ class LoggingConfig:
 
 @dataclass
 class EvalConfig:
+    """Thresholds for the validity gates.
+
+    ``linear_fit`` is the explained variance a closed-form linear stitch
+    reaches at this depth, read from the sweep ranking. It is what the coder is
+    judged against, because how much of the target is reachable at all is a
+    property of the model pair and the depth rather than of the coder. Left at
+    the default the gate asks for a perfect reconstruction, which is why the
+    launcher sets it and ``pending_decisions`` reports it while it is unset.
+    Explained variance means one thing throughout, defined at the top of
+    ``stitch.evaluate``; the fit and the coder's score are the same quantity or
+    the comparison between them says nothing.
+
+    ``fit_fraction`` is the share of that fit the coder must reach. One number
+    for every case, so no case carries a threshold of its own.
+    """
+
     batches: int = 50
     images: int = 5000
-    min_explained_variance: float = 0.5
+    linear_fit: float = 1.0           # explained variance of the linear stitch here
+    fit_fraction: float = 0.8         # share of that fit the coder must reach
     min_l0: float = 1.0
     max_l0_frac: float = 0.5          # fraction of the reconstructed activation's width
     max_never_fired: float = 0.5
@@ -373,13 +390,22 @@ class Config:
                 raise ValueError(
                     f"layer key {key!r} must be '<model label>@<node name>', "
                     f"for example 'A@blocks.6'")
-        
+
         if self.eval.batches < 1:
             raise ValueError("eval.batches must be at least 1")
-        
+
         if not 0 < self.eval.max_l0_frac <= 1:
             raise ValueError(
                 f"eval.max_l0_frac ({self.eval.max_l0_frac}) must be in (0, 1]")
+
+        if not 0 < self.eval.linear_fit <= 1:
+            raise ValueError(
+                f"eval.linear_fit ({self.eval.linear_fit}) must be in (0, 1]; it is "
+                f"the explained variance a linear stitch reaches at this depth")
+
+        if not 0 < self.eval.fit_fraction <= 1:
+            raise ValueError(
+                f"eval.fit_fraction ({self.eval.fit_fraction}) must be in (0, 1]")
 
     # ------------------------------------------------------------------
 
@@ -430,9 +456,12 @@ class Config:
             out.append("activations.shuffle_buffer_tokens is a placeholder")
         if self.layer_pairs.count == 3 and self.layer_pairs.ranking_file is None:
             out.append("layer_pairs.count is a placeholder and no sweep ranking exists yet")
-        thresholds = (self.eval.min_explained_variance, self.eval.min_l0, self.eval.max_l0_frac,
+        if self.eval.linear_fit == 1.0:
+            out.append("eval.linear_fit is unset, so the reconstruction gate asks for "
+                       "a perfect reconstruction")
+        thresholds = (self.eval.min_l0, self.eval.max_l0_frac,
                       self.eval.max_never_fired, self.eval.max_feature_frequency)
-        if thresholds == (0.5, 1.0, 0.5, 0.5, 0.9):
+        if thresholds == (1.0, 0.5, 0.5, 0.9):
             out.append("eval gate thresholds are the unconfirmed defaults(placeholders)")
         return out
 

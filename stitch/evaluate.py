@@ -20,6 +20,27 @@ activation and discarding the small ones the classifier actually reads.
 Validity gates sit on top of both. They do not say a coder is good; they say it
 is not obviously broken, and a coder that fails one should not be compared with
 anything.
+
+Explained variance
+------------------
+The one definition used by every measurement here and by the linear baseline in
+the sweep, written down once because the reconstruction gate compares the two:
+
+    1 - (sum over dimensions of the mean squared residual)
+        / (sum over dimensions of the variance of the target)
+
+Summed over dimensions rather than averaged over them, so a dimension carrying
+more of the activation's variance counts for more. Both sums are accumulated
+over the whole evaluation set rather than averaged per batch, which is a
+different number. One is an exact reconstruction, zero is no better than
+predicting the target's mean, and a map fitted on tokens other than the ones it
+is scored on can land below zero.
+
+It is invariant to a single scalar per layer, because that scalar squares out of
+the residual and the total alike. The activation scaling is one scalar per
+layer, so a coder working in scaled units and a linear fit measured in whatever
+units the sweep fed it are comparable. Per-dimension scaling would not cancel
+and the two would not be comparable.
 """
 
 from __future__ import annotations
@@ -60,6 +81,10 @@ def reconstruction_metrics(coder: SparseCoder, batches: Iterator[dict[str, Tenso
         the share of features that never fired, and the largest share of tokens
         any single feature fired on. A feature active on almost every token is
         not a feature, it is a bias with extra steps.
+
+        ``eval_explained_variance`` is the quantity defined at the top of this
+        module, accumulated over every token read rather than averaged per
+        batch.
     """
     device = torch.device(device)
     coder = coder.to(device).eval()
@@ -254,7 +279,14 @@ def check_gates(metrics: dict[str, float], cfg, width: int) -> dict[str, bool]:
     ``finite``
         a loss that went to infinity leaves plausible looking weights.
     ``reconstructs``
-        a coder that reconstructs nothing still has an error to report.
+        a coder that reconstructs nothing still has an error to report. Judged
+        against what a closed-form linear stitch reaches at the same depth,
+        because that is what is reachable there at all, and not against a fixed
+        number, which would ask more of a depth where little transfers than of
+        one where everything does. Both sides are the explained variance
+        defined at the top of this module, which is what makes the comparison
+        mean anything: the coder's measured here, the linear fit's measured by
+        the sweep and carried in on the configuration.
     ``not_collapsed``
         with every feature off, the reconstruction is a constant and the
         sparsity is perfect.
@@ -283,7 +315,8 @@ def check_gates(metrics: dict[str, float], cfg, width: int) -> dict[str, bool]:
     """
     gates = {
         "finite": all(math.isfinite(value) for value in metrics.values()),
-        "reconstructs": metrics["eval_explained_variance"] >= cfg.eval.min_explained_variance,
+        "reconstructs": (metrics["eval_explained_variance"]
+                         >= cfg.eval.fit_fraction * cfg.eval.linear_fit),
         "not_collapsed": metrics["eval_l0"] >= cfg.eval.min_l0,
         "not_dense": metrics["eval_l0"] <= cfg.eval.max_l0_frac * width,
         "features_alive": metrics["eval_never_fired"] <= cfg.eval.max_never_fired,
@@ -306,9 +339,16 @@ def evaluate(coder: SparseCoder, batches: Iterator[dict[str, Tensor]],
     Shaped to be passed to the training loop as its evaluation hook, so the
     gates are visible during a run rather than only at the end of one. Booleans
     become one and zero, since a metric store holds numbers.
+
+    The linear fit the coder was judged against is recorded alongside the
+    metrics, with the ratio between the two, so a result carries the comparison
+    rather than leaving it in a configuration file read separately. A ratio
+    above one is a coder that beat the linear map.
     """
     metrics = reconstruction_metrics(
         coder, batches, source_key, target_key, cfg.eval.batches, device)
+    metrics["eval_linear_fit"] = cfg.eval.linear_fit
+    metrics["eval_fit_ratio"] = metrics["eval_explained_variance"] / cfg.eval.linear_fit
     gates = check_gates(metrics, cfg, coder.d_out)
     metrics.update({f"gate_{name}": float(value) for name, value in gates.items()})
     return metrics

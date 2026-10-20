@@ -72,6 +72,17 @@ class DenseCoder(PerfectCoder):
         return torch.ones(x.shape[0], self.d_latent, device=x.device)
 
 
+class HalfCoder(PerfectCoder):
+    """Returns half its input, leaving three quarters of the variance.
+
+    The residual is a quarter of the target in squared terms, so the explained
+    variance is a known 0.75 whatever units the activation arrives in.
+    """
+
+    def forward(self, x):
+        return x * 0.5, self.encode(x)
+
+
 def stream(keys=(KEY,), width=WIDTH, batches=8, seed=0):
     """A finite, repeatable activation stream."""
     generator = torch.Generator().manual_seed(seed)
@@ -86,7 +97,8 @@ def cfg():
     c.train.device = "cpu"
     c.eval.batches = 4
     c.eval.images = 32
-    c.eval.min_explained_variance = 0.5
+    c.eval.linear_fit = 1.0
+    c.eval.fit_fraction = 0.5
     c.eval.min_l0 = 1.0
     c.eval.max_l0_frac = 0.25
     c.eval.max_never_fired = 0.5
@@ -141,6 +153,31 @@ def test_an_always_on_feature_is_reported():
     """A feature active on every token is a bias, not a feature."""
     metrics = reconstruction_metrics(DenseCoder(), stream(), KEY, KEY, count=4)
     assert metrics["eval_max_feature_frequency"] == pytest.approx(1.0)
+
+
+def test_explained_variance_is_a_share_of_the_targets_variance():
+    """Half the activation leaves a quarter of its squared magnitude as error."""
+    metrics = reconstruction_metrics(HalfCoder(), stream(), KEY, KEY, count=4)
+    assert metrics["eval_explained_variance"] == pytest.approx(0.75, abs=0.02)
+
+
+def test_explained_variance_does_not_depend_on_the_activation_scale():
+    """One scalar per layer squares out of the residual and the total alike.
+
+    This is what lets the reconstruction gate compare a coder working in scaled
+    units against a linear fit measured in whatever units the sweep fed it. The
+    error itself moves with the scale; the share of the variance does not.
+    """
+    def scaled(factor):
+        for batch in stream(batches=4):
+            yield {KEY: batch[KEY] * factor}
+
+    plain = reconstruction_metrics(HalfCoder(), scaled(1.0), KEY, KEY, count=4)
+    big = reconstruction_metrics(HalfCoder(), scaled(37.0), KEY, KEY, count=4)
+
+    assert big["eval_explained_variance"] == pytest.approx(
+        plain["eval_explained_variance"], abs=1e-5)
+    assert big["eval_mse"] == pytest.approx(plain["eval_mse"] * 37.0 ** 2, rel=1e-4)
 
 
 def test_a_different_target_is_used_as_the_target():
@@ -441,6 +478,54 @@ def test_the_threshold_scales_with_the_activation_width(cfg):
 
 
 # ----------------------------------------------------------------------
+# the reconstruction gate against the linear fit
+#
+# What is reachable at a depth is a property of the model pair and the depth.
+# A fixed threshold asks more of a depth where little transfers than of one
+# where everything does, and the same coder then passes or fails on where it
+# was placed rather than on what it learned.
+# ----------------------------------------------------------------------
+
+def test_the_reconstruction_gate_moves_with_the_fit(cfg):
+    """The same coder passes where little transfers and fails where much does."""
+    cfg.eval.fit_fraction = 0.8
+    cfg.eval.linear_fit = 0.5
+    assert check_gates(passing(eval_explained_variance=0.45), cfg, 64)["reconstructs"] is True
+    cfg.eval.linear_fit = 1.0
+    assert check_gates(passing(eval_explained_variance=0.45), cfg, 64)["reconstructs"] is False
+
+
+def test_the_threshold_is_the_fraction_of_the_fit(cfg):
+    """Eight tenths of a fit of six tenths, and the line itself counts as passing.
+
+    The threshold is computed rather than written out, because a coder landing
+    exactly on it is the case the comparison has to get right and a literal
+    0.48 is not the same double as 0.8 times 0.6.
+    """
+    cfg.eval.fit_fraction = 0.8
+    cfg.eval.linear_fit = 0.6
+    threshold = cfg.eval.fit_fraction * cfg.eval.linear_fit
+    assert check_gates(passing(eval_explained_variance=threshold),
+                       cfg, 64)["reconstructs"] is True
+    assert check_gates(passing(eval_explained_variance=0.47), cfg, 64)["reconstructs"] is False
+    assert check_gates(passing(eval_explained_variance=0.49), cfg, 64)["reconstructs"] is True
+
+
+def test_beating_the_linear_fit_is_allowed(cfg):
+    """The fit is a floor, not a ceiling. Nothing caps the coder at it."""
+    cfg.eval.linear_fit = 0.4
+    assert check_gates(passing(eval_explained_variance=0.9), cfg, 64)["passed"] is True
+
+
+def test_the_whole_fit_can_be_demanded(cfg):
+    """A fraction of one asks the coder to match the linear map exactly."""
+    cfg.eval.fit_fraction = 1.0
+    cfg.eval.linear_fit = 0.6
+    assert check_gates(passing(eval_explained_variance=0.6), cfg, 64)["reconstructs"] is True
+    assert check_gates(passing(eval_explained_variance=0.59), cfg, 64)["reconstructs"] is False
+
+
+# ----------------------------------------------------------------------
 # the hook
 # ----------------------------------------------------------------------
 
@@ -471,3 +556,18 @@ def test_evaluate_judges_density_against_the_output_width(cfg):
     metrics = evaluate(PerfectCoder(active=8), stream(), KEY, KEY, cfg)
     assert metrics["eval_l0"] == pytest.approx(8.0)
     assert metrics["gate_not_dense"] == 0.0
+
+
+def test_evaluate_records_what_it_judged_against(cfg):
+    """A result carries the comparison, not only the side of it it produced."""
+    cfg.eval.linear_fit = 0.5
+    metrics = evaluate(PerfectCoder(), stream(), KEY, KEY, cfg)
+    assert metrics["eval_linear_fit"] == pytest.approx(0.5)
+    assert metrics["eval_fit_ratio"] == pytest.approx(2.0, abs=1e-4)
+
+
+def test_the_ratio_is_against_the_fit_not_against_one(cfg):
+    """A coder reaching exactly the fit has a ratio of one, whatever the fit is."""
+    cfg.eval.linear_fit = 1.0
+    metrics = evaluate(PerfectCoder(), stream(), KEY, KEY, cfg)
+    assert metrics["eval_fit_ratio"] == pytest.approx(1.0, abs=1e-4)

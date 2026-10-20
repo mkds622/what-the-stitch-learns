@@ -183,6 +183,9 @@ def run(cfg, resume: Path | None = None) -> dict:
                   evaluate=hook, resume=resume)
 
     # Held-out metrics and the gates, on a coder that has finished training.
+    # These carry the linear fit the coder was judged against and the ratio
+    # between the two, so the summary records the comparison and not only the
+    # side of it the coder produced.
     held_out = evaluate(coder, evaluation.batches(), source_key, target_key,
                         cfg, cfg.train.device)
     logger.log_metrics(held_out, step=int(final.get("tokens", 0)))
@@ -220,6 +223,8 @@ def describe(cfg) -> str:
         f"reconstructs      {target_key}",
         f"activations       {cfg.activations.mode}, scaling {cfg.activations.scaling}",
         f"dictionary        {cfg.coder.expansion}x, {cfg.coder.sparsity.mode} sparsity",
+        f"judged against    {cfg.eval.fit_fraction:g} of a linear fit of "
+        f"{cfg.eval.linear_fit:g}",
         f"budget            {cfg.train.tokens:,} tokens, {steps:,} steps "
         f"of {cfg.train.token_batch:,}",
         f"device            {cfg.train.device}, {cfg.train.dtype}",
