@@ -34,6 +34,7 @@ models:
 layer_pairs:
   count: 3                       # read by the sweep only; a run's depth is set
   matched_depth_only: true       # by activations.layers below
+  ranking_file: sweeps/layer_sweep_control.json
 
 sweep:
   metric: explained_variance

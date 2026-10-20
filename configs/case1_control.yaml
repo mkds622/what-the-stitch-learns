@@ -33,6 +33,7 @@ models:
 layer_pairs:
   count: 3                       # PENDING: no sweep ranking exists yet
   matched_depth_only: true
+  ranking_file: sweeps/layer_sweep_control.json
 
 sweep:
   metric: explained_variance
