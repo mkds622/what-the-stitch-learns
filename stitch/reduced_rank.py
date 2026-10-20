@@ -142,6 +142,69 @@ def fit_reduced_rank(moments: CrossMoments, source: str, target: str,
     )
 
 
+def self_pair_moments(moments: CrossMoments, key: str) -> CrossMoments:
+    """One layer's sums, arranged as a pair with itself.
+
+    The sweep compares one model against the other, so it accumulates A against
+    B and never A against A. A coder reproducing its own input is fitted
+    against the second one, which is not in the file. Every term it needs is
+    though: a layer's cross moment with itself is its own second moment, and
+    its target sums are its source sums.
+
+    Deriving them rather than accumulating them means a case 1 baseline costs
+    no extra pass over the data and is matched to exactly the tokens the sweep
+    saw.
+
+    Raises:
+        ValueError: if the moments do not cover that layer at all.
+    """
+    if key in moments.sum_x:
+        first, second = moments.sum_x[key], moments.sum_xx[key]
+    elif key in moments.sum_y:
+        first, second = moments.sum_y[key], moments.sum_yy[key]
+    else:
+        raise ValueError(f"the moments do not cover layer {key!r}")
+
+    out = CrossMoments(pairs=[(key, key)], widths={key: int(moments.widths[key])},
+                       device=second.device)
+    out.tokens = moments.tokens
+    out.sum_x[key] = first
+    out.sum_xx[key] = second
+    out.sum_y[key] = first
+    out.sum_y2[key] = torch.diagonal(second).clone()
+    out.sum_yy[key] = second
+    out.sum_xy[(key, key)] = second
+    return out
+
+
+def baseline_from_moments(moments: CrossMoments, source: str, target: str,
+                          l0: float, ridge: float = 1e-3,
+                          held_out: CrossMoments | None = None) -> dict[str, float]:
+    """The matched-rank baseline for a run, from the sweep's sums.
+
+    The one entry point a run needs. It arranges the sums for whichever
+    objective is being measured, fits, and scores at the coder's own rank.
+
+    Args:
+        moments: sums over the tokens to fit on.
+        source: the layer the coder read.
+        target: the layer it reconstructed.
+        l0: the coder's measured active features per token.
+        ridge: damping for the fit.
+        held_out: sums over other tokens, so the baseline is scored the way the
+            coder is. Omitted, the score is in-sample and not comparable.
+
+    Returns:
+        The fields :func:`baseline_for` produces, ready for a run summary.
+    """
+    if source == target:
+        moments = self_pair_moments(moments, source)
+        held_out = None if held_out is None else self_pair_moments(held_out, source)
+
+    fit = fit_reduced_rank(moments, source, target, ridge)
+    return baseline_for(fit, l0, held_out, source, target)
+
+
 def rank_k_map(fit: ReducedRankFit, k: int) -> tuple[Tensor, Tensor]:
     """The best rank-k map, as a weight and a bias.
 

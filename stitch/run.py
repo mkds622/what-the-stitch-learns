@@ -30,10 +30,12 @@ from stitch.activations import build_source
 from stitch.coder import build_coder
 from stitch.config import load_config
 from stitch.data import build_loader, build_transform, build_dataset
-from stitch.evaluate import evaluate, substitution_accuracy
+from stitch.evaluate import evaluate, feature_frequencies, substitution_accuracy
 from stitch.labels import label_map_for
 from stitch.models import parse_layer_key, trace
-from stitch.sweep import fit_for
+from stitch.reduced_rank import baseline_from_moments
+from stitch.sweep import fit_for, load_moments, moments_path
+from stitch.synthetic import GaussianActivations
 from stitch.train import resolve_layers, set_seed, train
 
 log = logging.getLogger(__name__)
@@ -147,6 +149,65 @@ def resolve_linear_fit(cfg) -> float:
     return fit
 
 
+def build_gaussian_streams(cfg):
+    """Activation sources drawing from statistics instead of from images.
+
+    The control. No backbones are loaded and no images are read: both streams
+    are Gaussian, matched to the real activations the sweep measured at this
+    depth, on the corresponding split. The evaluation stream adopts the
+    training stream's scales for the same reason the real one does, so the two
+    are in one set of units.
+
+    Returns:
+        ``(training, evaluation, None)``. The third is the image loader a real
+        run uses for substitution, which has no counterpart here: there are no
+        images, and no model to put a reconstruction back into.
+    """
+    keys = list(dict.fromkeys(resolve_layers(cfg)))
+
+    training = GaussianActivations(
+        cfg, load_moments(moments_path(cfg.layer_pairs.ranking_file, cfg.dataset.split),
+                          cfg.train.device), keys)
+    evaluation = GaussianActivations(
+        cfg, load_moments(moments_path(cfg.layer_pairs.ranking_file, cfg.dataset.eval_split),
+                          cfg.train.device), keys)
+    evaluation.set_scales(training.scales())
+
+    return training, evaluation, None
+
+
+def resolve_baseline(cfg, source_key: str, target_key: str, l0: float) -> dict[str, float]:
+    """What a fixed basis of the same size per token reaches at this depth.
+
+    A coder spending ``l0`` features per token is only worth its machinery if a
+    rank-``l0`` linear map does worse. Computed from the sums the sweep saved,
+    so it costs a solve rather than a pass over the data, and fitted and scored
+    on the same two splits the coder was.
+
+    Returns:
+        The baseline fields, plus the coder's score over the baseline's. Empty
+        when no sweep ranking is configured, since there are no sums to read.
+    """
+    if not cfg.layer_pairs.ranking_file:
+        log.warning("no layer_pairs.ranking_file, so no matched-rank baseline")
+        return {}
+
+    try:
+        moments = load_moments(
+            moments_path(cfg.layer_pairs.ranking_file, cfg.dataset.split), cfg.train.device)
+        held_out = load_moments(
+            moments_path(cfg.layer_pairs.ranking_file, cfg.dataset.eval_split),
+            cfg.train.device)
+    except FileNotFoundError as error:
+        # A ranking written before the sums were kept. The run is still valid;
+        # it simply has no baseline until the sweep is run again.
+        log.warning("no matched-rank baseline: %s", error)
+        return {}
+
+    return baseline_from_moments(moments, source_key, target_key, l0,
+                                 ridge=cfg.sweep.ridge, held_out=held_out)
+
+
 def build_halves(cfg, models: dict[str, object]):
     """The parts of the model above and below the cut, for substitution.
 
@@ -217,8 +278,13 @@ def run(cfg, resume: Path | None = None) -> dict:
     logger.log_params(cfg.flat())
     logger.log_dict({"hash": config_hash, "pending": cfg.pending_decisions()}, "config.json")
 
-    models, backbones = load_models(cfg)
-    training, evaluation, eval_loader = build_streams(cfg, models, backbones)
+    synthetic = cfg.activations.mode == "gaussian"
+    if synthetic:
+        models = {}
+        training, evaluation, eval_loader = build_gaussian_streams(cfg)
+    else:
+        models, backbones = load_models(cfg)
+        training, evaluation, eval_loader = build_streams(cfg, models, backbones)
 
     source_key, target_key = resolve_layers(cfg)
     widths = training.widths()
@@ -242,18 +308,36 @@ def run(cfg, resume: Path | None = None) -> dict:
                         cfg, cfg.train.device)
     logger.log_metrics(held_out, step=int(final.get("tokens", 0)))
 
-    # The expensive one: does the model still work with the reconstruction in place.
-    upper, lower, reference_upper = build_halves(cfg, models)
-    substitution = substitution_accuracy(
-        coder, upper, lower, eval_loader,
-        scale_in=scales[source_key], scale_out=scales[target_key],
-        max_images=cfg.eval.images, device=cfg.train.device,
-        label_map=label_map_for(cfg, eval_loader.dataset),
-        reference_upper=reference_upper)
-    logger.log_metrics(substitution, step=int(final.get("tokens", 0)))
+    # What a fixed basis of the same size per token reaches here, so the
+    # dictionary is read against something rather than against nothing.
+    baseline = resolve_baseline(cfg, source_key, target_key, held_out["eval_l0"])
+    if baseline.get("baseline_explained_variance"):
+        baseline["baseline_ratio"] = (held_out["eval_explained_variance"]
+                                      / baseline["baseline_explained_variance"])
+    logger.log_metrics(baseline, step=int(final.get("tokens", 0)))
 
-    summary = {"hash": config_hash, "run_name": name,
-               "scales": scales, **final, **held_out, **substitution}
+    # The distribution behind eval_frequency_gini, kept because the shape is
+    # the thing and a summary number cannot show it.
+    frequencies = feature_frequencies(coder, evaluation.batches(), source_key,
+                                      cfg.eval.batches, cfg.train.device)
+    logger.log_dict({"frequencies": frequencies.tolist()}, "feature_frequencies.json")
+
+    # The expensive one: does the model still work with the reconstruction in
+    # place. Skipped for a control, where there are no images and no model to
+    # put a reconstruction back into.
+    substitution: dict[str, float] = {}
+    if not synthetic:
+        upper, lower, reference_upper = build_halves(cfg, models)
+        substitution = substitution_accuracy(
+            coder, upper, lower, eval_loader,
+            scale_in=scales[source_key], scale_out=scales[target_key],
+            max_images=cfg.eval.images, device=cfg.train.device,
+            label_map=label_map_for(cfg, eval_loader.dataset),
+            reference_upper=reference_upper)
+        logger.log_metrics(substitution, step=int(final.get("tokens", 0)))
+
+    summary = {"hash": config_hash, "run_name": name, "scales": scales,
+               **final, **held_out, **baseline, **substitution}
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     logger.end_run()
 
@@ -270,7 +354,8 @@ def describe(cfg) -> str:
         f"objective         {cfg.objective}",
         f"run name          {cfg.run_name()}",
         f"hash              {cfg.hash()}",
-        f"dataset           {cfg.dataset.name} at {cfg.dataset.root or '(unset)'}",
+        f"dataset           {cfg.dataset.name} at {cfg.dataset.root or '(unset)'}"
+        + ("   (unused: tokens are generated)" if cfg.activations.mode == "gaussian" else ""),
         f"reads             {source_key}",
         f"reconstructs      {target_key}",
         f"activations       {cfg.activations.mode}, scaling {cfg.activations.scaling}",

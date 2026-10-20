@@ -220,12 +220,20 @@ class ActivationsConfig:
                   the volume sustains the required read rate, slower than
                   on_the_fly if it does not. See scripts/benchmark_case2.py for
                   the thresholds on a given machine.
+      gaussian    no images and no backbones: tokens are drawn from a Gaussian
+                  matched to the real activations' mean and covariance, read
+                  from the sums the sweep saved. This is the control a trained
+                  dictionary is read against, since a Gaussian has no features
+                  in it, so whatever a coder reaches on it was already
+                  described by second moments. Everything downstream is
+                  identical, which is what makes the pair a controlled
+                  comparison rather than two experiments.
 
     ``layers`` names what to extract, keyed as ``<model label>@<node name>``.
     Case 1 lists one entry, case 2 lists two. Nothing else changes between them.
     """
 
-    mode: Literal["on_the_fly", "cached"] = "on_the_fly"
+    mode: Literal["on_the_fly", "cached", "gaussian"] = "on_the_fly"
     cache_dir: str | None = None      # required when mode == "cached"
     layers: list[str] = field(default_factory=lambda: ["A@add_14"])
     extraction_batch_size: int = 128  # measured optimum for ViT-B/16; see benchmarks
@@ -375,6 +383,12 @@ class Config:
 
         if self.activations.mode == "cached" and not self.activations.cache_dir:
             raise ValueError("activations.mode is 'cached' but no cache_dir is set")
+
+        if self.activations.mode == "gaussian" and not self.layer_pairs.ranking_file:
+            raise ValueError(
+                "activations.mode is 'gaussian', which draws from statistics the "
+                "sweep measured, so layer_pairs.ranking_file must name the sweep "
+                "those statistics belong to")
 
         if self.coder.sparsity.mode == "topk":
             if self.coder.sparsity.k is None and self.coder.sparsity.k_frac <= 0:

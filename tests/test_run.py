@@ -27,9 +27,12 @@ torch = pytest.importorskip("torch")
 
 from stitch.config import Config, ModelConfig, dump_config             # noqa: E402
 from stitch.run import (                                               # noqa: E402
-    describe, load_models, main, resolve_linear_fit,
+    build_gaussian_streams, describe, load_models, main, resolve_baseline,
+    resolve_linear_fit,
 )
-from stitch.sweep import write_ranking                                 # noqa: E402
+from stitch.sweep import (                                             # noqa: E402
+    CrossMoments, moments_path, save_moments, write_ranking,
+)
 
 DATA = Path("data/imagenet-100")
 
@@ -214,6 +217,119 @@ def test_without_a_ranking_file_the_configured_value_stands(cfg):
     cfg = cross(cfg)
     cfg.eval.linear_fit = 0.5
     assert resolve_linear_fit(cfg) == 0.5
+
+
+# ----------------------------------------------------------------------
+# what a fixed basis of the same size reaches
+#
+# No backbone: the sums the sweep saved are all a baseline needs, so this runs
+# on CPU in milliseconds and a run pays a solve rather than a pass over data.
+# ----------------------------------------------------------------------
+
+WIDTH = 6
+
+
+def swept(tmp_path, cfg, tokens=4000, width=WIDTH, source="A@add_14",
+          target="B@add_14", seed=0):
+    """A ranking and its sums, as a finished sweep leaves them."""
+    generator = torch.Generator().manual_seed(seed)
+    x = torch.randn(tokens, width, generator=generator)
+    y = x @ torch.randn(width, 2, generator=generator) @ \
+        torch.randn(2, width, generator=generator)
+
+    ranking = tmp_path / "sweeps" / "ranking.json"
+    write_ranking([{"source": source, "target": target,
+                    "explained_variance": 0.5, "rank": 0}], ranking)
+
+    for split in (cfg.dataset.split, cfg.dataset.eval_split):
+        moments = CrossMoments(pairs=[(source, target)],
+                               widths={source: width, target: width})
+        moments.update({source: x, target: y})
+        save_moments(moments, moments_path(ranking, split))
+
+    cfg.layer_pairs.ranking_file = str(ranking)
+    return cfg
+
+
+def test_a_run_is_judged_against_a_basis_of_its_own_size(cfg, tmp_path):
+    cross(cfg, None)
+    result = resolve_baseline(swept(tmp_path, cfg), "A@add_14", "B@add_14", l0=2.0)
+
+    assert result["baseline_rank"] == 2.0
+    assert result["baseline_explained_variance"] == pytest.approx(1.0, abs=1e-2)
+
+
+def test_a_coder_reproducing_its_own_input_gets_one_too(cfg, tmp_path):
+    """The sweep holds no self pair, so this is the case that has to be derived."""
+    result = resolve_baseline(swept(tmp_path, cfg), "A@add_14", "A@add_14", l0=3.0)
+    assert result["baseline_rank"] == 3.0
+    assert 0.0 <= result["baseline_explained_variance"] <= 1.0
+
+
+def test_without_a_sweep_there_is_no_baseline(cfg):
+    assert resolve_baseline(cfg, "A@add_14", "A@add_14", l0=3.0) == {}
+
+
+def test_a_ranking_written_before_the_sums_were_kept_is_not_fatal(cfg, tmp_path):
+    """Old sweeps have a ranking and no moments. The run is still valid."""
+    ranking = tmp_path / "ranking.json"
+    write_ranking([{"source": "A@add_14", "target": "B@add_14",
+                    "explained_variance": 0.5, "rank": 0}], ranking)
+    cfg.layer_pairs.ranking_file = str(ranking)
+
+    assert resolve_baseline(cfg, "A@add_14", "B@add_14", l0=3.0) == {}
+
+
+# ----------------------------------------------------------------------
+# the control
+#
+# Same coder, same loop, same budget, tokens drawn from the real activations'
+# statistics instead of from images.
+# ----------------------------------------------------------------------
+
+def test_a_control_needs_no_images_and_no_backbones(cfg, tmp_path):
+    swept(tmp_path, cfg)
+    cfg.activations.mode = "gaussian"
+    cfg.activations.layers = ["A@add_14"]
+    cfg.train.token_batch = 64
+    cfg.activations.scale_tokens = 128
+    cfg.dataset.root = ""                      # nothing on disk is read
+
+    training, evaluation, loader = build_gaussian_streams(cfg)
+
+    assert loader is None
+    assert training.widths() == {"A@add_14": WIDTH}
+    assert next(training.batches())["A@add_14"].shape == (64, WIDTH)
+
+
+def test_both_control_streams_share_one_set_of_units(cfg, tmp_path):
+    """The same reason the real streams do: two sets of scalars would put the
+    training and evaluation numbers in different units."""
+    swept(tmp_path, cfg)
+    cfg.activations.mode = "gaussian"
+    cfg.activations.layers = ["A@add_14"]
+    cfg.train.token_batch = 64
+    cfg.activations.scale_tokens = 128
+
+    training, evaluation, _ = build_gaussian_streams(cfg)
+    assert evaluation.scales() == training.scales()
+
+
+def test_a_control_carries_both_layers_for_a_cross_model_coder(cfg, tmp_path):
+    swept(tmp_path, cfg)
+    cross(cfg, None)
+    cfg.activations.mode = "gaussian"
+    cfg.train.token_batch = 64
+    cfg.activations.scale_tokens = 128
+
+    training, _, _ = build_gaussian_streams(cfg)
+    assert set(training.widths()) == {"A@add_14", "B@add_14"}
+
+
+def test_a_dry_run_says_the_images_are_unused(cfg, tmp_path):
+    swept(tmp_path, cfg)
+    cfg.activations.mode = "gaussian"
+    assert "tokens are generated" in describe(cfg)
 
 
 # ----------------------------------------------------------------------

@@ -20,7 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 torch = pytest.importorskip("torch")
 
 from stitch.reduced_rank import (                                           # noqa: E402
-    baseline_for, explained_at_rank, fit_reduced_rank, rank_k_map,
+    baseline_for, baseline_from_moments, explained_at_rank, fit_reduced_rank,
+    rank_k_map, self_pair_moments,
 )
 from stitch.sweep import CrossMoments, LinearStitch, fit_linear        # noqa: E402
 
@@ -269,6 +270,89 @@ def test_the_baseline_is_scored_held_out_when_given_other_tokens():
                                  source=A, target=B)["baseline_explained_variance"]
 
     assert out_of_sample < in_sample
+
+
+# ----------------------------------------------------------------------
+# a coder reproducing its own input
+#
+# The sweep accumulates A against B and never A against A, so the sums a case 1
+# baseline needs are not in the file. They are all derivable from what is.
+# ----------------------------------------------------------------------
+
+def test_a_layer_is_arranged_as_a_pair_with_itself():
+    torch.manual_seed(20)
+    x = torch.randn(TOKENS, WIDTH)
+    paired = self_pair_moments(moments_from(x, torch.randn(TOKENS, WIDTH)), A)
+
+    assert paired.pairs == [(A, A)]
+    assert paired.tokens == TOKENS
+    assert torch.allclose(paired.sum_xy[(A, A)], (x.T @ x).to(torch.float64), atol=1e-2)
+    assert torch.allclose(paired.sum_y[A], paired.sum_x[A])
+    assert torch.allclose(paired.sum_y2[A], torch.diagonal(paired.sum_xx[A]))
+
+
+def test_a_derived_self_pair_is_the_layer_s_own_components():
+    """Which is what makes the case 1 baseline PCA, with no extra accumulation."""
+    torch.manual_seed(21)
+    x = torch.randn(TOKENS, 2) @ torch.randn(2, WIDTH)
+    paired = self_pair_moments(moments_from(x, torch.randn(TOKENS, WIDTH)), A)
+
+    assert explained_at_rank(fit_reduced_rank(paired, A, A, ridge=1e-9), 2) \
+        == pytest.approx(1.0, abs=1e-4)
+
+
+def test_a_layer_the_sums_do_not_cover_raises():
+    x, y = reduced_rank_data(TOKENS, rank=2)
+    with pytest.raises(ValueError, match="do not cover"):
+        self_pair_moments(moments_from(x, y), "A@nowhere")
+
+
+def test_the_target_side_of_a_pair_can_be_arranged_too():
+    """B is only ever a target in the sweep, so its sums live elsewhere."""
+    torch.manual_seed(22)
+    y = torch.randn(TOKENS, WIDTH)
+    paired = self_pair_moments(moments_from(torch.randn(TOKENS, WIDTH), y), B)
+
+    assert paired.pairs == [(B, B)]
+    assert torch.allclose(paired.sum_xx[B], (y.T @ y).to(torch.float64), atol=1e-2)
+
+
+# ----------------------------------------------------------------------
+# the one call a run makes
+# ----------------------------------------------------------------------
+
+def test_a_run_gets_its_baseline_from_the_sums():
+    torch.manual_seed(23)
+    x = torch.randn(TOKENS, WIDTH)
+    y = x @ torch.randn(WIDTH, WIDTH)
+    result = baseline_from_moments(moments_from(x, y), A, B, l0=WIDTH, ridge=1e-9)
+
+    assert result["baseline_rank"] == float(WIDTH)
+    assert result["baseline_explained_variance"] == pytest.approx(1.0, abs=1e-3)
+
+
+def test_the_same_layer_on_both_sides_needs_no_cross_term():
+    """The case the sweep never accumulates, which must work anyway."""
+    torch.manual_seed(24)
+    x = torch.randn(TOKENS, 3) @ torch.randn(3, WIDTH)
+    result = baseline_from_moments(moments_from(x, torch.randn(TOKENS, WIDTH)),
+                                   A, A, l0=3, ridge=1e-9)
+
+    assert result["baseline_rank"] == 3.0
+    assert result["baseline_explained_variance"] == pytest.approx(1.0, abs=1e-3)
+
+
+def test_the_run_level_call_scores_held_out_too():
+    generator = torch.Generator().manual_seed(25)
+    fit_x = torch.randn(300, WIDTH, generator=generator)
+    fit_y = torch.randn(300, WIDTH, generator=generator)
+    unseen = torch.randn(TOKENS, WIDTH, generator=generator)
+
+    result = baseline_from_moments(
+        moments_from(fit_x, fit_y), A, B, l0=WIDTH, ridge=1e-9,
+        held_out=moments_from(unseen, torch.randn(TOKENS, WIDTH, generator=generator)))
+
+    assert result["baseline_explained_variance"] < 0.0
 
 
 def test_every_value_is_a_number():
