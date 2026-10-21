@@ -74,30 +74,54 @@ def frequency_concentration(frequencies: Tensor) -> dict[str, float]:
     their own metric, and counting them here would make this a second reading
     of that one rather than a statement about the dictionary in use.
 
+    Two readings of the same distribution, comparable across different things.
+    ``gini`` is a share, so it is comparable between runs holding the same
+    number of live features and not between a dictionary with a thousand live
+    features and one with five thousand: the same unevenness reads differently
+    at the two sizes. ``effective`` is a count of features, so it is comparable
+    between any two runs reconstructing the same activation, whatever their
+    live counts or configured expansions.
+
     Args:
         frequencies: share of tokens each feature fired on, from
             :func:`feature_frequencies` or accumulated alongside the metrics.
 
     Returns:
         ``gini``, zero when every live feature fires equally often and
-        approaching one when a single feature does everything, and ``median``,
-        the typical live feature's share of tokens. Both are zero when nothing
-        fired, which the collapse gate catches separately.
+        approaching one when a single feature does everything; ``median``, the
+        typical live feature's share of tokens; and ``effective``, the number
+        of features the firing is spread over, as the exponential of the
+        entropy of the normalised firing frequencies. That is exactly ``m``
+        when ``m`` features fire equally often and the rest are dead, one when
+        a single feature does everything, and between the two otherwise, so a
+        dictionary with five thousand live features of which a few hundred do
+        the work reports a few hundred. All three are zero when nothing fired,
+        which the collapse gate catches separately.
     """
     live = frequencies[frequencies > 0].to(torch.float64)
     n = live.numel()
     if n == 0:
-        return {"gini": 0.0, "median": 0.0}
+        return {"gini": 0.0, "median": 0.0, "effective": 0.0}
 
     ordered = torch.sort(live).values
     total = float(ordered.sum())
     if total <= 0:
-        return {"gini": 0.0, "median": 0.0}
+        return {"gini": 0.0, "median": 0.0, "effective": 0.0}
 
     rank = torch.arange(1, n + 1, dtype=torch.float64, device=ordered.device)
     gini = 2.0 * float((rank * ordered).sum()) / (n * total) - (n + 1) / n
 
-    return {"gini": max(0.0, gini), "median": float(ordered.median())}
+    # Normalised into a distribution over the live features, so this is the
+    # shape of the firing and not its overall rate: doubling every frequency
+    # leaves it unchanged.
+    share = ordered / total
+    entropy = float(-(share * share.log()).sum())
+
+    return {
+        "gini": max(0.0, gini),
+        "median": float(ordered.median()),
+        "effective": math.exp(entropy),
+    }
 
 
 # ----------------------------------------------------------------------
@@ -141,9 +165,12 @@ def reconstruction_metrics(coder: SparseCoder, batches: Iterator[dict[str, Tenso
         while the configured expansion is built from the width being read, so
         the two are the same base only when a coder reproduces its own input.
 
-        ``eval_frequency_gini`` and ``eval_median_feature_frequency`` describe
-        how the firing is spread across the live dictionary, which L0 does not
-        say. See :func:`frequency_concentration`.
+        ``eval_frequency_gini``, ``eval_median_feature_frequency`` and
+        ``eval_effective_features`` describe how the firing is spread across
+        the live dictionary, which L0 does not say. The last is a count of
+        features rather than a share, which is what makes it readable between
+        runs whose live counts differ; the Gini coefficient is not. See
+        :func:`frequency_concentration`.
     """
     device = torch.device(device)
     coder = coder.to(device).eval()
@@ -200,6 +227,7 @@ def reconstruction_metrics(coder: SparseCoder, batches: Iterator[dict[str, Tenso
         "eval_max_feature_frequency": float(frequencies.max()),
         "eval_median_feature_frequency": concentration["median"],
         "eval_frequency_gini": concentration["gini"],
+        "eval_effective_features": concentration["effective"],
         "eval_tokens": float(tokens),
     }
 

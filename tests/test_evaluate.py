@@ -249,7 +249,8 @@ def test_the_median_is_the_typical_live_feature():
 
 def test_a_dictionary_that_never_fired_is_not_concentrated():
     """A collapsed coder is caught by its own gate, not by this reading as 1.0."""
-    assert frequency_concentration(torch.zeros(16)) == {"gini": 0.0, "median": 0.0}
+    assert frequency_concentration(torch.zeros(16)) == {
+        "gini": 0.0, "median": 0.0, "effective": 0.0}
 
 
 def test_concentration_is_scale_free():
@@ -257,6 +258,76 @@ def test_concentration_is_scale_free():
     frequencies = torch.tensor([0.05, 0.1, 0.2, 0.4])
     assert frequency_concentration(frequencies * 2)["gini"] == pytest.approx(
         frequency_concentration(frequencies)["gini"])
+    assert frequency_concentration(frequencies * 2)["effective"] == pytest.approx(
+        frequency_concentration(frequencies)["effective"])
+
+
+# ----------------------------------------------------------------------
+# how many features the firing is spread over
+#
+# The Gini coefficient is a share, so it reads differently at a thousand live
+# features than at five thousand and cannot be compared between the two. These
+# pin the count that can: it is in features, and its value is known exactly for
+# a distribution whose shape is known.
+# ----------------------------------------------------------------------
+
+def test_an_even_dictionary_is_effectively_its_own_size():
+    """Equal firing over m features is m features' worth of spread, exactly."""
+    for m in (1, 8, 64, 1000):
+        result = frequency_concentration(torch.full((m,), 0.25))
+        assert result["effective"] == pytest.approx(float(m), rel=1e-9)
+
+
+def test_dead_features_do_not_change_the_count():
+    """A wider dictionary with the same live features spreads no further."""
+    live = torch.full((32,), 0.25)
+    padded = torch.cat([live, torch.zeros(4096)])
+    assert frequency_concentration(padded)["effective"] == pytest.approx(32.0)
+
+
+def test_one_feature_doing_everything_is_one_feature():
+    frequencies = torch.zeros(4096)
+    frequencies[0] = 1.0
+    frequencies[1:] = 1e-12
+    assert frequency_concentration(frequencies)["effective"] == pytest.approx(1.0, abs=0.01)
+
+
+def test_a_large_dictionary_carried_by_a_few_reports_the_few():
+    """The reading the live count cannot give and the Gini coefficient cannot compare.
+
+    A thousand live features, ten of which do almost all the firing. The live
+    count says a thousand, which is the number the covariance control is
+    compared against and the number that would make a concentrated dictionary
+    look like a spread one.
+    """
+    frequencies = torch.full((1000,), 1e-6)
+    frequencies[:10] = 0.5
+    effective = frequency_concentration(frequencies)["effective"]
+    assert 10.0 <= effective <= 12.0
+
+
+def test_the_count_never_exceeds_the_live_count():
+    """Its ceiling is the number of features that fired, reached only when even."""
+    frequencies = torch.cat([torch.full((16,), 0.4), torch.full((16,), 0.05)])
+    result = frequency_concentration(frequencies)
+    assert 1.0 < result["effective"] < 32.0
+
+
+def test_the_count_and_the_gini_disagree_about_which_dictionary_is_concentrated():
+    """Why the count was added: the same Gini coefficient at two live counts.
+
+    Both dictionaries have half their live features firing at four times the
+    rate of the other half, so they are equally uneven and their Gini
+    coefficients match. One of them spreads its firing over eight times as
+    many features, which only the count says.
+    """
+    small = torch.cat([torch.full((16,), 0.4), torch.full((16,), 0.1)])
+    large = torch.cat([torch.full((128,), 0.4), torch.full((128,), 0.1)])
+
+    assert frequency_concentration(large)["gini"] == pytest.approx(
+        frequency_concentration(small)["gini"], abs=0.01)
+    assert (frequency_concentration(large)["effective"]
+            == pytest.approx(8.0 * frequency_concentration(small)["effective"], rel=1e-6))
 
 
 def test_the_metrics_carry_the_concentration():
@@ -264,12 +335,21 @@ def test_the_metrics_carry_the_concentration():
     metrics = reconstruction_metrics(PerfectCoder(active=1), stream(), KEY, KEY, count=4)
     assert metrics["eval_frequency_gini"] == pytest.approx(0.0, abs=1e-9)
     assert metrics["eval_median_feature_frequency"] == pytest.approx(1.0)
+    assert metrics["eval_effective_features"] == pytest.approx(1.0)
+
+
+def test_the_metrics_carry_the_effective_count_in_features():
+    """Three features firing on every token, so the firing spreads over three."""
+    metrics = reconstruction_metrics(PerfectCoder(active=3), stream(), KEY, KEY, count=4)
+    assert metrics["eval_effective_features"] == pytest.approx(3.0)
+    assert metrics["eval_effective_expansion"] == pytest.approx(3 / WIDTH)
 
 
 def test_concentration_is_reported_even_for_a_dead_coder():
     metrics = reconstruction_metrics(ZeroCoder(), stream(), KEY, KEY, count=4)
     assert metrics["eval_frequency_gini"] == 0.0
     assert metrics["eval_median_feature_frequency"] == 0.0
+    assert metrics["eval_effective_features"] == 0.0
 
 
 # ----------------------------------------------------------------------
