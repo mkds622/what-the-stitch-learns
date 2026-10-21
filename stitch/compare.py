@@ -61,6 +61,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from pathlib import Path
 
 import torch
@@ -242,9 +243,15 @@ def random_baseline(width: int, features: int, trials: int = 3,
     closer the nearest one happens to be. Measured rather than assumed, since
     the analytic approximation is only good for large widths.
 
+    The size passed must be the number of features actually compared, not the
+    configured dictionary size. Dead features are dropped before two coders are
+    compared, so a floor measured over the full dictionary is a floor for a
+    larger problem than the one being solved, and it is one of the two anchors
+    the reported position sits between.
+
     Args:
         width: the space both dictionaries live in.
-        features: dictionary size.
+        features: dictionary size, meaning the live count.
         trials: how many random pairs to average over.
         seed: generator seed, so the baseline is reproducible.
 
@@ -326,6 +333,10 @@ def compare_runs(path_a: Path, path_b: Path, close: float = 0.9,
     record.update({
         "a": str(Path(path_a).name),
         "b": str(Path(path_b).name),
+        # Resolved here, where both run directories are in hand, rather than
+        # downstream from the names alone, which cannot see the depth.
+        "a_group": group_of(path_a),
+        "b_group": group_of(path_b),
         "a_kept": info_a["kept"],
         "b_kept": info_b["kept"],
         "width": a.shape[0],
@@ -333,15 +344,76 @@ def compare_runs(path_a: Path, path_b: Path, close: float = 0.9,
     return record
 
 
-def group_of(name: str) -> str:
-    """What a run directory name says the run was.
+def same_configuration(record: dict) -> bool:
+    """Whether a pair differs only by seed, so sets the ceiling rather than
+    being the comparison.
 
-    Run names are ``<objective>-<tag>-x<expansion>-<sparsity>-s<seed>-<hash>``,
-    so everything but the seed and the hash identifies the configuration a run
-    belongs to. Two runs in the same group differ only by seed.
+    Reads the groups the pair was recorded with. A record written before those
+    were carried falls back to its names, which is the older and weaker rule.
+    """
+    if "a_group" in record and "b_group" in record:
+        return record["a_group"] == record["b_group"]
+    return group_of(record["a"]) == group_of(record["b"])
+
+
+def _group_from_params(path: Path) -> str:
+    """A configuration's identity, from the settings the run recorded.
+
+    Everything except the seed. Two runs are a seed repeat exactly when every
+    other setting matches, which is what the ceiling is supposed to be measured
+    from.
+    """
+    import hashlib
+
+    stored = json.loads(Path(path).read_text())
+    stored.pop("train.seed", None)
+    blob = json.dumps(stored, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:12]
+
+
+#: A seed, as a run name spells it: the letter followed by digits and nothing
+#: else. Matching on the prefix alone would also swallow a tag beginning with
+#: the same letter and merge two configurations into one group.
+SEED_PART = re.compile(r"^s\d+$")
+
+
+def _group_from_name(name: str) -> str:
+    """The same identity, from the directory name, where that is all there is.
+
+    Names are ``<objective>-<tag>-x<expansion>-<sparsity>-s<seed>-<hash>``. The
+    name carries neither the depth nor the sparsity setting, so two runs that
+    differ only in those are indistinguishable here. It is a fallback for a run
+    whose parameters are missing, and the caller is warned.
     """
     parts = str(name).split("-")
-    return "-".join(part for part in parts[:-1] if not part.startswith("s")) or str(name)
+    return "-".join(part for part in parts[:-1] if not SEED_PART.match(part)) or str(name)
+
+
+def group_of(run: str | Path) -> str:
+    """Which configuration a run belongs to, for telling a seed repeat apart.
+
+    Args:
+        run: a run directory, or a bare run name.
+
+    Returns:
+        A key that is equal for two runs differing only by seed.
+
+    The directory is preferred because the name is not enough. It carries the
+    objective, the tag, the expansion, the sparsity mode, the seed and a hash,
+    and not the depth, the sparsity setting or the budget. In the main grid the
+    depths are separate configurations differing only in which layers they
+    read, so two runs at different depths share a name shape, and a ceiling
+    measured over them would be measuring depth rather than seed.
+    """
+    path = Path(run)
+    params = path / "params.json"
+    if params.is_file():
+        return _group_from_params(params)
+
+    if path.is_dir():
+        log.warning("%s has no params.json, so its configuration is read from its "
+                    "name, which cannot see the depth", path)
+    return _group_from_name(path.name)
 
 
 def pooled_shapes(records: list[dict]) -> dict[str, list[float]]:
@@ -354,8 +426,7 @@ def pooled_shapes(records: list[dict]) -> dict[str, list[float]]:
     for record in records:
         if "histogram" not in record:
             continue
-        key = ("within_shape" if group_of(record["a"]) == group_of(record["b"])
-               else "across_shape")
+        key = "within_shape" if same_configuration(record) else "across_shape"
         groups[key].append(record["histogram"])
 
     out = {}
@@ -380,8 +451,8 @@ def summarise(records: list[dict], baseline: dict | None = None) -> dict:
         ``random`` and ``within`` as a fraction, where 1 means
         indistinguishable from a seed repeat and 0 means no better than random.
     """
-    within = [r["mean"] for r in records if group_of(r["a"]) == group_of(r["b"])]
-    across = [r["mean"] for r in records if group_of(r["a"]) != group_of(r["b"])]
+    within = [r["mean"] for r in records if same_configuration(r)]
+    across = [r["mean"] for r in records if not same_configuration(r)]
 
     def stats(values: list[float]) -> dict:
         if not values:

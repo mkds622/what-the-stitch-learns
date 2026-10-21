@@ -19,7 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stitch.compare import (                                          # noqa: E402
     best_match, compare_runs, group_of, latest_checkpoint, load_dictionary,
-    random_baseline, similarity, summarise, write_comparison,
+    random_baseline, same_configuration, similarity, summarise,
+    write_comparison,
 )
 
 
@@ -111,7 +112,13 @@ def test_random_dictionaries_do_not_score_zero():
 
 
 def test_a_bigger_dictionary_matches_random_better():
-    """More directions means the nearest one is nearer, by chance alone."""
+    """More directions means the nearest one is nearer, by chance alone.
+
+    Which is why the floor has to be measured at the number of features the
+    comparison actually used. Dead features are dropped before two coders are
+    compared, so a floor taken over the configured dictionary belongs to a
+    larger problem than the one being solved.
+    """
     small = random_baseline(64, 64, trials=1)["mean"]
     large = random_baseline(64, 512, trials=1)["mean"]
     assert large > small
@@ -194,6 +201,104 @@ def test_runs_differing_only_by_seed_are_one_group():
 def test_runs_of_different_objectives_are_different_groups():
     assert (group_of("case1-main-x16-l1-s0-abc123")
             != group_of("case2-main-x16-l1-s0-abc123"))
+
+
+def test_a_tag_beginning_with_the_seed_letter_survives():
+    """The seed is dropped by matching the letter and digits, not the letter
+    alone, or a tag like 'smoke' would vanish and merge two configurations."""
+    assert (group_of("case1-smoke-x16-l1-s0-abc123")
+            != group_of("case1-stable-x16-l1-s0-abc123"))
+
+
+# ----------------------------------------------------------------------
+# grouping from what a run recorded, not from its name
+#
+# A run's directory name carries the objective, the tag, the expansion, the
+# sparsity mode, the seed and a hash. It does not carry the depth. In the main
+# grid the depths are separate configurations differing only in which layers
+# they read, so two depths share a name shape, and a ceiling measured over them
+# would be measuring depth rather than seed.
+# ----------------------------------------------------------------------
+
+def write_params(directory: Path, layers: list[str], seed: int, **extra) -> Path:
+    """A run's resolved settings, as the logger writes them."""
+    import json
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "params.json").write_text(json.dumps(
+        {"objective": "case1", "activations.layers": layers,
+         "coder.expansion": 32, "train.seed": seed, **extra}))
+    return directory
+
+
+def test_two_seeds_at_one_depth_are_one_group(tmp_path):
+    a = write_params(tmp_path / "case1-main-x32-topk-s0-aaa", ["A@add_4"], 0)
+    b = write_params(tmp_path / "case1-main-x32-topk-s1-bbb", ["A@add_4"], 1)
+    assert group_of(a) == group_of(b)
+
+
+def test_two_depths_are_not_a_seed_repeat(tmp_path):
+    """The defect this exists to prevent: the names are indistinguishable."""
+    from stitch.compare import _group_from_name
+
+    shallow = write_params(tmp_path / "case1-main-x32-topk-s0-aaa", ["A@add_4"], 0)
+    deep = write_params(tmp_path / "case1-main-x32-topk-s0-ccc", ["A@add_12"], 0)
+
+    assert group_of(shallow) != group_of(deep)
+    assert _group_from_name(shallow.name) == _group_from_name(deep.name)
+
+
+def test_two_sparsity_settings_are_not_a_seed_repeat(tmp_path):
+    """The name carries the mode but not the value, so these look alike too."""
+    loose = write_params(tmp_path / "case1-main-x32-topk-s0-aaa", ["A@add_4"], 0,
+                         **{"coder.sparsity.k_frac": 0.153})
+    tight = write_params(tmp_path / "case1-main-x32-topk-s0-bbb", ["A@add_4"], 0,
+                         **{"coder.sparsity.k_frac": 0.04})
+    assert group_of(loose) != group_of(tight)
+
+
+def test_a_run_without_parameters_falls_back_to_its_name(tmp_path):
+    run = tmp_path / "case1-main-x32-topk-s0-aaa"
+    run.mkdir()
+    assert group_of(run) == group_of("case1-main-x32-topk-s3-bbb")
+
+
+def test_a_comparison_records_which_configuration_each_side_was(tmp_path):
+    """Resolved where both directories are in hand, so nothing downstream has
+    to go back to the names."""
+    a = write_run(tmp_path / "case1-main-x32-topk-s0-aaa", unit(16, 32, seed=0))
+    b = write_run(tmp_path / "case1-main-x32-topk-s1-bbb", unit(16, 32, seed=1))
+    write_params(a, ["A@add_4"], 0)
+    write_params(b, ["A@add_4"], 1)
+
+    record = compare_runs(a, b)
+    assert record["a_group"] == record["b_group"]
+    assert same_configuration(record)
+
+
+def test_the_recorded_groups_win_over_the_names():
+    """Two runs at different depths, whose names say they are a seed repeat."""
+    record = {"a": "case1-main-x32-topk-s0-aaa", "b": "case1-main-x32-topk-s1-bbb",
+              "a_group": "shallow", "b_group": "deep", "mean": 0.5}
+    assert not same_configuration(record)
+
+
+def test_a_record_without_groups_still_reads():
+    """Comparisons written before the groups were carried."""
+    assert same_configuration({"a": "case1-x16-l1-s0-a", "b": "case1-x16-l1-s1-b"})
+
+
+def test_the_summary_uses_the_recorded_groups():
+    records = [
+        {"a": "case1-main-x32-topk-s0-a", "b": "case1-main-x32-topk-s1-b",
+         "a_group": "shallow", "b_group": "deep", "mean": 0.90},
+        {"a": "case1-main-x32-topk-s0-a", "b": "case1-main-x32-topk-s2-c",
+         "a_group": "shallow", "b_group": "shallow", "mean": 0.50},
+    ]
+    summary = summarise(records)
+    # By name both pairs are seed repeats. By what the runs recorded, the
+    # first is a comparison across depths and the second is the repeat.
+    assert summary["within"]["mean"] == pytest.approx(0.50)
+    assert summary["across"]["mean"] == pytest.approx(0.90)
 
 
 def test_the_summary_separates_seed_repeats_from_the_comparison():

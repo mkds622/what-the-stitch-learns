@@ -97,10 +97,19 @@ def main(argv=None) -> int:
 
     baseline = None
     if not args.no_baseline:
-        directions, info = load_dictionary(directories[0], drop_dead=False)
-        baseline = random_baseline(directions.shape[0], info["features"],
+        # Measured at the size the comparisons actually used, which is the live
+        # count rather than the configured one. The floor rises with dictionary
+        # size, so taking it over the full dictionary would compare the runs
+        # against a floor belonging to a larger problem. Averaged over the runs
+        # being compared, since their live counts differ.
+        directions, info = load_dictionary(directories[0], drop_dead=not args.keep_dead)
+        kept = sorted(record[side] for record in records for side in ("a_kept", "b_kept"))
+        features = kept[len(kept) // 2] if kept else info["kept"]
+
+        baseline = random_baseline(directions.shape[0], features,
                                    keep_distribution=drawing)
-        log.info("random dictionaries of the same shape: %.4f", baseline["mean"])
+        log.info("random dictionaries of %d live features: %.4f",
+                 features, baseline["mean"])
 
     summary = summarise(records, baseline)
     write_comparison(records, summary, args.out)
