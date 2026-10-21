@@ -268,6 +268,7 @@ def substitution_accuracy(coder: SparseCoder, upper: nn.Module, lower: nn.Module
                           max_images: int, device: torch.device | str = "cpu",
                           label_map: Tensor | None = None,
                           reference_upper: nn.Module | None = None,
+                          baseline: nn.Module | None = None,
                           ) -> dict[str, float]:
     """What the model predicts when the coder's output replaces the activation.
 
@@ -298,12 +299,32 @@ def substitution_accuracy(coder: SparseCoder, upper: nn.Module, lower: nn.Module
             chance. Left as None when both halves come from one model, where
             the activation already in hand is the right one and a second
             forward pass would buy nothing.
+        baseline: the reduced-rank map as a module, from
+            ``stitch.sweep.LinearStitch``, substituted at the same cut point so
+            its effect on the prediction can be read beside the coder's.
+            Without it, agreement is a number with no scale: there is no way to
+            tell whether a coder preserving 0.95 of the model's predictions is
+            the dictionary doing work or what any map of that cost reaches at
+            that depth. Run inside the same loop over the same images, so it
+            costs one more pass through the lower half and no extra pass over
+            the data.
+
+            It reads the activation directly, in the units the activation
+            arrives in, because the sweep that fitted it never scaled anything.
+            The coder is the one working in scaled units, and the scaling is
+            undone on its output alone.
 
     Returns:
         Top-1 accuracy of the unmodified model, top-1 with the reconstruction
         substituted, the gap between them, and the share of images where both
         predict the same class. Agreement is the stricter of the two: a coder
         can preserve accuracy while changing which images are right.
+
+        With a baseline given, the same three readings for it under
+        ``baseline_`` names, matching the keys its explained variance is
+        already recorded under. Absent without one, rather than present and
+        zero, so a run that had no baseline cannot be mistaken for one whose
+        baseline destroyed the prediction.
 
         The unmodified model is the one the coder reconstructs into, cut at the
         same depth and rejoined with nothing in between, so the only difference
@@ -315,11 +336,14 @@ def substitution_accuracy(coder: SparseCoder, upper: nn.Module, lower: nn.Module
     lower = lower.to(device).eval()
     if reference_upper is not None:
         reference_upper = reference_upper.to(device).eval()
+    if baseline is not None:
+        baseline = baseline.to(device).eval()
 
     if label_map is not None:
         label_map = label_map.to(device)
 
     correct_plain = correct_substituted = agreed = seen = 0
+    correct_baseline = agreed_baseline = 0
 
     for images, labels in loader:
         if seen >= max_images:
@@ -333,8 +357,8 @@ def substitution_accuracy(coder: SparseCoder, upper: nn.Module, lower: nn.Module
         activation = upper(images)
         plain = lower(activation if reference_upper is None else reference_upper(images))
 
-        flat = activation.reshape(-1, activation.shape[-1]) * scale_in
-        reconstruction, _ = coder(flat)
+        raw = activation.reshape(-1, activation.shape[-1])
+        reconstruction, _ = coder(raw * scale_in)
         restored = (reconstruction / scale_out).reshape(activation.shape)
         substituted = lower(restored)
 
@@ -346,19 +370,38 @@ def substitution_accuracy(coder: SparseCoder, upper: nn.Module, lower: nn.Module
         agreed += int((plain_class == substituted_class).sum())
         seen += images.shape[0]
 
+        if baseline is not None:
+            # Already fitted in the activation's own units, so no scale enters
+            # on either side. The second argument it returns is an empty latent
+            # tensor it carries only to match a coder's signature.
+            predicted, _ = baseline(raw)
+            baseline_class = lower(predicted.reshape(activation.shape)).argmax(dim=-1)
+            correct_baseline += int((baseline_class == labels).sum())
+            agreed_baseline += int((baseline_class == plain_class).sum())
+
     if seen == 0:
         raise ValueError("the loader produced no images")
 
     plain_top1 = correct_plain / seen
     substituted_top1 = correct_substituted / seen
 
-    return {
+    result = {
         "plain_top1": plain_top1,
         "substituted_top1": substituted_top1,
         "top1_drop": plain_top1 - substituted_top1,
         "agreement": agreed / seen,
         "images": float(seen),
     }
+
+    if baseline is not None:
+        baseline_top1 = correct_baseline / seen
+        result.update({
+            "baseline_substituted_top1": baseline_top1,
+            "baseline_top1_drop": plain_top1 - baseline_top1,
+            "baseline_agreement": agreed_baseline / seen,
+        })
+
+    return result
 
 
 # ----------------------------------------------------------------------

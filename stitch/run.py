@@ -33,8 +33,8 @@ from stitch.data import build_loader, build_transform, build_dataset
 from stitch.evaluate import evaluate, feature_frequencies, substitution_accuracy
 from stitch.labels import label_map_for
 from stitch.models import parse_layer_key, trace
-from stitch.reduced_rank import baseline_from_moments
-from stitch.sweep import fit_for, load_moments, moments_path
+from stitch.reduced_rank import baseline_from_moments, map_from_moments
+from stitch.sweep import LinearStitch, fit_for, load_moments, moments_path
 from stitch.synthetic import GaussianActivations
 from stitch.train import resolve_layers, set_seed, train
 
@@ -208,6 +208,41 @@ def resolve_baseline(cfg, source_key: str, target_key: str, l0: float) -> dict[s
                                  ridge=cfg.sweep.ridge, held_out=held_out)
 
 
+def resolve_baseline_map(cfg, source_key: str, target_key: str,
+                         rank: float | None) -> LinearStitch | None:
+    """The baseline as something the substitution measurement can run.
+
+    Explained variance says how much of the target the baseline reproduces.
+    It does not say whether what it reproduces is what the rest of the model
+    reads, which is the same distinction agreement draws for the coder. This
+    gives agreement a reference, so a coder preserving some share of the
+    model's predictions can be read against what a fixed basis of the same
+    cost per token preserves at the same depth.
+
+    Args:
+        rank: ``baseline_rank`` from the baseline already resolved for this
+            run, so both describe one map. None or zero when there was no
+            baseline, in which case there is no map either.
+
+    Returns:
+        The map as a module, or None when this run has no baseline.
+    """
+    if not rank:
+        return None
+
+    try:
+        moments = load_moments(
+            moments_path(cfg.layer_pairs.ranking_file, cfg.dataset.split),
+            cfg.train.device)
+    except FileNotFoundError as error:
+        log.warning("no baseline to substitute: %s", error)
+        return None
+
+    weight, bias = map_from_moments(moments, source_key, target_key,
+                                    int(rank), ridge=cfg.sweep.ridge)
+    return LinearStitch(weight, bias)
+
+
 def build_halves(cfg, models: dict[str, object]):
     """The parts of the model above and below the cut, for substitution.
 
@@ -333,7 +368,9 @@ def run(cfg, resume: Path | None = None) -> dict:
             scale_in=scales[source_key], scale_out=scales[target_key],
             max_images=cfg.eval.images, device=cfg.train.device,
             label_map=label_map_for(cfg, eval_loader.dataset),
-            reference_upper=reference_upper)
+            reference_upper=reference_upper,
+            baseline=resolve_baseline_map(cfg, source_key, target_key,
+                                          baseline.get("baseline_rank")))
         logger.log_metrics(substitution, step=int(final.get("tokens", 0)))
 
     summary = {"hash": config_hash, "run_name": name, "scales": scales,

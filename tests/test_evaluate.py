@@ -27,6 +27,7 @@ from stitch.evaluate import (                                           # noqa: 
     check_gates, evaluate, feature_frequencies, frequency_concentration,
     reconstruction_metrics, substitution_accuracy,
 )
+from stitch.sweep import LinearStitch                                   # noqa: E402
 
 WIDTH = 8
 LATENT = 32
@@ -441,6 +442,99 @@ def test_accuracy_is_a_proportion(loader):
                                    scale_in=1.0, scale_out=1.0, max_images=32)
     assert 0.0 <= result["plain_top1"] <= 1.0
     assert 0.0 <= result["agreement"] <= 1.0
+
+
+# ----------------------------------------------------------------------
+# the baseline put through the same substitution
+#
+# Agreement on its own is a number with no scale. These fix the reference it
+# is read against: the same rank-limited map whose explained variance the run
+# already records, substituted at the same cut point, in the same loop.
+#
+# The map is fitted in the activation's own units while the coder works in
+# scaled ones, so the baseline must read the activation unscaled and have no
+# scale undone on its output. That is the part a later change could silently
+# break, and the scale test below is what catches it.
+# ----------------------------------------------------------------------
+
+def identity_map(width: int = WIDTH) -> LinearStitch:
+    """A baseline that returns the activation untouched.
+
+    The real thing is a rank-limited linear map. This is the degenerate case
+    of one, and the only case whose effect on a prediction is known exactly.
+    """
+    return LinearStitch(torch.eye(width), torch.zeros(width))
+
+
+def test_without_a_baseline_no_baseline_fields_are_reported(loader):
+    """Absent rather than zero: a run with no baseline is not a run whose
+    baseline destroyed the prediction."""
+    result = substitution_accuracy(PerfectCoder(), Upper(), Lower(), loader,
+                                   scale_in=1.0, scale_out=1.0, max_images=32)
+    assert not any(key.startswith("baseline_") for key in result)
+
+
+def test_an_exact_baseline_changes_nothing(loader):
+    result = substitution_accuracy(PerfectCoder(), Upper(), Lower(), loader,
+                                   scale_in=1.0, scale_out=1.0, max_images=32,
+                                   baseline=identity_map())
+    assert result["baseline_agreement"] == 1.0
+    assert result["baseline_top1_drop"] == 0.0
+    assert result["baseline_substituted_top1"] == result["plain_top1"]
+
+
+def test_a_useless_baseline_is_visible(loader):
+    """A map that returns zero should move the prediction, as the coder would."""
+    dead = LinearStitch(torch.zeros(WIDTH, WIDTH), torch.zeros(WIDTH))
+    result = substitution_accuracy(PerfectCoder(), Upper(), Lower(), loader,
+                                   scale_in=1.0, scale_out=1.0, max_images=32,
+                                   baseline=dead)
+    assert result["baseline_agreement"] < 1.0
+    assert result["agreement"] == 1.0
+
+
+def test_the_baseline_reads_the_activation_in_its_own_units(loader):
+    """The scale belongs to the coder and must not reach the baseline.
+
+    The sweep that fitted the map never scaled anything, so the map is in the
+    activation's units. Handing it the coder's scaled input would put it in a
+    space it was never fitted for, and because the lower half has a bias that
+    shows up as a changed prediction rather than as an error.
+    """
+    result = substitution_accuracy(PerfectCoder(), Upper(), Lower(), loader,
+                                   scale_in=7.5, scale_out=7.5, max_images=32,
+                                   baseline=identity_map())
+    assert result["baseline_agreement"] == 1.0
+    assert result["agreement"] == 1.0
+
+
+def test_the_baseline_is_judged_against_the_same_reference_prediction(scattered_loader):
+    """`plain` is the target model cut and rejoined, for the baseline too.
+
+    With the halves taken from different models the reference comes from
+    ``reference_upper``. The baseline is substituted at the cut like the coder,
+    so it reads the source model's activation and cannot reproduce that
+    reference, which is the honest reading rather than a flattering one.
+    """
+    result = substitution_accuracy(PerfectCoder(), ZeroUpper(), ScatterLower(),
+                                   scattered_loader, scale_in=1.0, scale_out=1.0,
+                                   max_images=20,
+                                   label_map=torch.tensor(SUBSET_TO_FULL),
+                                   reference_upper=Identity(),
+                                   baseline=identity_map())
+    assert result["plain_top1"] == 1.0
+    assert result["baseline_agreement"] < 1.0
+
+
+def test_the_baseline_does_not_disturb_the_coder_numbers(loader):
+    """Adding a reference must not move the thing it is a reference for."""
+    upper, lower = Upper(), Lower()                 # one model, used twice
+    without = substitution_accuracy(PerfectCoder(), upper, lower, loader,
+                                    scale_in=1.0, scale_out=1.0, max_images=32)
+    with_baseline = substitution_accuracy(PerfectCoder(), upper, lower, loader,
+                                          scale_in=1.0, scale_out=1.0, max_images=32,
+                                          baseline=identity_map())
+    assert all(with_baseline[key] == value for key, value in without.items())
 
 
 # ----------------------------------------------------------------------

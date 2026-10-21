@@ -205,6 +205,33 @@ def baseline_from_moments(moments: CrossMoments, source: str, target: str,
     return baseline_for(fit, l0, held_out, source, target)
 
 
+def map_from_moments(moments: CrossMoments, source: str, target: str, rank: int,
+                     ridge: float = 1e-3) -> tuple[Tensor, Tensor]:
+    """The baseline map itself, arranged the way a run's baseline is.
+
+    :func:`baseline_from_moments` reports what the map scores and discards the
+    map. This returns the map, through the same arrangement and the same fit,
+    so what is handed to the substitution measurement is the map whose
+    explained variance was already recorded rather than a second one fitted
+    differently.
+
+    Args:
+        moments: sums over the tokens to fit on, the training split's.
+        source: the layer the coder read.
+        target: the layer it reconstructed.
+        rank: the rank to keep, which is ``baseline_rank`` from the run's
+            summary rather than its raw L0, since that one was clamped into
+            the range a rank can take.
+        ridge: damping for the fit, matching the run's.
+
+    Returns:
+        ``(weight, bias)``, applied as ``x @ weight + bias``.
+    """
+    if source == target:
+        moments = self_pair_moments(moments, source)
+    return rank_k_map(fit_reduced_rank(moments, source, target, ridge), rank)
+
+
 def rank_k_map(fit: ReducedRankFit, k: int) -> tuple[Tensor, Tensor]:
     """The best rank-k map, as a weight and a bias.
 
