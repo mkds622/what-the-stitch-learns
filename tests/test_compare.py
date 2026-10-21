@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stitch.compare import (                                          # noqa: E402
     best_match, compare_runs, group_of, latest_checkpoint, load_dictionary,
-    random_baseline, same_configuration, similarity, summarise,
+    load_sides, random_baseline, same_configuration, similarity, summarise,
     write_comparison,
 )
 
@@ -32,14 +32,26 @@ def unit(width: int, features: int, seed: int = 0) -> torch.Tensor:
 
 
 def write_run(directory: Path, weight: torch.Tensor, step: int = 100,
-              silence: torch.Tensor | None = None) -> Path:
-    """A run directory holding one checkpoint, as training would leave it."""
+              silence: torch.Tensor | None = None,
+              encoder: torch.Tensor | None = None) -> Path:
+    """A run directory holding one checkpoint, as training would leave it.
+
+    Args:
+        weight: the decoder, ``(width out, features)``, one column per feature.
+        encoder: the encoder, ``(features, width in)``, one ROW per feature,
+            which is how the layer stores it. Left out, it is the decoder
+            transposed, which is what initialisation gives a coder
+            reconstructing its own input, so a run written without saying
+            otherwise has two sides that agree.
+    """
     checkpoints = directory / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)
     if silence is None:
         silence = torch.zeros(weight.shape[1], dtype=torch.long)
+    if encoder is None:
+        encoder = weight.T.clone()
     torch.save({"step": step, "tokens": step * 4096,
-                "coder": {"decoder.weight": weight},
+                "coder": {"decoder.weight": weight, "encoder.weight": encoder},
                 "tracker": {"steps_since_fired": silence}},
                checkpoints / f"step_{step:09d}.pt")
     return directory
@@ -187,6 +199,141 @@ def test_two_runs_compare(tmp_path):
     b = write_run(tmp_path / "case1-main-x16-l1-s1-bbbbbb", unit(16, 32, seed=1))
     record = compare_runs(a, b)
     assert record["width"] == 16 and 0.0 < record["mean"] < 1.0
+
+
+# ----------------------------------------------------------------------
+# the two sides of a coder
+#
+# The decoder holds what a feature writes out, the encoder what it looks for.
+# Across the two objectives only the encoder is comparable, because the two
+# decoders write into two independently trained models whose coordinates were
+# never aligned. The cosine between them does not fail, it returns a number
+# with no content, which is the reason these exist.
+# ----------------------------------------------------------------------
+
+def test_the_encoder_is_read_as_one_direction_per_feature(tmp_path):
+    """Stored one row per feature, returned as unit columns like the decoder."""
+    decoder = unit(16, 32, seed=0)
+    encoder = torch.randn(32, 16)                      # (features, width in)
+    run = write_run(tmp_path / "r", decoder, encoder=encoder)
+
+    directions, _ = load_dictionary(run, side="encoder")
+    assert directions.shape == (16, 32)
+    assert torch.allclose(directions.norm(dim=0), torch.ones(32), atol=1e-6)
+
+
+def test_the_two_sides_are_different_readings_of_one_run(tmp_path):
+    decoder = unit(16, 32, seed=0)
+    encoder = torch.randn(32, 16)
+    run = write_run(tmp_path / "r", decoder, encoder=encoder)
+
+    assert not torch.allclose(load_dictionary(run, side="decoder")[0],
+                              load_dictionary(run, side="encoder")[0])
+
+
+def test_an_unknown_side_raises(tmp_path):
+    run = write_run(tmp_path / "r", unit(16, 32))
+    with pytest.raises(ValueError, match="side must be"):
+        load_dictionary(run, side="latents")
+
+
+def test_both_sides_come_back_from_one_read(tmp_path):
+    run = write_run(tmp_path / "r", unit(16, 32, seed=0), encoder=torch.randn(32, 16))
+    sides = load_sides(run)
+    assert set(sides) == {"decoder", "encoder"}
+    assert sides["decoder"][0].shape == sides["encoder"][0].shape
+
+
+def test_the_same_dead_features_are_dropped_from_both_sides(tmp_path):
+    """They are one dictionary. A feature dead on one side is dead on both."""
+    silence = torch.zeros(32, dtype=torch.long)
+    silence[:12] = 100                                  # never fired
+    run = write_run(tmp_path / "r", unit(16, 32), silence=silence,
+                    encoder=torch.randn(32, 16))
+
+    sides = load_sides(run)
+    assert sides["decoder"][1]["kept"] == 20
+    assert sides["encoder"][1]["kept"] == 20
+    assert sides["decoder"][0].shape[1] == sides["encoder"][0].shape[1]
+
+
+def test_a_comparison_carries_both_readings(tmp_path):
+    a = write_run(tmp_path / "case1-main-x16-topk-s0-aaaaaa", unit(16, 32, seed=0))
+    b = write_run(tmp_path / "case1-main-x16-topk-s1-bbbbbb", unit(16, 32, seed=1))
+    record = compare_runs(a, b)
+    assert 0.0 < record["mean"] < 1.0
+    assert 0.0 < record["encoder_mean"] < 1.0
+    assert record["width"] == record["encoder_width"] == 16
+
+
+def test_the_encoder_sees_agreement_the_decoder_cannot(tmp_path):
+    """The case the reading was added for, in its purest form.
+
+    Two coders that look for exactly the same directions in the activation
+    they both read, and write out into unrelated spaces. That is the shape of
+    a single-model coder against a cross-model one: same input, different
+    output space. The decoder reading calls them strangers, which is not a
+    finding about what they learned, and the encoder reading sees the identity
+    that is actually there.
+    """
+    shared = torch.randn(32, 16)                        # one encoder, two runs
+    a = write_run(tmp_path / "case1-main-x16-topk-s0-aaaaaa",
+                  unit(16, 32, seed=0), encoder=shared)
+    b = write_run(tmp_path / "case2-main-x16-topk-s0-bbbbbb",
+                  unit(16, 32, seed=1), encoder=shared.clone())
+
+    record = compare_runs(a, b)
+    assert record["encoder_mean"] == pytest.approx(1.0, abs=1e-5)
+    assert record["mean"] < 0.9
+
+
+def test_the_summary_can_be_read_in_either_measure(tmp_path):
+    """A floor, a ceiling and an across number only sit on one scale if all
+    three are the same reading, so the summary takes which one."""
+    shared = torch.randn(32, 16)
+    records = [
+        compare_runs(
+            write_run(tmp_path / "case1-main-x16-topk-s0-aaaaaa",
+                      unit(16, 32, seed=0), encoder=shared),
+            write_run(tmp_path / "case2-main-x16-topk-s0-bbbbbb",
+                      unit(16, 32, seed=1), encoder=shared.clone())),
+    ]
+    decoder = summarise(records)
+    encoder = summarise(records, key="encoder_mean", shape_key="encoder_histogram")
+
+    assert decoder["across"]["mean"] == records[0]["mean"]
+    assert encoder["across"]["mean"] == records[0]["encoder_mean"]
+    assert encoder["across"]["mean"] > decoder["across"]["mean"]
+
+
+def test_the_distributions_do_not_cross_between_readings(tmp_path):
+    """Each reading pools its own histogram, so a figure drawn from one is
+    not quietly averaging the other in."""
+    a = write_run(tmp_path / "case1-main-x16-topk-s0-aaaaaa",
+                  unit(16, 32, seed=0), encoder=torch.randn(32, 16))
+    b = write_run(tmp_path / "case1-main-x16-topk-s1-bbbbbb",
+                  unit(16, 32, seed=1), encoder=torch.randn(32, 16))
+    records = [compare_runs(a, b, keep_distribution=True)]
+
+    decoder = summarise(records)
+    encoder = summarise(records, key="encoder_mean", shape_key="encoder_histogram")
+    assert decoder["within_shape"] == records[0]["histogram"]
+    assert encoder["within_shape"] == records[0]["encoder_histogram"]
+
+
+def test_neither_distribution_is_written_out(tmp_path):
+    """Both are two hundred numbers per pair and the summary holds their
+    averages, which is what anything downstream reads."""
+    import json
+    a = write_run(tmp_path / "case1-main-x16-topk-s0-aaaaaa", unit(16, 32, seed=0))
+    b = write_run(tmp_path / "case1-main-x16-topk-s1-bbbbbb", unit(16, 32, seed=1))
+    records = [compare_runs(a, b, keep_distribution=True)]
+
+    out = tmp_path / "comparison.json"
+    write_comparison(records, summarise(records), out)
+    written = json.loads(out.read_text())["pairs"][0]
+    assert "histogram" not in written and "encoder_histogram" not in written
+    assert "encoder_mean" in written
 
 
 # ----------------------------------------------------------------------

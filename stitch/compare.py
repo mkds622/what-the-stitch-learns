@@ -100,25 +100,27 @@ def latest_checkpoint(run_dir: Path) -> Path:
     return found[-1]
 
 
-def load_dictionary(path: Path, drop_dead: bool = True) -> tuple[Tensor, dict]:
-    """The dictionary from a checkpoint, as unit column vectors.
+#: Which side of a coder a reading describes. The decoder holds what a feature
+#: writes out, the encoder what it looks for. They are the same features either
+#: way, so the same live mask applies to both.
+SIDES = ("decoder", "encoder")
 
-    Args:
-        path: a checkpoint file, or a run directory, in which case its last
-            checkpoint is used.
-        drop_dead: leave out features that never fired.
 
-    Returns:
-        ``(directions, info)``. ``directions`` is ``(width, features)`` with
-        every column at unit length. ``info`` carries the step, the dictionary
-        size before dropping, and how many were dropped.
+def _directions(state: dict, side: str, drop_dead: bool,
+                path: Path) -> tuple[Tensor, dict]:
+    """One side of a loaded checkpoint, as unit column vectors.
+
+    The decoder is stored as ``(width out, features)``, so its columns are
+    already the directions. The encoder is stored as ``(features, width in)``,
+    one row per feature, so it is transposed into the same shape and
+    everything downstream is indifferent to which side it was given.
     """
-    path = Path(path)
-    if path.is_dir():
-        path = latest_checkpoint(path)
+    if side not in SIDES:
+        raise ValueError(f"side must be one of {SIDES}, got {side!r}")
 
-    state = torch.load(path, map_location="cpu", weights_only=False)
-    weight = state["coder"]["decoder.weight"].float()      # (width, features)
+    weight = state["coder"][f"{side}.weight"].float()
+    if side == "encoder":
+        weight = weight.T                                  # (width in, features)
 
     total = weight.shape[1]
     dropped = 0
@@ -144,6 +146,41 @@ def load_dictionary(path: Path, drop_dead: bool = True) -> tuple[Tensor, dict]:
         "dropped": dropped,
         "kept": weight.shape[1],
     }
+
+
+def load_dictionary(path: Path, drop_dead: bool = True,
+                    side: str = "decoder") -> tuple[Tensor, dict]:
+    """One side of a coder from a checkpoint, as unit column vectors.
+
+    Args:
+        path: a checkpoint file, or a run directory, in which case its last
+            checkpoint is used.
+        drop_dead: leave out features that never fired.
+        side: ``decoder`` for the directions a feature writes out, ``encoder``
+            for the directions it reads. Which one is meaningful depends on
+            what is being compared; see :func:`compare_runs`.
+
+    Returns:
+        ``(directions, info)``. ``directions`` is ``(width, features)`` with
+        every column at unit length. ``info`` carries the step, the dictionary
+        size before dropping, and how many were dropped.
+    """
+    path = Path(path)
+    if path.is_dir():
+        path = latest_checkpoint(path)
+
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    return _directions(state, side, drop_dead, path)
+
+
+def load_sides(path: Path, drop_dead: bool = True) -> dict[str, tuple[Tensor, dict]]:
+    """Both sides of a coder, from one read of the checkpoint."""
+    path = Path(path)
+    if path.is_dir():
+        path = latest_checkpoint(path)
+
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    return {side: _directions(state, side, drop_dead, path) for side in SIDES}
 
 
 # ----------------------------------------------------------------------
@@ -321,15 +358,50 @@ def from_grids(paths: list[Path], run_root: Path) -> list[Path]:
 
 def compare_runs(path_a: Path, path_b: Path, close: float = 0.9,
                  drop_dead: bool = True, keep_distribution: bool = False) -> dict:
-    """Two runs, read from disk and compared.
+    """Two runs, read from disk and compared on both sides of the coder.
+
+    The decoder reading is the one the unprefixed fields carry, and it is the
+    right one whenever both coders write into the same space: two runs of the
+    single-model objective, or two of the cross-model objective.
+
+    It is the wrong one across the two objectives. A coder reproducing its own
+    input has decoder columns in the space it read; a coder reconstructing the
+    other model has them in that model's space. Those are two independently
+    trained networks and nothing ever aligned their coordinates, so a cosine
+    between them compares a direction measured in one basis against a direction
+    measured in another. Both halves of each pair here are the same width, so
+    that comparison does not fail. It returns a number near the floor, which
+    would read as two objectives having learned different features when the
+    reason is that the question has no content.
+
+    The encoder reading, under ``encoder_`` names, is the one that survives
+    that. Both objectives read the same activation, so the directions a feature
+    looks for are in one space whatever it writes out, and the question of
+    whether two coders carved the same features out of it is answerable.
+
+    What the encoder reading does not see: under TopK a feature's direction
+    does not by itself decide whether it fires, since the active set is chosen
+    in competition across the dictionary. Two coders can look for similar
+    directions and still fire on different tokens.
 
     Returns:
-        The similarity fields, plus what was loaded from each side.
+        The similarity fields for the decoder, the same fields prefixed
+        ``encoder_``, and what was loaded from each run.
     """
-    a, info_a = load_dictionary(path_a, drop_dead)
-    b, info_b = load_dictionary(path_b, drop_dead)
+    sides_a = load_sides(path_a, drop_dead)
+    sides_b = load_sides(path_b, drop_dead)
+
+    a, info_a = sides_a["decoder"]
+    b, info_b = sides_b["decoder"]
 
     record = similarity(a, b, close, keep_distribution)
+
+    encoder_a = sides_a["encoder"][0]
+    encoder_b = sides_b["encoder"][0]
+    for key, value in similarity(encoder_a, encoder_b, close,
+                                 keep_distribution).items():
+        record[f"encoder_{key}"] = value
+
     record.update({
         "a": str(Path(path_a).name),
         "b": str(Path(path_b).name),
@@ -340,6 +412,7 @@ def compare_runs(path_a: Path, path_b: Path, close: float = 0.9,
         "a_kept": info_a["kept"],
         "b_kept": info_b["kept"],
         "width": a.shape[0],
+        "encoder_width": encoder_a.shape[0],
     })
     return record
 
@@ -416,7 +489,8 @@ def group_of(run: str | Path) -> str:
     return _group_from_name(path.name)
 
 
-def pooled_shapes(records: list[dict]) -> dict[str, list[float]]:
+def pooled_shapes(records: list[dict],
+                  shape_key: str = "histogram") -> dict[str, list[float]]:
     """The average match distribution for seed repeats and for the comparison.
 
     Averaged over pairs rather than concatenated, so that a configuration with
@@ -424,10 +498,10 @@ def pooled_shapes(records: list[dict]) -> dict[str, list[float]]:
     """
     groups: dict[str, list[list[float]]] = {"within_shape": [], "across_shape": []}
     for record in records:
-        if "histogram" not in record:
+        if shape_key not in record:
             continue
         key = "within_shape" if same_configuration(record) else "across_shape"
-        groups[key].append(record["histogram"])
+        groups[key].append(record[shape_key])
 
     out = {}
     for key, shapes in groups.items():
@@ -436,7 +510,8 @@ def pooled_shapes(records: list[dict]) -> dict[str, list[float]]:
     return out
 
 
-def summarise(records: list[dict], baseline: dict | None = None) -> dict:
+def summarise(records: list[dict], baseline: dict | None = None,
+              key: str = "mean", shape_key: str = "histogram") -> dict:
     """Within-objective and across-objective, side by side.
 
     A pair of runs from the same group is a seed repeat and sets the ceiling.
@@ -445,14 +520,19 @@ def summarise(records: list[dict], baseline: dict | None = None) -> dict:
     Args:
         records: output of ``compare_runs``, one per pair.
         baseline: what random dictionaries score, if it was computed.
+        key: which reading to summarise, ``mean`` for the decoder and
+            ``encoder_mean`` for the encoder. A floor, a ceiling and an across
+            number only sit on one scale if all three are the same reading, so
+            this is what keeps a chain from being assembled out of two.
+        shape_key: the matching distribution field, which moves with ``key``.
 
     Returns:
         Mean and spread of each kind, and where ``across`` falls between
         ``random`` and ``within`` as a fraction, where 1 means
         indistinguishable from a seed repeat and 0 means no better than random.
     """
-    within = [r["mean"] for r in records if same_configuration(r)]
-    across = [r["mean"] for r in records if not same_configuration(r)]
+    within = [r[key] for r in records if same_configuration(r)]
+    across = [r[key] for r in records if not same_configuration(r)]
 
     def stats(values: list[float]) -> dict:
         if not values:
@@ -463,7 +543,7 @@ def summarise(records: list[dict], baseline: dict | None = None) -> dict:
                 "min": min(values), "max": max(values)}
 
     out = {"within": stats(within), "across": stats(across)}
-    out.update(pooled_shapes(records))
+    out.update(pooled_shapes(records, shape_key))
     if baseline is not None:
         out["random"] = baseline["mean"]
         if "histogram" in baseline:
@@ -487,7 +567,8 @@ def write_comparison(records: list[dict], summary: dict, path: Path) -> None:
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    trimmed = [{key: value for key, value in record.items() if key != "histogram"}
+    trimmed = [{key: value for key, value in record.items()
+                if key not in ("histogram", "encoder_histogram")}
                for record in records]
     path.write_text(json.dumps({"summary": summary, "pairs": trimmed}, indent=2))
     log.info("wrote %d comparisons to %s", len(records), path)

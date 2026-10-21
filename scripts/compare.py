@@ -74,6 +74,13 @@ def main(argv=None) -> int:
                         help="also draw the comparison here")
     parser.add_argument("--title", default=None,
                         help="heading for the figure, usually which depth this is")
+    parser.add_argument("--reading", choices=("decoder", "encoder"), default="decoder",
+                        help="which reading the figure draws. Both are always "
+                             "measured and written out; this picks the one the "
+                             "picture is of. Use encoder for any comparison "
+                             "between the two objectives, where the decoders "
+                             "live in different models' spaces and their "
+                             "similarity means nothing")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -93,9 +100,10 @@ def main(argv=None) -> int:
         record = compare_runs(a, b, args.close, drop_dead=not args.keep_dead,
                               keep_distribution=drawing)
         records.append(record)
-        log.info("%s vs %s: %.4f", record["a"], record["b"], record["mean"])
+        log.info("%s vs %s: decoder %.4f, encoder %.4f", record["a"], record["b"],
+                 record["mean"], record["encoder_mean"])
 
-    baseline = None
+    baseline = encoder_baseline = None
     if not args.no_baseline:
         # Measured at the size the comparisons actually used, which is the live
         # count rather than the configured one. The floor rises with dictionary
@@ -111,26 +119,44 @@ def main(argv=None) -> int:
         log.info("random dictionaries of %d live features: %.4f",
                  features, baseline["mean"])
 
+        # The floor depends on the space and the number of directions in it,
+        # not on which side of the coder they came from, so it is the same
+        # number wherever the two widths agree. Measured separately anyway,
+        # because the two widths are only guaranteed to agree when a coder
+        # reproduces its own input.
+        encoder_width = records[0]["encoder_width"] if records else directions.shape[0]
+        encoder_baseline = (baseline if encoder_width == directions.shape[0]
+                            else random_baseline(encoder_width, features,
+                                                 keep_distribution=drawing))
+
     summary = summarise(records, baseline)
+    summary["encoder"] = summarise(records, encoder_baseline, key="encoder_mean",
+                                   shape_key="encoder_histogram")
     write_comparison(records, summary, args.out)
 
-    print()
-    for name in ("random", "within", "across"):
-        value = summary.get(name)
-        if isinstance(value, dict) and value.get("n"):
-            print(f"{name:>8}  {value['mean']:.4f}  "
-                  f"+/- {value['std']:.4f}  over {value['n']} pairs")
-        elif isinstance(value, float):
-            print(f"{name:>8}  {value:.4f}")
+    def report(heading: str, chain: dict) -> None:
+        print(f"\n{heading}")
+        for name in ("random", "within", "across"):
+            value = chain.get(name)
+            if isinstance(value, dict) and value.get("n"):
+                print(f"{name:>8}  {value['mean']:.4f}  "
+                      f"+/- {value['std']:.4f}  over {value['n']} pairs")
+            elif isinstance(value, float):
+                print(f"{name:>8}  {value:.4f}")
+        if "position" in chain:
+            print(f"across sits {chain['position']:.0%} of the way "
+                  f"from random to a seed repeat")
 
-    if "position" in summary:
-        print(f"\nacross sits {summary['position']:.0%} of the way "
-              f"from random to a seed repeat")
+    report("decoder, what a feature writes out", summary)
+    report("encoder, what a feature looks for", summary["encoder"])
+    print("\nOnly the encoder reading is comparable across the two objectives:\n"
+          "the decoders write into different models' spaces.")
 
     if drawing:
         from stitch.plots import plot_comparison
-        plot_comparison(summary, args.figure, title=args.title)
-        print(f"figure written to {args.figure}")
+        drawn = summary if args.reading == "decoder" else summary["encoder"]
+        plot_comparison(drawn, args.figure, title=args.title)
+        print(f"figure written to {args.figure}, drawn from the {args.reading}")
     return 0
 
 
