@@ -14,6 +14,10 @@
     # reconstruction against sparsity, one point per run
     python scripts/plot.py --results grids/coder.json --tradeoff \
         --label-by coder.expansion --out figures/tradeoff.png
+
+    # one curve from several grids, for a sweep extended in a later run
+    python scripts/plot.py --results grids/lr.json grids/lr_high.json \
+        --x train.lr --metric eval_effective_features --out figures/lr.png
 """
 
 import argparse
@@ -25,8 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stitch.grid import read_results                                  # noqa: E402
 from stitch.plots import (                                            # noqa: E402
-    flattening_point, format_x, noise_from, plot_curve, plot_tradeoff, series,
-    split_series,
+    combine_results, flattening_point, format_x, noise_from, plot_curve,
+    plot_tradeoff, series, split_series,
 )
 
 
@@ -47,7 +51,12 @@ def report(points, x: str, metric: str, tolerance: float | None,
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--results", type=Path, required=True)
+    parser.add_argument("--results", type=Path, nargs="+", required=True,
+                        metavar="GRID",
+                        help="one or more grid result files. Several are read as "
+                             "one set of runs, so a sweep extended by a later "
+                             "grid draws as a single curve rather than needing "
+                             "the files merged by hand")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--x", default="train.tokens")
     parser.add_argument("--metric", default="eval_l0")
@@ -64,7 +73,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    results = read_results(args.results)
+    results = combine_results(read_results(path) for path in args.results)
 
     if args.tradeoff:
         plot_tradeoff(results, args.out, label_by=args.label_by)

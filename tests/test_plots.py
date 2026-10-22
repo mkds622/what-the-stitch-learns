@@ -17,8 +17,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stitch.plots import (                                            # noqa: E402
-    Point, flattening_point, noise_from, plot_curve, plot_feature_frequencies,
-    plot_tradeoff, series, split_series,
+    Point, combine_results, flattening_point, noise_from, plot_curve,
+    plot_feature_frequencies, plot_tradeoff, series, split_series,
 )
 
 
@@ -77,6 +77,100 @@ def test_records_off_the_axis_are_left_out():
 
 def test_an_empty_grid_gives_an_empty_series():
     assert series([], "train.tokens", "eval_l0") == []
+
+
+# ----------------------------------------------------------------------
+# several grids as one curve
+#
+# A sweep run in two sittings is one curve. The hazard is that a grid reuses a
+# run it has already trained rather than training it again, so the same run can
+# be recorded in two files, and counted twice it reads as two runs of one
+# configuration agreeing exactly. That is a spread of zero where there is no
+# spread, and the tolerance a budget curve is read against comes from exactly
+# those spreads.
+# ----------------------------------------------------------------------
+
+def named(name: str, position: float, value: float, metric="eval_l0",
+          x="train.tokens") -> dict:
+    """A record carrying the run name a grid writes with it."""
+    return {"run_name": name, "point": {x: position}, metric: value}
+
+
+def test_two_grids_read_as_one_curve():
+    first = [named("a", 1e6, 10.0), named("b", 2e6, 8.0)]
+    second = [named("c", 4e6, 7.0)]
+    points = series(combine_results([first, second]), "train.tokens", "eval_l0")
+    assert [point.x for point in points] == [1e6, 2e6, 4e6]
+
+
+def test_one_grid_is_unchanged():
+    records = [named("a", 1e6, 10.0), named("b", 2e6, 8.0)]
+    assert combine_results([records]) == records
+
+
+def test_no_grids_give_nothing():
+    assert combine_results([]) == []
+    assert combine_results([[], []]) == []
+
+
+def test_a_run_in_two_grids_is_counted_once():
+    """The reuse case: the second grid records a run the first already had."""
+    first = [named("a", 1e6, 10.0), named("b", 2e6, 8.0)]
+    second = [named("b", 2e6, 8.0), named("c", 4e6, 7.0)]
+    combined = combine_results([first, second])
+    assert [record["run_name"] for record in combined] == ["a", "b", "c"]
+
+
+def test_a_duplicate_does_not_invent_a_spread():
+    """What the deduplication is for, stated as the number it protects.
+
+    Counted twice, one run becomes two runs that agree exactly, and the
+    tolerance a curve is read against is the largest spread any configuration
+    shows. A zero where there should be no reading at all shrinks it.
+    """
+    twice = [[named("a", 1e6, 10.0)], [named("a", 1e6, 10.0)]]
+
+    naive = [record for group in twice for record in group]
+    assert series(naive, "train.tokens", "eval_l0")[0].n == 2
+    assert series(naive, "train.tokens", "eval_l0")[0].std == pytest.approx(0.0)
+    assert noise_from(naive, "eval_l0") == pytest.approx(0.0)
+
+    combined = combine_results(twice)
+    assert series(combined, "train.tokens", "eval_l0")[0].n == 1
+    assert series(combined, "train.tokens", "eval_l0")[0].std is None
+    assert noise_from(combined, "eval_l0") is None
+
+
+def test_genuine_seed_repeats_still_average_together():
+    """Different runs at one position are the spread, not a duplicate."""
+    first = [named("s0", 1e6, 10.0)]
+    second = [named("s1", 1e6, 20.0)]
+    point = series(combine_results([first, second]), "train.tokens", "eval_l0")[0]
+    assert (point.n, point.mean, point.std) == (2, 15.0, pytest.approx(7.071, abs=1e-3))
+
+
+def test_the_first_record_of_a_run_is_the_one_kept():
+    first = [named("a", 1e6, 10.0)]
+    second = [named("a", 1e6, 99.0)]
+    assert combine_results([first, second])[0]["eval_l0"] == 10.0
+
+
+def test_records_without_a_name_are_all_kept():
+    """Nothing identifies them as repeats, so dropping them would lose runs."""
+    plain = {"point": {"train.tokens": 1e6}, "eval_l0": 10.0}
+    assert len(combine_results([[dict(plain)], [dict(plain)]])) == 2
+
+
+def test_a_failed_run_is_still_deduplicated():
+    """It carries a name and no metric, and series drops it either way."""
+    failed = {"run_name": "a", "point": {"train.tokens": 1e6}, "error": "boom"}
+    assert len(combine_results([[failed], [dict(failed)]])) == 1
+
+
+def test_combining_takes_any_iterable():
+    """The script passes a generator over its --results paths."""
+    groups = ([named("a", 1e6, 10.0)], [named("b", 2e6, 8.0)])
+    assert len(combine_results(group for group in groups)) == 2
 
 
 # ----------------------------------------------------------------------

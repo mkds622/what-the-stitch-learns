@@ -48,6 +48,47 @@ def format_x(value: float) -> str:
     return f"{value:,.0f}" if abs(value) >= 1000 else f"{value:g}"
 
 
+def combine_results(groups) -> list[dict]:
+    """Several grids' records as one set of runs.
+
+    A sweep extended by a later grid is one curve, and which file recorded a
+    run says nothing about where that run sits on it.
+
+    Runs are identified by ``run_name`` and kept once. A grid reuses a run
+    whose configuration it has already trained rather than training it again,
+    so the same run can be recorded in more than one file. Counted twice it
+    reads as two runs of one configuration agreeing exactly, which reports a
+    spread of zero where there is no spread to report, and :func:`noise_from`
+    takes its tolerance from exactly those spreads. A tolerance that is too
+    small makes a curve look like it never flattens.
+
+    Args:
+        groups: an iterable of record lists, one per grid file.
+
+    Returns:
+        One list, in the order the groups were given, each run once. The first
+        record carrying a given name is the one kept. Records with no
+        ``run_name`` are all kept, since nothing identifies them as repeats.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    dropped = 0
+
+    for records in groups:
+        for record in records:
+            name = record.get("run_name")
+            if name is not None:
+                if name in seen:
+                    dropped += 1
+                    continue
+                seen.add(name)
+            out.append(record)
+
+    if dropped:
+        log.info("%d run(s) recorded in more than one grid, counted once", dropped)
+    return out
+
+
 def series(results: list[dict], x: str, metric: str) -> list[Point]:
     """One point per distinct value of ``x``, averaged over everything else.
 
