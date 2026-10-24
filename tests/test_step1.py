@@ -221,6 +221,38 @@ def test_a_resolved_linear_fit_is_not_pending():
 
 
 # ----------------------------------------------------------------------
+# the silent-feature threshold
+#
+# What the evaluation can see is which features fired on the tokens it read.
+# That is not the same as which are dead, and the name says so, because the
+# two were previously one word and two different counts.
+# ----------------------------------------------------------------------
+
+def test_the_silent_threshold_is_part_of_the_gate_defaults():
+    """It is one of the four the pending note is keyed on, so a rename that
+    missed it would leave that note reporting on a threshold nobody sets."""
+    cfg = Config()
+    assert cfg.eval.max_allowed_silent == 0.5
+    assert any("gate thresholds" in note for note in cfg.pending_decisions())
+
+    cfg.eval.max_allowed_silent = 0.4
+    assert not any("gate thresholds" in note for note in cfg.pending_decisions())
+
+
+def test_the_old_threshold_name_is_gone():
+    """Set in a config file or an override it must fail loudly. Accepted
+    silently it would have no effect, and the gate would run on the default
+    while the run recorded a number that did nothing."""
+    with pytest.raises(ValueError, match="unknown key"):
+        load_config(None, ["eval.max_never_fired=0.4"])
+
+
+def test_the_silent_threshold_is_settable_by_override():
+    cfg = load_config(None, ["eval.max_allowed_silent=0.3"])
+    assert cfg.eval.max_allowed_silent == pytest.approx(0.3)
+
+
+# ----------------------------------------------------------------------
 # logging
 # ----------------------------------------------------------------------
 
