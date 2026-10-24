@@ -1,3 +1,11 @@
+# Pinned to the versions the recorded results were produced under. A comparison
+# between runs holds the software stack fixed along with everything else, so
+# these move between projects, not between runs.
+#
+# Python 3.12. Torch wheels lag new interpreter releases.
+#
+#   pip install -r requirements.txt
+
 anyio==4.15.1
 certifi==2026.7.22
 click==8.5.0
@@ -44,3 +52,26 @@ torchvision==0.29.0
 tqdm==4.70.1
 triton==3.8.0
 typing_extensions==4.16.0
+
+# The stitching library, imported as nn_lib. The clone under external/ carries
+# graph surgery methods this project added, so it is installed from the working
+# tree. The published package is upstream and does not have them.
+-e ./external/nn-library
+
+# Tracking. Pinned because a newer version reads an existing mlruns store
+# differently.
+mlflow==3.16.1
+
+# Analysis and figures. These were installed by hand into the previous
+# environment and never written down, which is how a rebuild came up without
+# them.
+matplotlib==3.11.2
+seaborn==0.13.2
+scipy==1.18.1
+scikit-learn==1.9.1
+
+# Tests and linting.
+pytest==9.1.1
+black==26.10.0
+pylint==4.1.2
+isort==9.0.2
