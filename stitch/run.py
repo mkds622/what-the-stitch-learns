@@ -343,6 +343,14 @@ def run(cfg, resume: Path | None = None) -> dict:
                         cfg, cfg.train.device)
     logger.log_metrics(held_out, step=int(final.get("tokens", 0)))
 
+    # What the evaluation window cannot say. It reads a few hundred thousand
+    # tokens, so a feature rarer than that reads there as one that never fired,
+    # and a dictionary that is merely under-sampled looks like a dictionary
+    # that is unused. The tracker watched every step. Silent to it means silent
+    # for longer than its window, which is a far stronger claim.
+    train_dead = {"train_dead": tracker.dead_fraction}
+    logger.log_metrics(train_dead, step=int(final.get("tokens", 0)))
+
     # What a fixed basis of the same size per token reaches here, so the
     # dictionary is read against something rather than against nothing.
     baseline = resolve_baseline(cfg, source_key, target_key, held_out["eval_l0"])
@@ -374,7 +382,7 @@ def run(cfg, resume: Path | None = None) -> dict:
         logger.log_metrics(substitution, step=int(final.get("tokens", 0)))
 
     summary = {"hash": config_hash, "run_name": name, "scales": scales,
-               **final, **held_out, **baseline, **substitution}
+               **final, **held_out, **train_dead, **baseline, **substitution}
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     logger.end_run()
 

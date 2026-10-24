@@ -321,6 +321,15 @@ class EvalConfig:
 
     ``fit_fraction`` is the share of that fit the coder must reach. One number
     for every case, so no case carries a threshold of its own.
+
+    ``max_allowed_silent`` is a ceiling on the share of the dictionary that
+    fired on none of the evaluation tokens. Silent, not dead: that share holds
+    two groups together, features that never fired at any point in training,
+    and features that did fire during training and not inside this evaluation
+    window, whether because they have gone quiet or because they are rarer than
+    the window can see. The evaluation reads one number of tokens and cannot
+    separate the two. Only the training tracker knows which features never
+    fired at all, over its own ``coder.dead_features.track_window``.
     """
 
     batches: int = 50
@@ -329,7 +338,7 @@ class EvalConfig:
     fit_fraction: float = 0.8         # share of that fit the coder must reach
     min_l0: float = 1.0
     max_l0_frac: float = 0.5          # fraction of the reconstructed activation's width
-    max_never_fired: float = 0.5
+    max_allowed_silent: float = 0.5   # share silent on the evaluation tokens
     max_feature_frequency: float = 0.9
 
 
@@ -474,7 +483,7 @@ class Config:
             out.append("eval.linear_fit is unset, so the reconstruction gate asks for "
                        "a perfect reconstruction")
         thresholds = (self.eval.min_l0, self.eval.max_l0_frac,
-                      self.eval.max_never_fired, self.eval.max_feature_frequency)
+                      self.eval.max_allowed_silent, self.eval.max_feature_frequency)
         if thresholds == (1.0, 0.5, 0.5, 0.9):
             out.append("eval gate thresholds are the unconfirmed defaults(placeholders)")
         return out

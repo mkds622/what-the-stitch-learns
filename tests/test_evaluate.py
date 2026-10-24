@@ -102,7 +102,7 @@ def cfg():
     c.eval.fit_fraction = 0.5
     c.eval.min_l0 = 1.0
     c.eval.max_l0_frac = 0.25
-    c.eval.max_never_fired = 0.5
+    c.eval.max_allowed_silent = 0.5
     c.eval.max_feature_frequency = 0.9
     return c
 
@@ -145,9 +145,13 @@ def test_an_empty_stream_raises():
 
 
 def test_silent_features_are_reported():
-    """One feature in use out of thirty-two."""
+    """One feature in use out of thirty-two.
+
+    Reported as dead or dormant together, since a single evaluation window
+    cannot tell a feature that never fired from one too rare to appear in it.
+    """
     metrics = reconstruction_metrics(PerfectCoder(active=1), stream(), KEY, KEY, count=4)
-    assert metrics["eval_never_fired"] == pytest.approx(31 / 32)
+    assert metrics["eval_dead_or_dormant"] == pytest.approx(31 / 32)
 
 
 def test_sparsity_is_reported_against_the_activation_width():
@@ -675,7 +679,7 @@ def passing(**overrides):
         "eval_mse": 0.1,
         "eval_l0": 8.0,
         "eval_explained_variance": 0.9,
-        "eval_never_fired": 0.05,
+        "eval_dead_or_dormant": 0.05,
         "eval_max_feature_frequency": 0.3,
         "eval_tokens": 1000.0,
     }
@@ -693,7 +697,7 @@ def test_a_healthy_coder_passes(cfg):
     ("reconstructs", {"eval_explained_variance": 0.1}),
     ("not_collapsed", {"eval_l0": 0.0}),
     ("not_dense", {"eval_l0": 64.0}),
-    ("features_alive", {"eval_never_fired": 0.9}),
+    ("features_alive", {"eval_dead_or_dormant": 0.9}),
     ("no_always_on_feature", {"eval_max_feature_frequency": 0.99}),
 ])
 def test_each_gate_catches_its_own_failure(cfg, gate, metrics):

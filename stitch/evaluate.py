@@ -145,7 +145,7 @@ def reconstruction_metrics(coder: SparseCoder, batches: Iterator[dict[str, Tenso
 
     Returns:
         Averages over those batches, plus two numbers about the dictionary:
-        the share of features that never fired, and the largest share of tokens
+        the share of features silent here, and the largest share of tokens
         any single feature fired on. A feature active on almost every token is
         not a feature, it is a bias with extra steps.
 
@@ -222,7 +222,7 @@ def reconstruction_metrics(coder: SparseCoder, batches: Iterator[dict[str, Tenso
         "eval_l0": l0,
         "eval_l0_frac": l0 / coder.d_out,
         "eval_explained_variance": explained,
-        "eval_never_fired": float((frequencies == 0).float().mean()),
+        "eval_dead_or_dormant": float((frequencies == 0).float().mean()),
         "eval_effective_expansion": alive / coder.d_out,
         "eval_max_feature_frequency": float(frequencies.max()),
         "eval_median_feature_frequency": concentration["median"],
@@ -436,9 +436,15 @@ def check_gates(metrics: dict[str, float], cfg, width: int) -> dict[str, bool]:
         move the threshold with the expansion factor and say nothing about how
         compactly the token was described.
     ``features_alive``
-        a coder with most of its dictionary dead is a smaller coder than its
-        configuration says, so comparing it against one with none dead compares
-        two dictionary sizes.
+        a coder with most of its dictionary silent is a smaller coder than its
+        configuration says, so comparing it against one with none silent
+        compares two dictionary sizes. Silent and not dead: what this reads is
+        the share that fired on none of the evaluation tokens, which holds
+        together the features that never fired in training and the ones too
+        rare for the window to catch. Separating those needs the training
+        tracker, and for this gate's purpose they count the same, since a
+        feature the evaluation never sees contributes nothing to what is
+        measured there either way.
     ``no_always_on_feature``
         a feature active on nearly every token carries no information about any
         particular token.
@@ -457,7 +463,8 @@ def check_gates(metrics: dict[str, float], cfg, width: int) -> dict[str, bool]:
                          >= cfg.eval.fit_fraction * cfg.eval.linear_fit),
         "not_collapsed": metrics["eval_l0"] >= cfg.eval.min_l0,
         "not_dense": metrics["eval_l0"] <= cfg.eval.max_l0_frac * width,
-        "features_alive": metrics["eval_never_fired"] <= cfg.eval.max_never_fired,
+        "features_alive": (metrics["eval_dead_or_dormant"]
+                           <= cfg.eval.max_allowed_silent),
         "no_always_on_feature":
             metrics["eval_max_feature_frequency"] <= cfg.eval.max_feature_frequency,
     }
