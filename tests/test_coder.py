@@ -10,6 +10,7 @@ on the device.
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -89,6 +90,47 @@ def test_the_same_seed_builds_the_same_coder():
     torch.manual_seed(7)
     two = SparseCoder(D_IN, D_OUT, EXPANSION)
     assert torch.equal(one.decoder.weight, two.decoder.weight)
+
+
+# ----------------------------------------------------------------------
+# where the encoder starts
+#
+# The transpose is only informative where the encoder reads the space the
+# decoder writes into. Where it is not, it is a random matrix with a
+# misleading name, and the alternative has to differ from it in alignment
+# alone: a scale change would confound any comparison between the two.
+# ----------------------------------------------------------------------
+
+def test_the_encoder_starts_at_the_dictionary_when_tied(coder):
+    expected = coder.decoder.weight.T / math.sqrt(D_IN)
+    assert torch.allclose(coder.encoder.weight, expected, atol=1e-6)
+
+
+def test_the_encoder_starts_elsewhere_when_untied():
+    coder = SparseCoder(D_IN, D_OUT, EXPANSION, tie_init=False)
+    tied = coder.decoder.weight.T / math.sqrt(D_IN)
+    assert not torch.allclose(coder.encoder.weight, tied, atol=1e-4)
+
+
+def test_untying_changes_the_directions_and_not_the_scale():
+    """The two must differ in alignment alone, or a comparison between them is
+    also a comparison between magnitudes."""
+    torch.manual_seed(0)
+    tied = SparseCoder(D_IN, D_OUT, EXPANSION, tie_init=True)
+    torch.manual_seed(0)
+    free = SparseCoder(D_IN, D_OUT, EXPANSION, tie_init=False)
+
+    assert torch.allclose(tied.encoder.weight.norm(dim=1),
+                          free.encoder.weight.norm(dim=1), atol=1e-6)
+
+
+def test_differing_widths_ignore_the_setting():
+    """The transpose does not fit, so there is nothing to tie or untie."""
+    torch.manual_seed(0)
+    one = SparseCoder(d_in=8, d_out=12, expansion=2, tie_init=True)
+    torch.manual_seed(0)
+    two = SparseCoder(d_in=8, d_out=12, expansion=2, tie_init=False)
+    assert torch.equal(one.encoder.weight, two.encoder.weight)
 
 
 # ----------------------------------------------------------------------
@@ -286,6 +328,14 @@ def test_build_coder_follows_the_sparsity_setting():
     cfg.coder.sparsity.mode = "l1"
     coder, _ = build_coder(cfg, d_in=8, d_out=8)
     assert coder.sparsity == "l1"
+
+
+def test_build_coder_passes_the_init_setting():
+    cfg = Config()
+    cfg.coder.tie_decoder_init = False
+    coder, _ = build_coder(cfg, d_in=8, d_out=8)
+    tied = coder.decoder.weight.T / math.sqrt(8)
+    assert not torch.allclose(coder.encoder.weight, tied, atol=1e-4)
 
 
 # ----------------------------------------------------------------------

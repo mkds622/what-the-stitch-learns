@@ -200,7 +200,7 @@ class CoderConfig:
     expansion: int = 16
     sparsity: SparsityConfig = field(default_factory=SparsityConfig)
     dead_features: DeadFeatureConfig = field(default_factory=DeadFeatureConfig)
-    tie_decoder_init: bool = True     # initialise decoder as the encoder's transpose
+    tie_decoder_init: bool = True     # start the encoder at the dictionary's transpose
 
 
 # ----------------------------------------------------------------------

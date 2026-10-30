@@ -44,7 +44,7 @@ class SparseCoder(nn.Module):
 
     def __init__(self, d_in: int, d_out: int, expansion: int,
                  sparsity: str = "l1", k: int | None = None,
-                 normalize_decoder: bool = True):
+                 normalize_decoder: bool = True, tie_init: bool = True):
         """
         Args:
             d_in: width of the activation read.
@@ -56,6 +56,9 @@ class SparseCoder(nn.Module):
             k: active features per token. Required for ``topk``, ignored for
                 ``l1``, where sparsity is a penalty rather than a constraint.
             normalize_decoder: hold every dictionary vector at unit length.
+            tie_init: start the encoder at the dictionary's transpose. Applies
+                only where the encoder reads the space the decoder writes into;
+                see :meth:`reset_parameters`.
 
         Raises:
             ValueError: on an unknown sparsity mode, a missing or out of range
@@ -76,6 +79,7 @@ class SparseCoder(nn.Module):
         self.d_latent = d_in * expansion
         self.sparsity = sparsity
         self.normalize_decoder = normalize_decoder
+        self.tie_init = tie_init
 
         if sparsity == "topk":
             if k is None:
@@ -102,9 +106,20 @@ class SparseCoder(nn.Module):
 
         Dictionary vectors start at unit length pointing in random directions,
         which is the state the normalisation maintains, so training does not
-        begin by undoing the initialisation. The encoder starts at the
-        dictionary's transpose scaled down, so that early features respond to
-        the directions they will later reconstruct rather than to noise.
+        begin by undoing the initialisation.
+
+        The encoder is then started from the dictionary, scaled down, so that
+        early features respond to the directions they will later reconstruct
+        rather than to noise. That only says something when the encoder reads
+        the space the decoder writes into. Where it does not, the transpose
+        carries no information about what a feature should detect, so
+        ``tie_init`` turns it off and the encoder starts from its own random
+        directions at the same scale. The two settings differ in where the rows
+        point and in nothing else, so a comparison between them is not also a
+        comparison between magnitudes.
+
+        Widths that differ cannot use the transpose at all, since the shapes do
+        not match, and fall through to the standard initialisation.
         """
         with torch.no_grad():
             weight = torch.randn(self.d_out, self.d_latent)
@@ -114,7 +129,14 @@ class SparseCoder(nn.Module):
 
             scale = 1.0 / math.sqrt(self.d_in)
             if self.d_in == self.d_out:
-                self.encoder.weight.copy_(weight.T * scale)
+                if self.tie_init:
+                    self.encoder.weight.copy_(weight.T * scale)
+                else:
+                    # Unit-length rows, which is what weight.T already has, so
+                    # the only thing that changes is where the rows point.
+                    rows = torch.randn(self.d_latent, self.d_in)
+                    rows /= rows.norm(dim=1, keepdim=True)
+                    self.encoder.weight.copy_(rows * scale)
             else:
                 nn.init.kaiming_uniform_(self.encoder.weight, a=math.sqrt(5))
             self.encoder.bias.zero_()
@@ -337,6 +359,7 @@ def build_coder(cfg, d_in: int, d_out: int) -> tuple[SparseCoder, DeadFeatureTra
         sparsity=cfg.coder.sparsity.mode,
         k=k,
         normalize_decoder=cfg.coder.sparsity.normalize_decoder,
+        tie_init=cfg.coder.tie_decoder_init,
     )
 
     tracker = DeadFeatureTracker(coder.d_latent, cfg.coder.dead_features.track_window)
