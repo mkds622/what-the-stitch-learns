@@ -10,7 +10,6 @@ on the device.
 
 from __future__ import annotations
 
-import math
 import sys
 from pathlib import Path
 
@@ -102,14 +101,12 @@ def test_the_same_seed_builds_the_same_coder():
 # ----------------------------------------------------------------------
 
 def test_the_encoder_starts_at_the_dictionary_when_tied(coder):
-    expected = coder.decoder.weight.T / math.sqrt(D_IN)
-    assert torch.allclose(coder.encoder.weight, expected, atol=1e-6)
+    assert torch.allclose(coder.encoder.weight, coder.decoder.weight.T, atol=1e-6)
 
 
 def test_the_encoder_starts_elsewhere_when_untied():
     coder = SparseCoder(D_IN, D_OUT, EXPANSION, tie_init=False)
-    tied = coder.decoder.weight.T / math.sqrt(D_IN)
-    assert not torch.allclose(coder.encoder.weight, tied, atol=1e-4)
+    assert not torch.allclose(coder.encoder.weight, coder.decoder.weight.T, atol=1e-4)
 
 
 def test_untying_changes_the_directions_and_not_the_scale():
@@ -131,6 +128,87 @@ def test_differing_widths_ignore_the_setting():
     torch.manual_seed(0)
     two = SparseCoder(d_in=8, d_out=12, expansion=2, tie_init=False)
     assert torch.equal(one.encoder.weight, two.encoder.weight)
+
+
+# ----------------------------------------------------------------------
+# centring
+# ----------------------------------------------------------------------
+
+def test_the_centring_terms_start_at_zero_when_none_are_given(coder):
+    """The old behaviour, which every test without statistics to hand gets."""
+    assert torch.equal(coder.b_pre, torch.zeros(D_IN))
+    assert torch.equal(coder.decoder.bias, torch.zeros(D_OUT))
+
+
+def test_the_centring_terms_start_where_they_are_told_to():
+    torch.manual_seed(0)
+    b_pre = torch.randn(D_IN)
+    b_d = torch.randn(D_OUT)
+    coder = SparseCoder(D_IN, D_OUT, EXPANSION, b_pre_init=b_pre, b_d_init=b_d)
+
+    assert torch.equal(coder.b_pre, b_pre)
+    assert torch.equal(coder.decoder.bias, b_d)
+
+
+def test_the_two_centring_terms_are_independent():
+    """They are different vectors when the coder reads one layer and writes
+    another, so one cannot be derived from the other."""
+    torch.manual_seed(0)
+    b_pre = torch.randn(8)
+    b_d = torch.randn(12)
+    coder = SparseCoder(d_in=8, d_out=12, expansion=2,
+                        b_pre_init=b_pre, b_d_init=b_d)
+
+    assert torch.equal(coder.b_pre, b_pre)
+    assert torch.equal(coder.decoder.bias, b_d)
+
+
+def test_resetting_puts_the_centring_terms_back():
+    """Held rather than consumed, so a reset is a reset and not a reseed."""
+    torch.manual_seed(0)
+    b_pre = torch.randn(D_IN)
+    b_d = torch.randn(D_OUT)
+    coder = SparseCoder(D_IN, D_OUT, EXPANSION, b_pre_init=b_pre, b_d_init=b_d)
+
+    with torch.no_grad():
+        coder.b_pre.add_(1.0)
+        coder.decoder.bias.add_(1.0)
+    coder.reset_parameters()
+
+    assert torch.equal(coder.b_pre, b_pre)
+    assert torch.equal(coder.decoder.bias, b_d)
+
+
+def test_a_centring_term_of_the_wrong_shape_raises():
+    with pytest.raises(ValueError, match="b_pre_init"):
+        SparseCoder(D_IN, D_OUT, EXPANSION, b_pre_init=torch.zeros(D_IN + 1))
+    with pytest.raises(ValueError, match="b_d_init"):
+        SparseCoder(D_IN, D_OUT, EXPANSION, b_d_init=torch.zeros(D_OUT + 1))
+
+
+def test_the_caller_keeps_its_own_copy():
+    """The coder clones, so training it does not edit the caller's vector."""
+    b_pre = torch.zeros(D_IN)
+    coder = SparseCoder(D_IN, D_OUT, EXPANSION, b_pre_init=b_pre)
+    with torch.no_grad():
+        coder.b_pre.add_(1.0)
+    assert torch.equal(b_pre, torch.zeros(D_IN))
+
+
+def test_the_encoder_carries_no_bias():
+    """It would be redundant with b_pre and make the centring unidentifiable."""
+    coder = SparseCoder(D_IN, D_OUT, EXPANSION)
+    assert coder.encoder.bias is None
+
+
+def test_centring_subtracts_before_the_encoder(x):
+    """b_pre is what the encoder sees removed, not an offset added after."""
+    torch.manual_seed(0)
+    centre = torch.randn(D_IN)
+    coder = SparseCoder(D_IN, D_OUT, EXPANSION, b_pre_init=centre)
+
+    expected = torch.relu(coder.encoder(x - centre))
+    assert torch.allclose(coder.encode(x), expected, atol=1e-6)
 
 
 # ----------------------------------------------------------------------
@@ -221,7 +299,6 @@ def test_the_penalty_weighs_features_by_their_dictionary_vector(x):
     with torch.no_grad():
         coder.decoder.weight.mul_(2.0)
         coder.encoder.weight.div_(2.0)
-        coder.encoder.bias.div_(2.0)
 
     _, after = compute_loss(coder, x, x, coeff=1.0)
     assert after["sparsity_penalty"] == pytest.approx(before["sparsity_penalty"], rel=1e-4)
@@ -334,8 +411,25 @@ def test_build_coder_passes_the_init_setting():
     cfg = Config()
     cfg.coder.tie_decoder_init = False
     coder, _ = build_coder(cfg, d_in=8, d_out=8)
-    tied = coder.decoder.weight.T / math.sqrt(8)
-    assert not torch.allclose(coder.encoder.weight, tied, atol=1e-4)
+    assert not torch.allclose(coder.encoder.weight, coder.decoder.weight.T, atol=1e-4)
+
+
+def test_build_coder_passes_the_centring_terms():
+    torch.manual_seed(0)
+    cfg = Config()
+    b_pre = torch.randn(8)
+    b_d = torch.randn(8)
+    coder, _ = build_coder(cfg, d_in=8, d_out=8, b_pre_init=b_pre, b_d_init=b_d)
+
+    assert torch.equal(coder.b_pre, b_pre)
+    assert torch.equal(coder.decoder.bias, b_d)
+
+
+def test_build_coder_centres_at_zero_when_given_nothing():
+    cfg = Config()
+    coder, _ = build_coder(cfg, d_in=8, d_out=8)
+    assert torch.equal(coder.b_pre, torch.zeros(8))
+    assert torch.equal(coder.decoder.bias, torch.zeros(8))
 
 
 # ----------------------------------------------------------------------

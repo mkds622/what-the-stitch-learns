@@ -253,5 +253,28 @@ class GaussianActivations(ActivationSource):
         self._measure_scales()
         return dict(self._scales)
 
+    def centres(self) -> dict[str, torch.Tensor]:
+        """Where this stream sits, sliced per layer and scaled.
+
+        The real stream reports a geometric median, because a residual stream
+        carries outlier tokens that pull an arithmetic mean off centre. A
+        Gaussian carries none. It is symmetric about its location parameter, so
+        its geometric median and its arithmetic mean are the same point, and
+        that point is already held here as the vector the stream generates
+        from. Running Weiszfeld over generated tokens would hand it back with
+        sampling noise added.
+
+        That location is the real activations' arithmetic mean, since that is
+        what this stream was matched to. So a control run is centred on a
+        slightly different vector from the run it controls. That is correct
+        rather than an oversight: each stream is centred on its own
+        distribution, and a control centred where its own tokens are not would
+        be measuring the centring instead of the features.
+        """
+        self._measure_scales()
+        return {key: (self.mean[start:stop].to(torch.float32).cpu()
+                      * self._scales[key])
+                for key, start, stop in self._offsets}
+
     def set_scales(self, scales: dict[str, float]) -> None:
         self._scales = dict(scales)

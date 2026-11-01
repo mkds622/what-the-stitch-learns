@@ -16,6 +16,24 @@ Input and output widths are separate. When they are equal this is an ordinary
 sparse autoencoder reconstructing its own input. When they differ it
 reconstructs something else, which is the only structural difference between
 the objectives being compared.
+
+Centring
+--------
+Both the activation read and the activation reconstructed carry a constant
+part, and something has to hold it. ``b_pre`` is subtracted before encoding and
+``b_d`` is added after decoding, and both are given the centre of their layer
+at initialisation rather than starting at zero.
+
+Left at zero they never arrive there. Absorbing a constant is a race between
+two biases and a dictionary of thousands of directions, the loss does not care
+which wins, and the dictionary wins. The features that win it then fire on
+nearly every token, which is a dense code wearing a sparse code's sparsity
+count. Handing the constant to the bias at step zero means the dictionary never
+has a gradient asking it to spend features on something every token shares.
+
+The encoder carries no bias of its own. With one, the pre-activation would be
+``W_e x + (b_e - W_e b_pre)`` and only that combination would be identifiable,
+so ``b_pre`` could drift anywhere and the centring would say nothing.
 """
 
 from __future__ import annotations
@@ -44,7 +62,9 @@ class SparseCoder(nn.Module):
 
     def __init__(self, d_in: int, d_out: int, expansion: int,
                  sparsity: str = "l1", k: int | None = None,
-                 normalize_decoder: bool = True, tie_init: bool = True):
+                 normalize_decoder: bool = True, tie_init: bool = True,
+                 b_pre_init: Tensor | None = None,
+                 b_d_init: Tensor | None = None):
         """
         Args:
             d_in: width of the activation read.
@@ -59,10 +79,20 @@ class SparseCoder(nn.Module):
             tie_init: start the encoder at the dictionary's transpose. Applies
                 only where the encoder reads the space the decoder writes into;
                 see :meth:`reset_parameters`.
+            b_pre_init: where the pre-encoder centring term starts, at the
+                input width and in the units the coder will be trained in.
+                The centre of the layer read; see the module docstring. None
+                starts it at zero, which is what the tests and any caller
+                without statistics to hand get.
+            b_d_init: the same for the decoder bias, at the output width, from
+                the layer reconstructed. The same vector as ``b_pre_init``
+                where the coder reproduces its own input, and a different one
+                where it does not.
 
         Raises:
             ValueError: on an unknown sparsity mode, a missing or out of range
-                ``k``, or a non-positive width or expansion.
+                ``k``, a non-positive width or expansion, or a centring vector
+                of the wrong shape.
         """
         super().__init__()
 
@@ -88,13 +118,26 @@ class SparseCoder(nn.Module):
                 raise ValueError(f"k must be between 1 and {self.d_latent}, got {k}")
         self.k = k
 
+        for name, vector, width in (("b_pre_init", b_pre_init, d_in),
+                                    ("b_d_init", b_d_init, d_out)):
+            if vector is not None and tuple(vector.shape) != (width,):
+                raise ValueError(
+                    f"{name} must have shape ({width},), got {tuple(vector.shape)}")
+
+        # Held rather than consumed, so a later reset_parameters puts the coder
+        # back where it started instead of somewhere else.
+        self.b_pre_init = None if b_pre_init is None else b_pre_init.detach().clone()
+        self.b_d_init = None if b_d_init is None else b_d_init.detach().clone()
+
         # Subtracted before encoding. A standard autoencoder reuses the decoder
         # bias here, which only works when the input and the target are the same
         # thing. They are not in general, so the centring term is its own
         # parameter at the input width.
         self.b_pre = nn.Parameter(torch.zeros(d_in))
 
-        self.encoder = nn.Linear(d_in, self.d_latent, bias=True)
+        # No encoder bias: it would be redundant with b_pre and would make the
+        # centring unidentifiable. See the module docstring.
+        self.encoder = nn.Linear(d_in, self.d_latent, bias=False)
         self.decoder = nn.Linear(self.d_latent, d_out, bias=True)
 
         self.reset_parameters()
@@ -102,30 +145,33 @@ class SparseCoder(nn.Module):
     # ------------------------------------------------------------------
 
     def reset_parameters(self) -> None:
-        """Initialise the dictionary and the encoder.
+        """Initialise the dictionary, the encoder and the centring terms.
 
         Dictionary vectors start at unit length pointing in random directions,
         which is the state the normalisation maintains, so training does not
         begin by undoing the initialisation.
 
-        The encoder is then started from the dictionary, scaled down, so that
-        early features respond to the directions they will later reconstruct
-        rather than to noise. That only says something when the encoder reads
-        the space the decoder writes into. Where it does not, the transpose
-        carries no information about what a feature should detect, so
-        ``tie_init`` turns it off and the encoder starts from its own random
-        directions at the same scale. The two settings differ in where the rows
-        point and in nothing else, so a comparison between them is not also a
-        comparison between magnitudes.
+        The encoder is then started from the dictionary, so that early features
+        respond to the directions they will later reconstruct rather than to
+        noise. That only says something when the encoder reads the space the
+        decoder writes into. Where it does not, the transpose carries no
+        information about what a feature should detect, so ``tie_init`` turns
+        it off and the encoder starts from its own random directions at the
+        same scale. The two settings differ in where the rows point and in
+        nothing else, so a comparison between them is not also a comparison
+        between magnitudes.
 
         Widths that differ cannot use the transpose at all, since the shapes do
         not match, and fall through to the standard initialisation.
+
+        Both centring terms start at the centre of their layer when one was
+        given, and at zero when none was. Zero is the state that leaves the
+        constant to the dictionary; see the module docstring.
         """
         with torch.no_grad():
             weight = torch.randn(self.d_out, self.d_latent)
             weight /= weight.norm(dim=0, keepdim=True)
             self.decoder.weight.copy_(weight)
-            self.decoder.bias.zero_()
 
             if self.d_in == self.d_out:
                 if self.tie_init:
@@ -138,8 +184,16 @@ class SparseCoder(nn.Module):
                     self.encoder.weight.copy_(rows)
             else:
                 nn.init.kaiming_uniform_(self.encoder.weight, a=math.sqrt(5))
-            self.encoder.bias.zero_()
-            self.b_pre.zero_()
+
+            if self.b_pre_init is None:
+                self.b_pre.zero_()
+            else:
+                self.b_pre.copy_(self.b_pre_init)
+
+            if self.b_d_init is None:
+                self.decoder.bias.zero_()
+            else:
+                self.decoder.bias.copy_(self.b_d_init)
 
     # ------------------------------------------------------------------
 
@@ -340,12 +394,19 @@ def compute_loss(coder: SparseCoder, x: Tensor, target: Tensor,
 # construction from configuration
 # ----------------------------------------------------------------------
 
-def build_coder(cfg, d_in: int, d_out: int) -> tuple[SparseCoder, DeadFeatureTracker]:
-    """A coder and its tracker, sized from the widths the backbones produce.
+def build_coder(cfg, d_in: int, d_out: int,
+                b_pre_init: Tensor | None = None,
+                b_d_init: Tensor | None = None,
+                ) -> tuple[SparseCoder, DeadFeatureTracker]:
+    """A coder and its tracker, sized and centred from what the stream produces.
 
     Widths are arguments rather than settings. A coder built at a width the
     model does not produce would fail at the first batch, and a coder built at
     the wrong one of two widths would not fail at all.
+
+    The centring terms are arguments for the same reason. They are properties
+    of the activations at this depth in this model, measured by the stream, and
+    nothing in the configuration could state them correctly.
     """
     sparsity = cfg.coder.sparsity
     k = sparsity.k
@@ -359,6 +420,8 @@ def build_coder(cfg, d_in: int, d_out: int) -> tuple[SparseCoder, DeadFeatureTra
         k=k,
         normalize_decoder=cfg.coder.sparsity.normalize_decoder,
         tie_init=cfg.coder.tie_decoder_init,
+        b_pre_init=b_pre_init,
+        b_d_init=b_d_init,
     )
 
     tracker = DeadFeatureTracker(coder.d_latent, cfg.coder.dead_features.track_window)

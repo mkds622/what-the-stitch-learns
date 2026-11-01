@@ -31,6 +31,19 @@ units they arrive in. Left alone, one sparsity coefficient would mean a
 different trade at every layer and in every case. Each layer is therefore
 divided by a scalar fixed once at the start of the run, chosen so a typical
 token has the norm an isotropic unit-variance vector of that width would have.
+
+The centre of each layer is measured in the same pass, because the coder needs
+somewhere to put the constant part of an activation and cannot work it out for
+itself. It is the geometric median rather than the mean. A residual stream
+carries a small number of tokens with enormous norm, and the mean is pulled by
+them while the median is not: at ``add_12`` on the main pair the two differ by
+23 percent of the mean's own length, almost all of it in direction rather than
+magnitude. The median is also what the coder's reference uses, for the same
+reason.
+
+Centres are returned scaled, like the batches, so they arrive in the units the
+coder is trained in. The geometric median commutes with a positive scalar, so
+measuring before scaling and scaling afterwards is the same thing.
 """
 
 from __future__ import annotations
@@ -49,6 +62,31 @@ from stitch.models import layer_key, make_extractor, parse_layer_key
 log = logging.getLogger(__name__)
 
 TokenBatch = dict[str, torch.Tensor]
+
+
+def geometric_median(x: torch.Tensor, iterations: int = 50,
+                     eps: float = 1e-8) -> torch.Tensor:
+    """The point minimising total distance to every row, by Weiszfeld's method.
+
+    Started from the mean, which is the usual choice and converges in a few
+    tens of steps on activation-shaped data. ``eps`` keeps a token that sits
+    exactly on the current estimate from dividing by zero.
+
+    Args:
+        x: ``(tokens, width)``.
+        iterations: fixed rather than tolerance-based, so the cost of building
+            a coder does not depend on the data.
+        eps: floor on the distance used as a weight.
+
+    Returns:
+        ``(width,)``, in the units ``x`` arrived in.
+    """
+    m = x.mean(dim=0)
+    for _ in range(iterations):
+        distance = (x - m).norm(dim=1).clamp_min(eps)
+        weight = 1.0 / distance
+        m = (x * weight[:, None]).sum(dim=0) / weight.sum()
+    return m
 
 
 class ActivationSource(ABC):
@@ -77,6 +115,16 @@ class ActivationSource(ABC):
         An evaluation stream has to use the numbers the training stream
         measured. Measuring its own would put the two in different units, and
         every comparison between them would be off by a factor nobody recorded.
+        """
+
+    @abstractmethod
+    def centres(self) -> dict[str, torch.Tensor]:
+        """The centre of each layer, scaled, for the coder's centring terms.
+
+        One vector per layer key, at that layer's width, in the units
+        :meth:`batches` yields. Measured rather than configured, for the same
+        reason the widths are: it is a property of the activations at this
+        depth in this model.
         """
 
 
@@ -127,6 +175,7 @@ class OnTheFlyActivations(ActivationSource):
         self.generator = torch.Generator().manual_seed(cfg.train.seed)
         self._widths: dict[str, int] = {}
         self._scales: dict[str, float] | None = None
+        self._centres: dict[str, torch.Tensor] | None = None
 
     # ------------------------------------------------------------------
 
@@ -175,6 +224,45 @@ class OnTheFlyActivations(ActivationSource):
 
         log.info("activation scales: %s",
                  {key: round(value, 4) for key, value in self._scales.items()})
+
+    def _measure_centres(self) -> None:
+        """Fix one centre per layer, over the same tokens the scales used.
+
+        A separate pass from the scales rather than the same one. The median
+        needs the tokens all at once rather than as a running sum, so folding
+        it into :meth:`_measure_scales` would make every stream pay for the
+        memory, including an evaluation stream that has adopted its scales
+        from elsewhere and will never be asked for a centre.
+
+        The tokens are held on the host while it runs: ``scale_tokens`` by the
+        width by four bytes, per layer, which at the configured hundred
+        thousand is a few hundred megabytes, released as soon as it is done.
+        """
+        if self._centres is not None:
+            return
+
+        self._measure_scales()
+
+        held: dict[str, list[torch.Tensor]] = {}
+        seen = 0
+        for block in self._blocks():
+            for key, value in block.items():
+                held.setdefault(key, []).append(value.detach().to("cpu", torch.float32))
+            seen += next(iter(block.values())).shape[0]
+            if seen >= self.scale_tokens:
+                break
+
+        # Scaled after the fact rather than before, which gives the same
+        # vector, because the geometric median commutes with a positive scalar.
+        self._centres = {}
+        for key, chunks in held.items():
+            tokens = torch.cat(chunks)[:self.scale_tokens]
+            chunks.clear()
+            self._centres[key] = geometric_median(tokens) * self._scales[key]
+
+        log.info("activation centres, norm: %s",
+                 {key: round(float(value.norm()), 4)
+                  for key, value in self._centres.items()})
 
     def batches(self) -> Iterator[TokenBatch]:
         """Shuffled, scaled token batches, forever."""
@@ -233,8 +321,19 @@ class OnTheFlyActivations(ActivationSource):
         return dict(self._scales)
 
     def set_scales(self, scales: dict[str, float]) -> None:
-        """Adopt scales measured elsewhere instead of measuring them."""
+        """Adopt scales measured elsewhere instead of measuring them.
+
+        The centres are left alone. An evaluation stream has no use for them,
+        since the coder is built once from the training stream, and silently
+        rescaling a centre measured against different scalars would be worse
+        than having none.
+        """
         self._scales = dict(scales)
+
+    def centres(self) -> dict[str, torch.Tensor]:
+        """The centre of each layer, scaled, measuring it if necessary."""
+        self._measure_centres()
+        return dict(self._centres)
 
 
 def build_source(cfg, models: dict[str, nn.Module], loader: DataLoader) -> ActivationSource:

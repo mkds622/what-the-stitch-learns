@@ -323,10 +323,15 @@ def run(cfg, resume: Path | None = None) -> dict:
 
     source_key, target_key = resolve_layers(cfg)
     widths = training.widths()
-    coder, tracker = build_coder(cfg, widths[source_key], widths[target_key])
+    centres = training.centres()
+    coder, tracker = build_coder(cfg, widths[source_key], widths[target_key],
+                                 b_pre_init=centres[source_key],
+                                 b_d_init=centres[target_key])
 
     scales = training.scales()
     logger.log_dict(scales, "scales.json")
+    logger.log_dict({key: value.tolist() for key, value in centres.items()},
+                    "centres.json")
 
     def hook(current, step):
         return evaluate(current, evaluation.batches(), source_key, target_key,
