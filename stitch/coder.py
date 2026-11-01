@@ -127,16 +127,15 @@ class SparseCoder(nn.Module):
             self.decoder.weight.copy_(weight)
             self.decoder.bias.zero_()
 
-            scale = 1.0 / math.sqrt(self.d_in)
             if self.d_in == self.d_out:
                 if self.tie_init:
-                    self.encoder.weight.copy_(weight.T * scale)
+                    self.encoder.weight.copy_(weight.T)
                 else:
                     # Unit-length rows, which is what weight.T already has, so
                     # the only thing that changes is where the rows point.
                     rows = torch.randn(self.d_latent, self.d_in)
                     rows /= rows.norm(dim=1, keepdim=True)
-                    self.encoder.weight.copy_(rows * scale)
+                    self.encoder.weight.copy_(rows)
             else:
                 nn.init.kaiming_uniform_(self.encoder.weight, a=math.sqrt(5))
             self.encoder.bias.zero_()
