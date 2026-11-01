@@ -14,6 +14,7 @@ mlruns/
 .DS_Store
 
 runs/
+archive/
 crashes/
 logs/
 mlruns/
