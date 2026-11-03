@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 torch = pytest.importorskip("torch")
 
 from stitch.coder import (                                            # noqa: E402
-    DeadFeatureTracker, SparseCoder, build_coder, compute_loss,
+    DeadFeatureTracker, SparseCoder, auxiliary_latents, build_coder, compute_loss,
 )
 from stitch.config import Config                                      # noqa: E402
 
@@ -527,3 +527,162 @@ def test_the_tracker_sees_the_features_without_a_second_pass(coder, x):
 
 def test_no_tracker_is_fine(coder, x):
     compute_loss(coder, x, x, coeff=0.0)
+
+
+# ----------------------------------------------------------------------
+# the auxiliary loss on dead features
+# ----------------------------------------------------------------------
+
+def dead_tracker(d_latent: int, dead) -> DeadFeatureTracker:
+    """A tracker that calls exactly these features dead, and nothing else."""
+    tracker = DeadFeatureTracker(d_latent, window=2)
+    tracker.steps_since_fired.zero_()
+    tracker.steps_since_fired[list(dead)] = 100
+    return tracker
+
+
+def silent_features(coder: SparseCoder, batch):
+    """Which features the sparsity operator leaves unselected on this batch."""
+    with torch.no_grad():
+        _, latents = coder(batch)
+    return (~(latents > 0).any(dim=0)).nonzero().flatten().tolist()
+
+
+def test_only_dead_features_take_part(coder, x):
+    selected = auxiliary_latents(coder.pre_activations(x),
+                                 dead_tracker(coder.d_latent, [3, 7, 11]).dead_mask,
+                                 aux_k=2)
+    live = torch.ones(coder.d_latent, dtype=torch.bool)
+    live[[3, 7, 11]] = False
+    assert torch.equal(selected[:, live], torch.zeros_like(selected[:, live]))
+
+
+def test_the_selection_is_capped_by_how_many_are_dead(coder, x):
+    """``aux_k`` asks for more than exist, so it has to clamp rather than fail."""
+    selected = auxiliary_latents(coder.pre_activations(x),
+                                 dead_tracker(coder.d_latent, [0, 5]).dead_mask,
+                                 aux_k=coder.d_latent)
+    support = (selected != 0).any(dim=0).nonzero().flatten().tolist()
+    assert support == [0, 5]
+
+
+def test_a_feature_that_never_clears_the_relu_still_takes_part():
+    """Ranking on the post-ReLU value would make the term a constant."""
+    pre = torch.tensor([[-5.0, -1.0, 2.0]])
+    selected = auxiliary_latents(pre, torch.tensor([True, True, False]), aux_k=1)
+    assert selected.tolist() == [[0.0, -1.0, 0.0]]
+
+
+def test_the_auxiliary_decode_leaves_out_the_bias():
+    coder = SparseCoder(D_IN, D_OUT, EXPANSION,
+                        b_d_init=torch.full((D_OUT,), 3.0))
+    latents = torch.zeros(1, coder.d_latent)
+    latents[0, 0] = 1.0
+
+    assert torch.allclose(coder.decode_centred(latents),
+                          coder.decode(latents) - coder.decoder.bias)
+
+
+def test_a_zero_coefficient_is_exactly_the_run_it_was_before(coder, x):
+    plain, plain_metrics = compute_loss(
+        coder, x, x, coeff=0.0, tracker=dead_tracker(coder.d_latent, [0, 1, 2]))
+    same, metrics = compute_loss(
+        coder, x, x, coeff=0.0, tracker=dead_tracker(coder.d_latent, [0, 1, 2]),
+        aux_coeff=0.0, aux_k=4)
+
+    assert float(plain.detach()) == float(same.detach())
+    assert metrics["aux_loss"] == 0.0
+    assert plain_metrics["aux_loss"] == 0.0
+
+
+def test_without_a_tracker_there_is_nothing_to_call_dead(coder, x):
+    _, metrics = compute_loss(coder, x, x, coeff=0.0, aux_coeff=1.0, aux_k=4)
+    assert metrics["aux_loss"] == 0.0
+
+
+def test_nothing_dead_means_nothing_to_add(coder, x):
+    plain, _ = compute_loss(coder, x, x, coeff=0.0,
+                            tracker=DeadFeatureTracker(coder.d_latent, window=10))
+    loss, metrics = compute_loss(coder, x, x, coeff=0.0,
+                                 tracker=DeadFeatureTracker(coder.d_latent, window=10),
+                                 aux_coeff=1.0, aux_k=4)
+
+    assert metrics["aux_loss"] == 0.0
+    assert float(loss.detach()) == float(plain.detach())
+
+
+def test_a_dead_feature_gets_a_gradient_it_would_not_otherwise_have():
+    """The whole point. Under topk its gradient is otherwise exactly zero."""
+    torch.manual_seed(0)
+    coder = SparseCoder(D_IN, D_OUT, EXPANSION, sparsity="topk", k=2)
+    batch = torch.randn(TOKENS, D_IN)
+
+    silent = silent_features(coder, batch)
+    assert silent, "the fixture is meant to leave some features unselected"
+
+    coder.zero_grad()
+    compute_loss(coder, batch, batch, coeff=0.0,
+                 tracker=dead_tracker(coder.d_latent, silent))[0].backward()
+    assert float(coder.encoder.weight.grad[silent].abs().sum()) == 0.0
+
+    coder.zero_grad()
+    compute_loss(coder, batch, batch, coeff=0.0,
+                 tracker=dead_tracker(coder.d_latent, silent),
+                 aux_coeff=1.0, aux_k=len(silent))[0].backward()
+    assert float(coder.encoder.weight.grad[silent].abs().sum()) > 0.0
+
+
+def test_the_term_leaves_the_live_features_alone():
+    """The error it fits is detached, so it is not a second reconstruction loss."""
+    torch.manual_seed(0)
+    coder = SparseCoder(D_IN, D_OUT, EXPANSION, sparsity="topk", k=2)
+    batch = torch.randn(TOKENS, D_IN)
+
+    silent = silent_features(coder, batch)
+    live = torch.ones(coder.d_latent, dtype=torch.bool)
+    live[silent] = False
+
+    coder.zero_grad()
+    compute_loss(coder, batch, batch, coeff=0.0,
+                 tracker=dead_tracker(coder.d_latent, silent))[0].backward()
+    without = coder.encoder.weight.grad[live].clone()
+
+    coder.zero_grad()
+    compute_loss(coder, batch, batch, coeff=0.0,
+                 tracker=dead_tracker(coder.d_latent, silent),
+                 aux_coeff=1.0, aux_k=len(silent))[0].backward()
+
+    assert torch.equal(coder.encoder.weight.grad[live], without)
+
+
+def test_the_dead_set_comes_from_the_tracker_and_not_the_batch(coder, x):
+    """A feature firing on every token is still dead if the tracker says so."""
+    live = int((coder.encode(x) > 0).float().sum(dim=0).argmax())
+    selected = auxiliary_latents(coder.pre_activations(x),
+                                 dead_tracker(coder.d_latent, [live]).dead_mask,
+                                 aux_k=4)
+    assert (selected[:, live] != 0).all()
+
+
+def test_the_term_falls_when_the_dead_features_are_trained_on_it():
+    torch.manual_seed(0)
+    coder = SparseCoder(D_IN, D_OUT, EXPANSION, sparsity="topk", k=2)
+    batch = torch.randn(256, D_IN)
+    dead = [0, 1, 2, 3]
+    optimiser = torch.optim.Adam(coder.parameters(), lr=1e-2)
+
+    def step():
+        return compute_loss(coder, batch, batch, coeff=0.0,
+                            tracker=dead_tracker(coder.d_latent, dead),
+                            aux_coeff=1.0, aux_k=len(dead))
+
+    _, first = step()
+    for _ in range(200):
+        optimiser.zero_grad()
+        loss, last = step()
+        loss.backward()
+        coder.project_decoder_gradient()
+        optimiser.step()
+        coder.normalize_decoder_columns()
+
+    assert last["aux_loss"] < first["aux_loss"]

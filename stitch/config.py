@@ -177,14 +177,33 @@ class DeadFeatureConfig:
     """What to do about dictionary slots that stop firing.
 
     A slot that never activates contributes nothing and inflates the apparent
-    dictionary size, which corrupts any comparison between dictionaries. Both
-    remedies below are standard; resampling is the more aggressive one.
+    dictionary size, which corrupts any comparison between dictionaries.
+
+    The remedy here is an auxiliary loss. Every step, the slots the tracker
+    calls dead are asked to reconstruct the error the live ones left behind, so
+    they receive a gradient from what the dictionary is missing rather than
+    sitting at zero. ``aux_loss_coeff`` at zero turns it off entirely and is
+    the default, so a run without it is the same run it was before this
+    existed.
+
+    ``aux_k_frac`` is the mechanism's own sparsity, as a fraction of the
+    dictionary rather than a count. The dictionary is the pool the dead slots
+    are drawn from and it grows with the expansion factor, so a fixed count
+    would be a third of the pool at one end of an expansion sweep and a
+    fiftieth at the other, and the mechanism would not be the same mechanism
+    across the sweep.
+
+    Note that this divides by the dictionary width while ``k_frac`` divides by
+    the input width. ``k`` is deliberately held fixed as the dictionary grows,
+    since that is what an expansion sweep varies. The auxiliary problem has no
+    reason to be held fixed, and every reason to stay the same share of the
+    pool it selects from.
     """
 
     track_window: int = 10_000        # steps over which "never fired" is judged
-    resample: bool = False            # reinitialise dead slots from high-error inputs
-    resample_every: int = 25_000
-    aux_loss_coeff: float = 0.0       # auxiliary reconstruction from dead slots only
+    aux_loss_coeff: float = 0.0       # weight on the auxiliary loss; 0 turns it off
+    aux_k_frac: float = 0.05          # dead slots used per token, as a fraction
+                                      # of the dictionary
 
 
 @dataclass

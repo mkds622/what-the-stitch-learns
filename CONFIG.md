@@ -158,12 +158,21 @@ setting.
 | Key | Default | Meaning |
 |---|---|---|
 | `track_window` | `10000` | Steps over which "never fired" is judged |
-| `resample` | `false` | Reinitialise dead slots from high-error inputs |
-| `resample_every` | `25000` | Cadence when resampling |
-| `aux_loss_coeff` | `0.0` | Auxiliary reconstruction from dead slots only |
+| `aux_loss_coeff` | `0.0` | Weight on the auxiliary loss. `0` turns it off |
+| `aux_k_frac` | `0.05` | Dead slots used per token, as a fraction of the dictionary |
 
 A slot that never activates contributes nothing and inflates the apparent
-dictionary size, which corrupts any comparison between dictionaries.
+dictionary size, which corrupts any comparison between dictionaries. Under
+`topk` it also cannot recover: it is absent from the reconstruction, so no term
+in the loss is a function of it and its gradient is exactly zero.
+
+The auxiliary loss is the remedy. Each step, the dead slots alone are asked to
+reconstruct the error the live slots left behind, and that loss is added to the
+main one at `aux_loss_coeff`. `aux_k` is how many dead slots take part per
+token, ranked by pre-activation. It is set rather than derived from `k` or from
+the dead count: the first would tie the size of the auxiliary problem to the
+sparsity budget, which is a swept lever, and the second would make the
+auxiliary problem easier exactly as the dictionary got healthier.
 
 ### `activations`
 

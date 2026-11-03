@@ -34,6 +34,23 @@ has a gradient asking it to spend features on something every token shares.
 The encoder carries no bias of its own. With one, the pre-activation would be
 ``W_e x + (b_e - W_e b_pre)`` and only that combination would be identifiable,
 so ``b_pre`` could drift anywhere and the centring would say nothing.
+
+The auxiliary loss on dead features
+-----------------------------------
+Under topk a feature that is never selected is absent from the reconstruction,
+so no term in the loss is a function of it and its gradient is exactly zero. It
+cannot recover on its own; whatever it was at initialisation is what it stays.
+
+The remedy is a second, small reconstruction asked of the dead features alone:
+fit the error the live features left behind, using only features the tracker
+says have not fired. That makes the dead features a function of something
+again, and it points them at structure the dictionary is currently missing
+rather than at whatever the live features already cover.
+
+Both the selection among dead features and the coefficients given to them come
+from the pre-activation rather than the post-ReLU value. A feature is usually
+dead because its pre-activation is negative on every token, so its post-ReLU
+value is zero and would carry no gradient either.
 """
 
 from __future__ import annotations
@@ -197,10 +214,24 @@ class SparseCoder(nn.Module):
 
     # ------------------------------------------------------------------
 
-    def encode(self, x: Tensor) -> Tensor:
-        """Features for one batch of activations, most of them zero."""
-        latents = torch.relu(self.encoder(x - self.b_pre))
+    def pre_activations(self, x: Tensor) -> Tensor:
+        """Encoder output, before the ReLU and before any selection.
 
+        Every feature has a value here, including the ones about to be zeroed,
+        and the value can be negative. That is what the auxiliary loss on dead
+        features reads. A dead feature is usually one whose pre-activation is
+        negative on every token, so its post-ReLU value is exactly zero and
+        carries no gradient; ranking and weighting dead features by their
+        post-ReLU value would make the auxiliary term a constant.
+        """
+        return self.encoder(x - self.b_pre)
+
+    def activations(self, x: Tensor) -> Tensor:
+        """Post-ReLU features, before any sparsity operator selects among them."""
+        return torch.relu(self.pre_activations(x))
+
+    def sparsify(self, latents: Tensor) -> Tensor:
+        """Apply the sparsity operator to post-ReLU features."""
         if self.sparsity == "topk":
             # Keep the k largest per token and zero the rest, so sparsity is
             # exact rather than something a penalty has to be tuned towards.
@@ -209,19 +240,45 @@ class SparseCoder(nn.Module):
 
         return latents
 
+    def encode(self, x: Tensor) -> Tensor:
+        """Features for one batch of activations, most of them zero."""
+        return self.sparsify(self.activations(x))
+
     def decode(self, latents: Tensor) -> Tensor:
         """Reconstruct from features."""
         return self.decoder(latents)
 
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+    def decode_centred(self, latents: Tensor) -> Tensor:
+        """Reconstruct from features without the decoder bias.
+
+        For a target that is already a difference between two quantities in the
+        output space, where the constant part has cancelled and adding it back
+        would be an error.
         """
+        return torch.nn.functional.linear(latents, self.decoder.weight)
+
+    def forward(self, x: Tensor,
+                return_pre_activations: bool = False
+                ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
+        """
+        Args:
+            x: ``(tokens, d_in)``.
+            return_pre_activations: also return the encoder output from before
+                the ReLU and the sparsity operator. The auxiliary loss needs it
+                and recomputing the encoder to get it would double its cost.
+
         Returns:
-            ``(reconstruction, latents)``. The latents are returned because
-            every sparsity metric is computed from them and recomputing them
-            would double the encoder's cost.
+            ``(reconstruction, latents)``, or ``(reconstruction, latents,
+            pre_activations)`` when asked. The latents are returned because
+            every sparsity metric is computed from them.
         """
-        latents = self.encode(x)
-        return self.decode(latents), latents
+        pre = self.pre_activations(x)
+        latents = self.sparsify(torch.relu(pre))
+        reconstruction = self.decode(latents)
+
+        if return_pre_activations:
+            return reconstruction, latents, pre
+        return reconstruction, latents
 
     # ------------------------------------------------------------------
     # dictionary normalisation
@@ -329,8 +386,40 @@ class DeadFeatureTracker(nn.Module):
 # loss and metrics
 # ----------------------------------------------------------------------
 
+def auxiliary_latents(pre_activations: Tensor, dead: Tensor,
+                      aux_k: int) -> Tensor | None:
+    """The dead features the auxiliary loss uses, as a sparse feature tensor.
+
+    Per token, the ``aux_k`` largest pre-activations among the features the
+    tracker calls dead, in a tensor shaped like the latents and zero everywhere
+    else. Selected and weighted by the pre-activation rather than the
+    post-ReLU value, which for a dead feature is almost always zero.
+
+    Args:
+        pre_activations: ``(tokens, d_latent)``, encoder output.
+        dead: ``(d_latent,)`` boolean, from the tracker.
+        aux_k: how many dead features to keep per token.
+
+    Returns:
+        ``(tokens, d_latent)``, or ``None`` when nothing is dead and there is
+        nothing for the auxiliary loss to do.
+    """
+    count = min(aux_k, int(dead.sum()))
+    if count < 1:
+        return None
+
+    with torch.no_grad():
+        masked = pre_activations.detach().masked_fill(~dead, float("-inf"))
+        indices = masked.topk(count, dim=-1).indices
+
+    values = pre_activations.gather(-1, indices)
+    return torch.zeros_like(pre_activations).scatter(-1, indices, values)
+
+
 def compute_loss(coder: SparseCoder, x: Tensor, target: Tensor,
-                 coeff: float, tracker: "DeadFeatureTracker | None" = None) -> tuple[Tensor, dict[str, float]]:
+                 coeff: float, tracker: "DeadFeatureTracker | None" = None,
+                 aux_coeff: float = 0.0, aux_k: int = 0,
+                 ) -> tuple[Tensor, dict[str, float]]:
     """One step's loss, with everything worth logging alongside it.
 
     Args:
@@ -345,11 +434,42 @@ def compute_loss(coder: SparseCoder, x: Tensor, target: Tensor,
             the encoder a second time to see them, which is about a sixth of
             the step's arithmetic.
 
+            Also what the auxiliary loss reads to find the dead features, so
+            without it there is no auxiliary loss however it is configured.
+        aux_coeff: weight on the auxiliary loss. Zero, the default, skips it
+            entirely rather than multiplying it out, so a run without it costs
+            nothing and is the run it was before this existed.
+        aux_k: dead features the auxiliary loss uses per token.
+
     Returns:
         ``(loss, metrics)``. The loss carries gradients; the metrics are plain
         floats, detached, ready to log.
+
+    The auxiliary term, when on: the dead features are asked to reconstruct the
+    error the live ones left behind. A dead feature otherwise receives no
+    gradient at all, since it is not selected and so does not appear in the
+    reconstruction, and nothing in the loss refers to it. Giving it the residual
+    to explain is the one way to make it a function of something.
+
+    It decodes without the decoder's bias. The residual is a difference between
+    two quantities in the output space, so the constant part has already
+    cancelled out of it, and adding the bias back would ask the dead features
+    to undo it.
+
+    The residual it is fitted to is detached. The term is there to move the dead
+    features, not to give the live ones a second, differently weighted
+    reconstruction objective.
     """
-    reconstruction, latents = coder(x)
+    use_aux = aux_coeff > 0.0 and aux_k > 0 and tracker is not None
+    if use_aux:
+        reconstruction, latents, pre_activations = coder(x, return_pre_activations=True)
+    else:
+        reconstruction, latents = coder(x)
+
+    # Read before the update, so "dead" means dead going into this batch rather
+    # than dead after it, and a feature is not asked to explain an error it has
+    # just been given a chance at.
+    dead = tracker.dead_mask.clone() if use_aux else None
 
     if tracker is not None:
         tracker.update(latents)
@@ -375,6 +495,14 @@ def compute_loss(coder: SparseCoder, x: Tensor, target: Tensor,
         penalty = torch.zeros((), device=x.device)
         loss = mse
 
+    aux = torch.zeros((), device=x.device)
+    if use_aux:
+        error = (target - reconstruction).detach()
+        selected = auxiliary_latents(pre_activations, dead, aux_k)
+        if selected is not None:
+            aux = torch.nn.functional.mse_loss(coder.decode_centred(selected), error)
+            loss = loss + aux_coeff * aux
+
     with torch.no_grad():
         residual = target - reconstruction
         variance = target.var(dim=0).sum()
@@ -384,6 +512,7 @@ def compute_loss(coder: SparseCoder, x: Tensor, target: Tensor,
             "loss": float(loss),
             "mse": float(mse),
             "sparsity_penalty": float(penalty),
+            "aux_loss": float(aux),
             "l0": float((latents > 0).float().sum(dim=-1).mean()),
             "explained_variance": float(explained),
         }

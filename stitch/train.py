@@ -183,6 +183,10 @@ def train(cfg, source, coder: SparseCoder, tracker: DeadFeatureTracker,
     total_steps = math.ceil(cfg.train.tokens / cfg.train.token_batch)
     checkpoints = run_dir / "checkpoints"
 
+    # Resolved once here rather than per step. A fraction of the dictionary,
+    # which is the pool the auxiliary loss selects dead slots out of.
+    aux_k = max(1, round(cfg.coder.dead_features.aux_k_frac * coder.d_latent))
+
     log.info("training %d steps of %d tokens, reading %s, reconstructing %s",
              total_steps, cfg.train.token_batch, source_key, target_key)
 
@@ -198,8 +202,12 @@ def train(cfg, source, coder: SparseCoder, tracker: DeadFeatureTracker,
             optimiser.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=half):
-                loss, metrics = compute_loss(coder, x, target, cfg.coder.sparsity.coeff,
-                                             tracker=tracker)
+                loss, metrics = compute_loss(
+                    coder, x, target, cfg.coder.sparsity.coeff,
+                    tracker=tracker,
+                    aux_coeff=cfg.coder.dead_features.aux_loss_coeff,
+                    aux_k=aux_k,
+                )
 
             scaler.scale(loss).backward()
 
