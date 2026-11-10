@@ -23,6 +23,39 @@ The measure is one-sided and the two sides differ, so both are reported. A
 small dictionary contained inside a large one scores high read one way and low
 read the other.
 
+Two ways of pairing features
+----------------------------
+
+Taking each feature's closest counterpart lets several features in one
+dictionary all name the same feature in the other. A dictionary that collapsed
+onto a handful of directions would then score well, because every one of its
+features found something close, and nothing in the number would say that they
+all found the same thing.
+
+The one-to-one pairing does not allow that. Every feature is assigned exactly
+one counterpart and no counterpart is used twice, chosen so that the total
+similarity over all pairs is as large as it can be. It is symmetric, so there
+is one number rather than two.
+
+Both are reported, because the gap between them is itself a reading: it is how
+much of the best-match score came from features crowding onto the same
+counterpart. They coincide exactly when the best matches already happen to form
+a one-to-one pairing.
+
+Firing frequency
+----------------
+
+Features that fire often are easier to match than features that fire rarely,
+for the same reason that a well-sampled quantity is estimated more precisely
+than a poorly sampled one. Two dictionaries that use their features with
+different evenness will therefore differ in matched score even if they contain
+the same features.
+
+So the matched scores are also reported split into bands of firing frequency,
+least frequent band first. A difference that is present in every band is a
+difference in what was learned. A difference that appears only in the rare
+bands is a difference in how heavily the dictionary was used.
+
 Why three numbers and not one
 -----------------------------
 
@@ -124,6 +157,9 @@ def _directions(state: dict, side: str, drop_dead: bool,
 
     total = weight.shape[1]
     dropped = 0
+    # Which columns survived, so anything recorded per feature elsewhere, such
+    # as the firing frequencies, can be cut down the same way.
+    alive_mask = torch.ones(total, dtype=torch.bool)
     if drop_dead:
         silence = state.get("tracker", {}).get("steps_since_fired")
         if silence is not None:
@@ -133,6 +169,7 @@ def _directions(state: dict, side: str, drop_dead: bool,
             if alive.any():
                 weight = weight[:, alive]
                 dropped = int((~alive).sum())
+                alive_mask = alive
             else:
                 log.warning("%s has no live features, keeping all of them", path)
 
@@ -145,6 +182,7 @@ def _directions(state: dict, side: str, drop_dead: bool,
         "features": total,
         "dropped": dropped,
         "kept": weight.shape[1],
+        "alive": alive_mask,
     }
 
 
@@ -181,6 +219,44 @@ def load_sides(path: Path, drop_dead: bool = True) -> dict[str, tuple[Tensor, di
 
     state = torch.load(path, map_location="cpu", weights_only=False)
     return {side: _directions(state, side, drop_dead, path) for side in SIDES}
+
+
+#: Where the evaluation writes the per-feature firing rates, relative to a run.
+FREQUENCIES = Path("artifacts") / "feature_frequencies.json"
+
+
+def run_directory(path: Path) -> Path:
+    """The run a path points into, given a run, its checkpoints or a checkpoint."""
+    path = Path(path)
+    if path.is_dir():
+        return path.parent if path.name == CHECKPOINTS else path
+    return path.parent.parent
+
+
+def load_frequencies(path: Path, alive: Tensor | None = None) -> Tensor | None:
+    """How often each feature fired over the evaluation set.
+
+    Written by the evaluation as one number per feature, in dictionary order,
+    over the whole dictionary including the features that never fired.
+
+    Args:
+        path: a run directory or a checkpoint inside one.
+        alive: the mask :func:`load_dictionary` kept, so the frequencies are
+            cut down to the same features in the same order.
+
+    Returns:
+        ``(features,)``, or ``None`` if the run recorded no frequencies, which
+        is the case for a run that died before its evaluation.
+    """
+    file = run_directory(path) / FREQUENCIES
+    if not file.is_file():
+        return None
+
+    values = torch.tensor(json.loads(file.read_text())["frequencies"],
+                          dtype=torch.float32)
+    if alive is not None and alive.numel() == values.numel():
+        values = values[alive]
+    return values
 
 
 # ----------------------------------------------------------------------
@@ -271,8 +347,113 @@ def similarity(a: Tensor, b: Tensor, close: float = 0.9,
     return out
 
 
+def assignment(a: Tensor, b: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """The one-to-one pairing of the two dictionaries with the highest total cosine.
+
+    Every column of the smaller dictionary is given exactly one counterpart in
+    the larger, and no counterpart is given to two of them. Solved exactly,
+    rather than by taking each feature's best and hoping no two agree.
+
+    Unlike :func:`best_match` this needs the whole similarity matrix at once,
+    since a pairing cannot be decided one row at a time. At twelve thousand
+    features that is about six hundred megabytes, and the solve itself is the
+    slower half.
+
+    Args:
+        a: ``(width, features_a)``, unit columns.
+        b: ``(width, features_b)``, unit columns.
+
+    Returns:
+        ``(rows, columns, scores)``. ``rows`` indexes ``a``, ``columns``
+        indexes ``b``, and ``scores`` is the cosine of each pair. All three have
+        length ``min(features_a, features_b)``.
+
+    Raises:
+        ValueError: if the two are not in the same space, or either is empty.
+    """
+    if a.shape[0] != b.shape[0]:
+        raise ValueError(f"different widths, {a.shape[0]} and {b.shape[0]}")
+    if a.shape[1] == 0 or b.shape[1] == 0:
+        raise ValueError("an empty dictionary cannot be compared")
+
+    from scipy.optimize import linear_sum_assignment
+
+    scores = a.T @ b
+    rows, columns = linear_sum_assignment(scores.numpy(), maximize=True)
+    rows, columns = torch.as_tensor(rows), torch.as_tensor(columns)
+    return rows, columns, scores[rows, columns]
+
+
+def by_frequency(scores: Tensor, frequencies: Tensor | None,
+                 bands: int = 4) -> list[float] | None:
+    """Mean matched score inside each band of firing frequency, rarest first.
+
+    Split at quantiles rather than at fixed rates, so the bands hold equal
+    numbers of features and none of them is empty whatever the distribution
+    looks like.
+
+    Args:
+        scores: one matched score per feature.
+        frequencies: how often each of those features fired, same order.
+        bands: how many bands to split into.
+
+    Returns:
+        One mean per band, or ``None`` if there are no frequencies to split on
+        or they do not line up with the scores.
+    """
+    if frequencies is None or frequencies.numel() != scores.numel():
+        return None
+    if scores.numel() < bands:
+        return None
+
+    order = frequencies.argsort()
+    return [float(scores[part].mean()) for part in torch.tensor_split(order, bands)]
+
+
+def assigned_similarity(a: Tensor, b: Tensor, close: float = 0.9,
+                        keep_distribution: bool = False,
+                        frequencies: Tensor | None = None,
+                        bands: int = 4) -> dict:
+    """The same reading as :func:`similarity`, under a one-to-one pairing.
+
+    One number rather than two: a pairing where nothing is used twice is
+    symmetric, so there is no forward and backward to report.
+
+    Args:
+        a: ``(width, features_a)``, unit columns.
+        b: ``(width, features_b)``, unit columns.
+        close: cosine above which two features count as the same feature.
+        keep_distribution: also return the shape of the matched scores.
+        frequencies: firing rates for the columns of ``a``, if the bands are
+            wanted.
+        bands: how many frequency bands to split into.
+
+    Returns:
+        The mean, median and matched share over the pairs, how many pairs there
+        were, and the per-band means when frequencies were given.
+    """
+    rows, _, scores = assignment(a, b)
+
+    out = {
+        "assigned_mean": float(scores.mean()),
+        "assigned_median": float(scores.median()),
+        "assigned_matched": float((scores >= close).float().mean()),
+        "assigned_pairs": int(scores.numel()),
+    }
+
+    if frequencies is not None:
+        bands_out = by_frequency(scores, frequencies[rows], bands)
+        if bands_out is not None:
+            out["assigned_by_frequency"] = bands_out
+
+    if keep_distribution:
+        out["assigned_histogram"] = histogram(scores)
+    return out
+
+
 def random_baseline(width: int, features: int, trials: int = 3,
-                    seed: int = 0, keep_distribution: bool = False) -> dict:
+                    seed: int = 0, keep_distribution: bool = False,
+                    assign: bool = False) -> dict:
     """The same measure on dictionaries that learned nothing.
 
     Two sets of random unit directions still match better than zero, and the
@@ -291,13 +472,19 @@ def random_baseline(width: int, features: int, trials: int = 3,
         features: dictionary size, meaning the live count.
         trials: how many random pairs to average over.
         seed: generator seed, so the baseline is reproducible.
+        assign: also measure the floor under the one-to-one pairing, which the
+            one-to-one reading has to be read against. Off by default because
+            it is the slow half: a pairing at the sizes used here takes minutes
+            per trial where the best match takes seconds.
 
     Returns:
-        The same fields ``similarity`` returns, averaged over the trials.
+        The same fields ``similarity`` returns, averaged over the trials, and
+        the ``assigned_`` fields alongside when asked for.
     """
     generator = torch.Generator().manual_seed(seed)
     totals: dict[str, float] = {}
     shape = [0.0] * BINS
+    assigned_shape = [0.0] * BINS
 
     for _ in range(trials):
         a = torch.randn(width, features, generator=generator)
@@ -305,14 +492,21 @@ def random_baseline(width: int, features: int, trials: int = 3,
         a = a / a.norm(dim=0, keepdim=True)
         b = b / b.norm(dim=0, keepdim=True)
         scores = similarity(a, b, keep_distribution=keep_distribution)
+        if assign:
+            scores.update(assigned_similarity(a, b, keep_distribution=keep_distribution))
         if keep_distribution:
             shape = [held + new for held, new in zip(shape, scores.pop("histogram"))]
+            if assign:
+                assigned_shape = [held + new for held, new
+                                  in zip(assigned_shape, scores.pop("assigned_histogram"))]
         for key, value in scores.items():
             totals[key] = totals.get(key, 0.0) + value
 
     out = {key: value / trials for key, value in totals.items()}
     if keep_distribution:
         out["histogram"] = [value / trials for value in shape]
+        if assign:
+            out["assigned_histogram"] = [value / trials for value in assigned_shape]
     return out
 
 
@@ -357,7 +551,8 @@ def from_grids(paths: list[Path], run_root: Path) -> list[Path]:
 
 
 def compare_runs(path_a: Path, path_b: Path, close: float = 0.9,
-                 drop_dead: bool = True, keep_distribution: bool = False) -> dict:
+                 drop_dead: bool = True, keep_distribution: bool = False,
+                 assign: bool = True, bands: int = 4) -> dict:
     """Two runs, read from disk and compared on both sides of the coder.
 
     The decoder reading is the one the unprefixed fields carry, and it is the
@@ -384,9 +579,18 @@ def compare_runs(path_a: Path, path_b: Path, close: float = 0.9,
     in competition across the dictionary. Two coders can look for similar
     directions and still fire on different tokens.
 
+    Args:
+        assign: also pair the dictionaries one-to-one, under ``assigned_``
+            names, and split those scores into frequency bands. On by default,
+            since the gap between the two pairings is part of the reading. It
+            is the slow half, so it is the thing to turn off when a sweep of
+            comparisons is only being looked at roughly.
+        bands: how many frequency bands to split the one-to-one scores into.
+
     Returns:
         The similarity fields for the decoder, the same fields prefixed
-        ``encoder_``, and what was loaded from each run.
+        ``encoder_``, the ``assigned_`` fields for both readings when asked
+        for, and what was loaded from each run.
     """
     sides_a = load_sides(path_a, drop_dead)
     sides_b = load_sides(path_b, drop_dead)
@@ -401,6 +605,19 @@ def compare_runs(path_a: Path, path_b: Path, close: float = 0.9,
     for key, value in similarity(encoder_a, encoder_b, close,
                                  keep_distribution).items():
         record[f"encoder_{key}"] = value
+
+    if assign:
+        # Frequencies belong to the features, not to a side, so the same ones
+        # band both readings. Cut down by the mask the dictionary was loaded
+        # under, or they would not line up with the columns that survived.
+        frequencies = load_frequencies(path_a, info_a.get("alive"))
+        for key, value in assigned_similarity(a, b, close, keep_distribution,
+                                              frequencies, bands).items():
+            record[key] = value
+        for key, value in assigned_similarity(encoder_a, encoder_b, close,
+                                              keep_distribution, frequencies,
+                                              bands).items():
+            record[f"encoder_{key}"] = value
 
     record.update({
         "a": str(Path(path_a).name),
@@ -568,7 +785,222 @@ def write_comparison(records: list[dict], summary: dict, path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     trimmed = [{key: value for key, value in record.items()
-                if key not in ("histogram", "encoder_histogram")}
+                if key not in ("histogram", "encoder_histogram",
+                               "assigned_histogram", "encoder_assigned_histogram")}
                for record in records]
     path.write_text(json.dumps({"summary": summary, "pairs": trimmed}, indent=2))
     log.info("wrote %d comparisons to %s", len(records), path)
+
+# ----------------------------------------------------------------------
+# what the figures need
+#
+# The numbers above are what the comparison is for. These are what a picture
+# of it needs, which is not the same thing: a figure showing individual
+# features needs the features themselves, not their average.
+#
+# None of this is written into the comparison file. A feature-by-feature
+# matrix is tens of thousands of numbers for one pair of runs, a comparison of
+# ten runs has forty-five pairs, and the comparison files are kept in version
+# control. So the detail is computed when a figure is drawn and thrown away
+# afterwards, which means the figures that use it can only be drawn while the
+# checkpoints are still on disk. Every other figure, and every number, survives
+# their deletion.
+# ----------------------------------------------------------------------
+
+#: How many features the one-square-per-feature figure draws. Enough to read as
+#: a dictionary rather than a sample, few enough that a square is still a
+#: square on a slide.
+SQUARES = 640
+
+#: How many pairs the ribbon figure draws. A line per feature would be a solid
+#: block of ink; this is a sample spread across the dictionary.
+RIBBONS = 70
+
+#: The side of the square block of the similarity matrix that gets drawn. The
+#: whole matrix at twelve thousand features is both unreadable and far too
+#: large to put in a figure.
+BLOCK = 140
+
+
+def _ranks(frequencies: Tensor | None, count: int) -> Tensor:
+    """Where each feature sits when the dictionary is ordered by firing rate.
+
+    Returned as a fraction of the dictionary, most active at zero, so two
+    dictionaries of different live sizes can be drawn on the same axis.
+
+    Firing rate is used rather than the dictionary's own index order because
+    the index order is arbitrary. Two coders assign their features to slots
+    independently, so a figure drawn against index would show every pairing as
+    a tangle, including a perfect one. Ordering both sides by how heavily a
+    feature is used gives the picture something to say: whether a feature that
+    carried a lot of the work in one dictionary is matched by one that carried
+    a lot of it in the other.
+
+    Args:
+        frequencies: per-feature firing rates, or ``None`` when the run
+            recorded none.
+        count: how many features the dictionary has.
+
+    Returns:
+        ``(count,)`` in ``[0, 1]``. Falls back to index order when there are no
+        frequencies to rank by, which keeps the figure drawable and makes it
+        say less.
+    """
+    span = max(count - 1, 1)
+    if frequencies is None or frequencies.numel() != count:
+        return torch.arange(count, dtype=torch.float32) / span
+
+    order = frequencies.argsort(descending=True)
+    place = torch.empty(count, dtype=torch.float32)
+    place[order] = torch.arange(count, dtype=torch.float32)
+    return place / span
+
+
+def detail(path_a: Path, path_b: Path, side: str = "encoder",
+           drop_dead: bool = True, squares: int = SQUARES,
+           ribbons: int = RIBBONS, block: int = BLOCK) -> dict:
+    """Per-feature material for the figures that draw features individually.
+
+    All three readings come from the same one-to-one pairing as the
+    ``assigned_`` numbers, so a figure and the number beside it are describing
+    the same thing.
+
+    Args:
+        path_a: a run directory or checkpoint.
+        path_b: the run it is compared against.
+        side: which side of the coder. ``encoder`` for anything spanning the
+            two objectives; see :func:`compare_runs` for why the decoder
+            reading has no content there.
+        drop_dead: leave out features that never fired, as the numbers do.
+        squares: how many per-feature scores to return, in dictionary order.
+        ribbons: how many pairs to return.
+        block: the side of the similarity block to return.
+
+    Returns:
+        ``squares``, one matched score per feature in the dictionary's own
+        order; ``pairs``, triples of where the feature sits in its own
+        dictionary by firing rate, where its counterpart sits in the other, and
+        how well they matched; and ``block``, a square piece of the similarity
+        matrix over the most active features, ordered so that the pairing lies
+        on the diagonal.
+    """
+    a, info_a = load_dictionary(path_a, drop_dead, side)
+    b, info_b = load_dictionary(path_b, drop_dead, side)
+    rows, columns, scores = assignment(a, b)
+
+    rank_a = _ranks(load_frequencies(path_a, info_a.get("alive")), a.shape[1])
+    rank_b = _ranks(load_frequencies(path_b, info_b.get("alive")), b.shape[1])
+
+    # Spread across the dictionary rather than taken from the front, so the
+    # sample is of the whole thing and not of whichever features happen to sit
+    # in the first slots.
+    step = max(rows.numel() // max(ribbons, 1), 1)
+    chosen = torch.arange(0, rows.numel(), step)[:ribbons]
+
+    # The block is over the most heavily used features, which is the part of
+    # the dictionary a reader should care whether the two agree about. Taking
+    # the first hundred and forty slots instead would draw an arbitrary corner.
+    active = rank_a[rows].argsort()[:block]
+
+    return {
+        "squares": [float(value) for value in scores[:squares]],
+        "pairs": [[float(rank_a[rows[index]]), float(rank_b[columns[index]]),
+                   float(scores[index])] for index in chosen.tolist()],
+        "block": (a[:, rows[active]].T @ b[:, columns[active]]).tolist(),
+        "features": int(rows.numel()),
+    }
+
+
+def shares(distribution: list[float], floor: float, close: float,
+           centres: list[float] | None = None) -> dict:
+    """A distribution of match scores as three shares rather than a shape.
+
+    For the reader who will not read a density plot. The two cuts are the two
+    numbers the method already has: a feature counts as matched when it clears
+    ``close``, and as unmatched when it does no better than the random floor,
+    which is where a feature that found nothing lands. Between them is the
+    middle, where there is something in common but not the same feature.
+
+    Args:
+        distribution: a histogram as :func:`histogram` records it, as fractions.
+        floor: the random baseline for this pairing and this side.
+        close: the cosine above which two features count as the same.
+        centres: where each bin sits. Defaults to the bins this module records.
+
+    Returns:
+        ``strong``, ``partial`` and ``absent``, summing to the distribution's
+        total.
+
+    Raises:
+        ValueError: if the floor is not below the matched threshold, which
+            would make the three bands overlap.
+    """
+    if not distribution:
+        raise ValueError("an empty distribution has no shares")
+    if floor >= close:
+        raise ValueError(f"floor {floor} is not below the threshold {close}")
+
+    if centres is None:
+        centres = bin_centres(len(distribution))
+
+    strong = partial = absent = 0.0
+    for centre, value in zip(centres, distribution):
+        if centre >= close:
+            strong += value
+        elif centre < floor:
+            absent += value
+        else:
+            partial += value
+    return {"strong": strong, "partial": partial, "absent": absent}
+
+
+def by_kind(records: list[dict], key: str) -> dict[str, list[float]]:
+    """One per-band curve for the seed repeats and one for the comparison.
+
+    Averaged over the pairs of each kind, which is the same averaging the
+    three-number chain does, so the bands and the headline numbers are read off
+    the same set of pairs.
+
+    Args:
+        records: comparison records.
+        key: which per-band field, such as ``encoder_assigned_by_frequency``.
+
+    Returns:
+        ``within`` and ``across``, each a list of per-band means, rarest band
+        first. A kind with no pairs carrying the field is left out.
+    """
+    out: dict[str, list[float]] = {}
+    for name, wanted in (("within", True), ("across", False)):
+        chosen = [record[key] for record in records
+                  if key in record and same_configuration(record) is wanted]
+        if chosen:
+            out[name] = [sum(column) / len(chosen) for column in zip(*chosen)]
+    return out
+
+
+def representatives(pairs: list[tuple[Path, Path]],
+                    records: list[dict]) -> dict[str, tuple[Path, Path]]:
+    """One pair of runs of each kind, for the figures that draw features.
+
+    The numbers average over every pair, because a single pair cannot separate
+    a real difference from seed noise. The per-feature figures cannot average:
+    feature seventeen of one run is not feature seventeen of another, so there
+    is nothing to average over. They show one pair of each kind as an example,
+    and the numbers beside them are what says whether that example is typical.
+
+    The first pair of each kind is taken, which is a run order rather than a
+    choice about which looks better.
+
+    Args:
+        pairs: the run directories compared, in the order they were compared.
+        records: what each comparison produced, in the same order.
+
+    Returns:
+        ``within`` and ``across``, each a pair of run directories. A kind with
+        no pairs is left out.
+    """
+    out: dict[str, tuple[Path, Path]] = {}
+    for (path_a, path_b), record in zip(pairs, records):
+        kind = "within" if same_configuration(record) else "across"
+        out.setdefault(kind, (Path(path_a), Path(path_b)))
+    return out

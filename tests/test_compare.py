@@ -115,6 +115,231 @@ def test_chunking_does_not_change_the_answer():
 
 
 # ----------------------------------------------------------------------
+# the one-to-one pairing
+#
+# Taking each feature's closest counterpart lets several features name the same
+# counterpart. The pairing forbids that, so the two readings differ exactly
+# when the best matches collide, and the gap between them is how much of the
+# best-match score came from crowding.
+# ----------------------------------------------------------------------
+
+def test_a_dictionary_pairs_with_itself_perfectly():
+    from stitch.compare import assigned_similarity
+    a = unit(16, 32)
+    assert assigned_similarity(a, a)["assigned_mean"] == pytest.approx(1.0, abs=1e-5)
+
+
+def test_the_pairing_recovers_a_shuffle():
+    """Nothing fixes which column a feature occupies, so the pairing has to
+    find the permutation rather than be given it."""
+    from stitch.compare import assignment
+    a = unit(16, 32)
+    order = torch.randperm(32, generator=torch.Generator().manual_seed(1))
+    rows, columns, scores = assignment(a, a[:, order])
+
+    assert scores.min() == pytest.approx(1.0, abs=1e-5)
+    assert torch.equal(order[columns], rows)
+
+
+def test_every_counterpart_is_used_once():
+    from stitch.compare import assignment
+    _, columns, _ = assignment(unit(32, 40, seed=0), unit(32, 40, seed=1))
+    assert len(set(columns.tolist())) == 40
+
+
+def test_the_pairing_is_symmetric():
+    """No forward and backward, unlike the best match."""
+    from stitch.compare import assigned_similarity
+    a, b = unit(32, 48, seed=0), unit(32, 48, seed=1)
+    assert (assigned_similarity(a, b)["assigned_mean"]
+            == pytest.approx(assigned_similarity(b, a)["assigned_mean"], abs=1e-5))
+
+
+def test_the_pairing_never_scores_above_the_best_match():
+    """Each feature's best counterpart is an upper bound on the one it is
+    assigned, so the pairing can only be lower."""
+    from stitch.compare import assigned_similarity
+    a, b = unit(32, 64, seed=0), unit(32, 64, seed=1)
+    assert assigned_similarity(a, b)["assigned_mean"] <= similarity(a, b)["mean_a_to_b"]
+
+
+def test_crowding_separates_the_two_readings():
+    """The case the pairing exists for: a dictionary whose features all point
+    at one direction scores well on best match and badly when paired."""
+    from stitch.compare import assigned_similarity
+    target = unit(32, 64, seed=0)
+    crowded = target[:, :1].repeat(1, 64)          # every feature the same one
+
+    assert similarity(crowded, target)["mean_a_to_b"] == pytest.approx(1.0, abs=1e-5)
+    assert assigned_similarity(crowded, target)["assigned_mean"] < 0.5
+
+
+def test_the_pairing_is_as_long_as_the_smaller_dictionary():
+    from stitch.compare import assigned_similarity
+    scores = assigned_similarity(unit(32, 64, seed=0), unit(32, 20, seed=1))
+    assert scores["assigned_pairs"] == 20
+
+
+def test_mismatched_widths_raise_for_the_pairing():
+    from stitch.compare import assignment
+    with pytest.raises(ValueError, match="different widths"):
+        assignment(unit(16, 8), unit(32, 8))
+
+
+def test_an_empty_dictionary_raises_for_the_pairing():
+    from stitch.compare import assignment
+    with pytest.raises(ValueError, match="empty"):
+        assignment(unit(16, 8), torch.zeros(16, 0))
+
+
+# ----------------------------------------------------------------------
+# firing frequency
+#
+# Features that fire often are easier to match than features that fire rarely,
+# so two dictionaries that use their features with different evenness differ in
+# matched score without differing in what they contain. The bands are what
+# tells those two apart.
+# ----------------------------------------------------------------------
+
+def write_frequencies(directory: Path, values: torch.Tensor) -> Path:
+    """The firing rates, as the evaluation leaves them."""
+    import json
+    artifacts = directory / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (artifacts / "feature_frequencies.json").write_text(
+        json.dumps({"frequencies": values.tolist()}))
+    return directory
+
+
+def test_frequencies_are_read_from_the_run(tmp_path):
+    from stitch.compare import load_frequencies
+    run = write_run(tmp_path / "run", unit(8, 6))
+    write_frequencies(run, torch.arange(6, dtype=torch.float32))
+    assert torch.equal(load_frequencies(run), torch.arange(6, dtype=torch.float32))
+
+
+def test_frequencies_are_read_from_a_checkpoint_path(tmp_path):
+    """compare_runs may be given either, so both have to resolve to the run."""
+    from stitch.compare import latest_checkpoint, load_frequencies
+    run = write_run(tmp_path / "run", unit(8, 6))
+    write_frequencies(run, torch.ones(6))
+    assert load_frequencies(latest_checkpoint(run)) is not None
+
+
+def test_a_run_without_frequencies_gives_none(tmp_path):
+    from stitch.compare import load_frequencies
+    run = write_run(tmp_path / "run", unit(8, 6))
+    assert load_frequencies(run) is None
+
+
+def test_frequencies_are_cut_down_to_the_live_features(tmp_path):
+    """They are recorded over the whole dictionary and the comparison drops
+    the dead ones, so they would not line up otherwise."""
+    from stitch.compare import load_dictionary, load_frequencies
+    silence = torch.zeros(6, dtype=torch.long)
+    silence[:2] = 100
+    run = write_run(tmp_path / "run", unit(8, 6), step=100, silence=silence)
+    write_frequencies(run, torch.arange(6, dtype=torch.float32))
+
+    _, info = load_dictionary(run)
+    assert torch.equal(load_frequencies(run, info["alive"]),
+                       torch.tensor([2.0, 3.0, 4.0, 5.0]))
+
+
+def test_bands_split_at_quantiles_so_none_is_empty():
+    from stitch.compare import by_frequency
+    scores = torch.ones(40)
+    # Nearly all of them share one rate, which fixed-width bands would put in
+    # a single band and leave the rest empty.
+    frequencies = torch.cat([torch.full((38,), 0.001), torch.tensor([0.5, 0.9])])
+    assert len(by_frequency(scores, frequencies, bands=4)) == 4
+
+
+def test_bands_run_from_rarest_to_most_frequent():
+    from stitch.compare import by_frequency
+    frequencies = torch.arange(40, dtype=torch.float32)
+    bands = by_frequency(frequencies, frequencies, bands=4)
+    assert bands == sorted(bands)
+
+
+def test_bands_are_absent_without_frequencies():
+    from stitch.compare import by_frequency
+    assert by_frequency(torch.ones(8), None) is None
+
+
+def test_bands_are_absent_when_the_counts_disagree():
+    """A frequency file from a different dictionary size would otherwise be
+    silently zipped against the wrong features."""
+    from stitch.compare import by_frequency
+    assert by_frequency(torch.ones(8), torch.ones(12)) is None
+
+
+def test_a_comparison_carries_the_pairing_and_the_bands(tmp_path):
+    a = write_run(tmp_path / "case1-main-x16-topk-s0-aaaaaa", unit(16, 32, seed=0))
+    b = write_run(tmp_path / "case1-main-x16-topk-s1-bbbbbb", unit(16, 32, seed=1))
+    write_frequencies(a, torch.rand(32))
+
+    record = compare_runs(a, b)
+    assert record["assigned_mean"] <= record["mean_a_to_b"]
+    assert record["encoder_assigned_pairs"] == 32
+    assert len(record["assigned_by_frequency"]) == 4
+    assert len(record["encoder_assigned_by_frequency"]) == 4
+
+
+def test_the_pairing_can_be_skipped(tmp_path):
+    a = write_run(tmp_path / "case1-main-x16-topk-s0-aaaaaa", unit(16, 32, seed=0))
+    b = write_run(tmp_path / "case1-main-x16-topk-s1-bbbbbb", unit(16, 32, seed=1))
+    record = compare_runs(a, b, assign=False)
+    assert "assigned_mean" not in record and "mean" in record
+
+
+def test_a_comparison_without_frequencies_still_pairs(tmp_path):
+    a = write_run(tmp_path / "case1-main-x16-topk-s0-aaaaaa", unit(16, 32, seed=0))
+    b = write_run(tmp_path / "case1-main-x16-topk-s1-bbbbbb", unit(16, 32, seed=1))
+    record = compare_runs(a, b)
+    assert "assigned_mean" in record and "assigned_by_frequency" not in record
+
+
+def test_the_random_floor_can_be_measured_under_the_pairing():
+    """The one-to-one reading needs its own floor: a pairing cannot reuse a
+    counterpart, so random dictionaries score lower under it."""
+    scores = random_baseline(32, 64, trials=1, assign=True)
+    assert scores["assigned_mean"] < scores["mean"]
+
+
+def test_the_random_floor_leaves_the_pairing_out_by_default():
+    assert "assigned_mean" not in random_baseline(32, 64, trials=1)
+
+
+def test_the_pairing_distributions_are_not_written_out(tmp_path):
+    import json
+    a = write_run(tmp_path / "case1-main-x16-topk-s0-aaaaaa", unit(16, 32, seed=0))
+    b = write_run(tmp_path / "case1-main-x16-topk-s1-bbbbbb", unit(16, 32, seed=1))
+    records = [compare_runs(a, b, keep_distribution=True)]
+
+    out = tmp_path / "comparison.json"
+    write_comparison(records, summarise(records), out)
+    written = json.loads(out.read_text())["pairs"][0]
+    assert "assigned_histogram" not in written
+    assert "encoder_assigned_histogram" not in written
+    assert "assigned_mean" in written
+
+
+def test_the_summary_can_be_read_off_the_pairing():
+    records = [
+        {"a": "case1-main-x16-l1-s0-a", "b": "case1-main-x16-l1-s1-b",
+         "assigned_mean": 0.80},
+        {"a": "case1-main-x16-l1-s0-a", "b": "case2-main-x16-l1-s0-c",
+         "assigned_mean": 0.40},
+    ]
+    summary = summarise(records, baseline={"mean": 0.20}, key="assigned_mean",
+                        shape_key="assigned_histogram")
+    assert summary["within"]["mean"] == pytest.approx(0.80)
+    assert summary["across"]["mean"] == pytest.approx(0.40)
+    assert summary["position"] == pytest.approx(1.0 / 3.0)
+
+
+# ----------------------------------------------------------------------
 # the random reference
 # ----------------------------------------------------------------------
 
@@ -610,3 +835,244 @@ def test_a_failed_point_without_a_run_name_is_skipped(tmp_path):
         {"point": {"train.seed": 1}, "error": "RuntimeError: out of memory"},
     ]))
     assert len(from_grids([grid], tmp_path / "runs")) == 1
+
+# ----------------------------------------------------------------------
+# what the figures need
+#
+# The numbers average over every pair. A figure that draws features one at a
+# time cannot: feature seventeen of one run is not feature seventeen of
+# another, so there is nothing to average. These produce the per-feature
+# material for one pair, and the shapes the rest of the figures read.
+# ----------------------------------------------------------------------
+
+def test_ranks_order_by_firing_rate_most_active_first():
+    from stitch.compare import _ranks
+    places = _ranks(torch.tensor([0.1, 0.9, 0.5]), 3)
+    assert places.tolist() == [1.0, 0.0, 0.5]
+
+
+def test_ranks_fall_back_to_index_order_without_frequencies():
+    """A run that died before its evaluation still draws, saying less."""
+    from stitch.compare import _ranks
+    assert _ranks(None, 3).tolist() == [0.0, 0.5, 1.0]
+
+
+def test_ranks_fall_back_when_the_counts_disagree():
+    from stitch.compare import _ranks
+    assert _ranks(torch.tensor([0.1, 0.2]), 3).tolist() == [0.0, 0.5, 1.0]
+
+
+def test_ranks_of_one_feature_do_not_divide_by_zero():
+    from stitch.compare import _ranks
+    assert _ranks(torch.tensor([0.5]), 1).tolist() == [0.0]
+
+
+def test_detail_returns_one_score_per_feature(tmp_path):
+    from stitch.compare import detail
+    a = write_run(tmp_path / "a", unit(16, 24, seed=0))
+    b = write_run(tmp_path / "b", unit(16, 24, seed=1))
+    out = detail(a, b, side="decoder")
+    assert out["features"] == 24
+    assert len(out["squares"]) == 24
+
+
+def test_detail_scores_a_dictionary_against_itself_at_one(tmp_path):
+    from stitch.compare import detail
+    weight = unit(16, 20, seed=0)
+    a = write_run(tmp_path / "a", weight)
+    b = write_run(tmp_path / "b", weight.clone())
+    out = detail(a, b, side="decoder")
+    assert min(out["squares"]) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_detail_puts_the_pairing_on_the_diagonal(tmp_path):
+    """What the matrix figure relies on: the block is ordered so that a pair
+    sits at the same row and column, and a shuffle of one dictionary must not
+    change that."""
+    from stitch.compare import detail
+    weight = unit(16, 20, seed=0)
+    order = torch.randperm(20, generator=torch.Generator().manual_seed(3))
+    a = write_run(tmp_path / "a", weight)
+    b = write_run(tmp_path / "b", weight[:, order].clone())
+
+    block = torch.tensor(detail(a, b, side="decoder", block=20)["block"])
+    assert torch.allclose(block.diagonal(), torch.ones(20), atol=1e-5)
+
+
+def test_detail_caps_what_it_returns(tmp_path):
+    from stitch.compare import detail
+    a = write_run(tmp_path / "a", unit(16, 40, seed=0))
+    b = write_run(tmp_path / "b", unit(16, 40, seed=1))
+    out = detail(a, b, side="decoder", squares=10, ribbons=5, block=6)
+    assert len(out["squares"]) == 10
+    assert len(out["pairs"]) == 5
+    assert len(out["block"]) == 6 and len(out["block"][0]) == 6
+
+
+def test_detail_asks_for_more_than_there_is(tmp_path):
+    """A small dictionary gives what it has rather than raising."""
+    from stitch.compare import detail
+    a = write_run(tmp_path / "a", unit(8, 6, seed=0))
+    b = write_run(tmp_path / "b", unit(8, 6, seed=1))
+    out = detail(a, b, side="decoder", squares=500, ribbons=500, block=500)
+    assert len(out["squares"]) == 6
+    assert len(out["pairs"]) == 6
+    assert len(out["block"]) == 6
+
+
+def test_detail_pairs_carry_positions_and_a_score(tmp_path):
+    from stitch.compare import detail
+    a = write_run(tmp_path / "a", unit(16, 20, seed=0))
+    b = write_run(tmp_path / "b", unit(16, 20, seed=1))
+    for left, right, score in detail(a, b, side="decoder")["pairs"]:
+        assert 0.0 <= left <= 1.0 and 0.0 <= right <= 1.0
+        assert -1.0 <= score <= 1.0
+
+
+def test_detail_places_pairs_by_firing_rate(tmp_path):
+    """The feature that fires most sits at the left-hand end, whatever slot it
+    occupies, because the slot numbering is arbitrary and the figure would
+    otherwise show a perfect pairing as a tangle."""
+    from stitch.compare import detail
+    weight = unit(16, 4, seed=0)
+    a = write_frequencies(write_run(tmp_path / "a", weight),
+                          torch.tensor([0.1, 0.9, 0.2, 0.3]))
+    b = write_frequencies(write_run(tmp_path / "b", weight.clone()),
+                          torch.tensor([0.1, 0.9, 0.2, 0.3]))
+
+    pairs = detail(a, b, side="decoder")["pairs"]
+    assert pairs[1][0] == pytest.approx(0.0)
+    assert pairs[1][1] == pytest.approx(0.0)
+
+
+def test_detail_reads_the_side_it_is_asked_for(tmp_path):
+    """The encoder reading is the only one that means anything across the two
+    objectives, so a figure drawn from the wrong side would be drawn from
+    nothing."""
+    from stitch.compare import detail
+    decoder = unit(16, 12, seed=0)
+    a = write_run(tmp_path / "a", decoder, encoder=unit(12, 16, seed=5))
+    b = write_run(tmp_path / "b", decoder.clone(), encoder=unit(12, 16, seed=6))
+
+    assert min(detail(a, b, side="decoder")["squares"]) == pytest.approx(1.0, abs=1e-5)
+    assert max(detail(a, b, side="encoder")["squares"]) < 0.99
+
+
+# ----------------------------------------------------------------------
+# three shares instead of a shape
+# ----------------------------------------------------------------------
+
+def spike(centre: float, bins: int = 200) -> list[float]:
+    """A distribution with all of its weight in one bin."""
+    out = [0.0] * bins
+    out[min(int((centre + 1.0) / 2.0 * bins), bins - 1)] = 1.0
+    return out
+
+
+def test_everything_above_the_threshold_is_strong():
+    from stitch.compare import shares
+    assert shares(spike(0.95), floor=0.2, close=0.9)["strong"] == pytest.approx(1.0)
+
+
+def test_everything_below_the_floor_is_absent():
+    from stitch.compare import shares
+    assert shares(spike(0.05), floor=0.2, close=0.9)["absent"] == pytest.approx(1.0)
+
+
+def test_between_the_two_is_partial():
+    from stitch.compare import shares
+    assert shares(spike(0.5), floor=0.2, close=0.9)["partial"] == pytest.approx(1.0)
+
+
+def test_the_three_shares_account_for_everything():
+    from stitch.compare import histogram, shares
+    values = torch.linspace(-0.5, 1.0, 400)
+    out = shares(histogram(values), floor=0.2, close=0.9)
+    assert sum(out.values()) == pytest.approx(1.0)
+
+
+def test_an_empty_distribution_raises():
+    from stitch.compare import shares
+    with pytest.raises(ValueError, match="empty distribution"):
+        shares([], floor=0.2, close=0.9)
+
+
+def test_a_floor_above_the_threshold_raises():
+    """The bands would overlap and a feature would be counted twice."""
+    from stitch.compare import shares
+    with pytest.raises(ValueError, match="not below"):
+        shares(spike(0.5), floor=0.95, close=0.9)
+
+
+# ----------------------------------------------------------------------
+# averaging the bands, and choosing what to draw
+# ----------------------------------------------------------------------
+
+def banded(a: str, b: str, values: list[float]) -> dict:
+    """A record carrying per-band means and the groups that place it."""
+    return {"a": a, "b": b, "a_group": a[:-1], "b_group": b[:-1],
+            "encoder_assigned_by_frequency": values}
+
+
+def test_each_kind_gets_its_own_curve():
+    from stitch.compare import by_kind
+    records = [banded("c1s0", "c1s1", [0.7, 0.9]),
+               banded("c1s0", "c2s0", [0.3, 0.5])]
+    out = by_kind(records, "encoder_assigned_by_frequency")
+    assert out["within"] == [0.7, 0.9]
+    assert out["across"] == [0.3, 0.5]
+
+
+def test_the_pairs_of_a_kind_are_averaged():
+    from stitch.compare import by_kind
+    records = [banded("c1s0", "c1s1", [0.6, 0.8]),
+               banded("c1s0", "c1s2", [0.8, 1.0])]
+    assert by_kind(records, "encoder_assigned_by_frequency")["within"] == [0.7, 0.9]
+
+
+def test_a_kind_with_no_pairs_is_left_out():
+    from stitch.compare import by_kind
+    out = by_kind([banded("c1s0", "c1s1", [0.7])], "encoder_assigned_by_frequency")
+    assert "across" not in out
+
+
+def test_records_without_the_bands_are_left_out():
+    from stitch.compare import by_kind
+    records = [banded("c1s0", "c1s1", [0.6]),
+               {"a": "c1s0", "b": "c1s3", "a_group": "c1s", "b_group": "c1s"}]
+    assert by_kind(records, "encoder_assigned_by_frequency")["within"] == [0.6]
+
+
+def test_no_records_give_no_curves():
+    from stitch.compare import by_kind
+    assert by_kind([], "encoder_assigned_by_frequency") == {}
+
+
+def test_one_pair_of_each_kind_is_chosen():
+    from stitch.compare import representatives
+    pairs = [(Path("c1s0"), Path("c1s1")), (Path("c1s0"), Path("c2s0"))]
+    chosen = representatives(pairs, [banded("c1s0", "c1s1", [0.7]),
+                                     banded("c1s0", "c2s0", [0.3])])
+    assert chosen["within"] == (Path("c1s0"), Path("c1s1"))
+    assert chosen["across"] == (Path("c1s0"), Path("c2s0"))
+
+
+def test_the_first_pair_of_a_kind_is_the_one_chosen():
+    """Run order rather than a judgement about which pair looks better."""
+    from stitch.compare import representatives
+    pairs = [(Path("c1s0"), Path("c1s1")), (Path("c1s0"), Path("c1s2"))]
+    chosen = representatives(pairs, [banded("c1s0", "c1s1", [0.7]),
+                                     banded("c1s0", "c1s2", [0.9])])
+    assert chosen["within"] == (Path("c1s0"), Path("c1s1"))
+
+
+def test_a_kind_that_was_never_compared_is_left_out():
+    from stitch.compare import representatives
+    chosen = representatives([(Path("c1s0"), Path("c1s1"))],
+                             [banded("c1s0", "c1s1", [0.7])])
+    assert "across" not in chosen
+
+
+def test_nothing_compared_chooses_nothing():
+    from stitch.compare import representatives
+    assert representatives([], []) == {}

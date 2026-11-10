@@ -506,3 +506,524 @@ def plot_comparison(summary: dict, path: Path, centres: list[float] | None = Non
     plt.close(figure)
     log.info("wrote %s", path)
     return path
+
+# ----------------------------------------------------------------------
+# the same comparison, for different readers
+#
+# plot_comparison above is the whole argument in one frame, which is what a
+# paper wants when it is allowed one figure. The rest of this section is the
+# same small set of quantities taken apart: one figure that shows what a
+# dictionary is before anything is compared, two that show the pairing itself,
+# one that shows the distributions behind the numbers, one that reduces them to
+# shares, one that states the conclusion alone, and one that asks whether the
+# difference is about what was learned or about how much it was used.
+#
+# None of them measure anything. Everything they draw is produced by
+# stitch.compare.
+# ----------------------------------------------------------------------
+
+#: The same wording plot_comparison uses, for the figures that label panels
+#: rather than lines.
+_PANEL_LABELS = {
+    "random": "two untrained dictionaries",
+    "within": "same goal, different starting point",
+    "across": "different goals",
+}
+
+#: Order the stacked rows run in, bottom upwards: floor, comparison, ceiling.
+_PANEL_ORDER = ("random", "across", "within")
+
+#: Order the side-by-side panels run in. The other way round, because a reader
+#: meets a panel on the left before the one on the right, and the comparison
+#: only means something once the ceiling beside it has been seen.
+_PAIR_ORDER = ("within", "across", "random")
+
+#: One sequential map for everything that shades a feature by how well it
+#: matched, so a colour means the same thing in every figure that uses one.
+_MATCH_MAP = "magma"
+
+
+def _figure_out(figure, path: Path) -> Path:
+    """Write a finished figure where it was asked for."""
+    import matplotlib.pyplot as plt
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(figure)
+    log.info("wrote %s", path)
+    return path
+
+
+def plot_feature_squares(scores: dict[str, list[float]], path: Path,
+                         title: str | None = None, columns: int = 40) -> Path:
+    """One square per feature, shaded by how well that feature matched.
+
+    The figure to show first, because it is the only one whose subject is the
+    dictionary rather than the comparison. A reader who has never met a sparse
+    dictionary can see from it that the thing being compared is a few thousand
+    separate parts, and that the question is asked of each part on its own.
+
+    Nothing is sorted. A sorted version reads as a smooth gradient, which is a
+    picture of a distribution; left in the dictionary's own order it reads as
+    individual features, some of which found a counterpart and some of which
+    did not.
+
+    Args:
+        scores: kind to per-feature matched scores, from
+            ``stitch.compare.detail``.
+        path: where the image goes.
+        title: a heading, usually which depth this is.
+        columns: squares per row.
+
+    Returns:
+        The path written.
+
+    Raises:
+        ValueError: if no kind carries any scores.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    kinds = [kind for kind in _PAIR_ORDER if scores.get(kind)]
+    if not kinds:
+        raise ValueError("nothing to plot: no per-feature scores")
+
+    figure, axes = plt.subplots(len(kinds), 1,
+                                figsize=(11, 2.7 * len(kinds) + 0.6),
+                                squeeze=False)
+
+    image = None
+    for axis, kind in zip(axes[:, 0], kinds):
+        values = list(scores[kind])
+        # A dictionary smaller than one row gets a shorter row rather than a
+        # row padded out with squares that stand for no feature.
+        width = min(columns, len(values))
+        rows = max(len(values) // width, 1)
+        grid = np.array(values[:rows * width]).reshape(rows, width)
+
+        image = axis.imshow(grid, cmap=_MATCH_MAP, vmin=0, vmax=1,
+                            interpolation="nearest")
+        # Borders between the cells, so the eye reads discrete features rather
+        # than a surface.
+        axis.set_xticks(np.arange(-0.5, width, 1), minor=True)
+        axis.set_yticks(np.arange(-0.5, rows, 1), minor=True)
+        axis.grid(which="minor", color="white", linewidth=1.1)
+        axis.tick_params(which="minor", length=0)
+        axis.set_title(_PANEL_LABELS[kind], fontsize=11, pad=8)
+        axis.set_xticks([])
+        axis.set_yticks([])
+        for spine in axis.spines.values():
+            spine.set_visible(False)
+
+    figure.colorbar(image, ax=axes, fraction=0.02, pad=0.02,
+                    label="how well this feature matched")
+    figure.suptitle(title or "Every feature in the dictionary, one square each",
+                    fontsize=13)
+    return _figure_out(figure, path)
+
+
+def plot_pairing(pairs: dict[str, list], path: Path,
+                 title: str | None = None) -> Path:
+    """Which feature became which, as a ribbon per pair.
+
+    Both dictionaries are laid out in order of how often their features fire,
+    heaviest on the left, because their own slot numbering is arbitrary and a
+    figure drawn against it would show a perfect pairing as a tangle. A ribbon
+    that runs straight down is a feature that carried the same share of the
+    work in both; one that crosses the figure is a feature that mattered in one
+    dictionary and barely fired in the other. Colour and weight carry how well
+    the two actually matched.
+
+    The two things a reader should take from it are separate: a bright ribbon
+    is a feature the other dictionary also has, and a steep ribbon is a feature
+    the other dictionary uses differently.
+
+    Args:
+        pairs: kind to triples of position in its own dictionary, position of
+            its counterpart in the other, and matched score, from
+            ``stitch.compare.detail``.
+        path: where the image goes.
+        title: a heading, usually which depth this is.
+
+    Returns:
+        The path written.
+
+    Raises:
+        ValueError: if no kind carries any pairs.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import PathPatch, Rectangle
+    from matplotlib.path import Path as MplPath
+
+    kinds = [kind for kind in _PAIR_ORDER if pairs.get(kind)]
+    if not kinds:
+        raise ValueError("nothing to plot: no pairs")
+
+    figure, axes = plt.subplots(1, len(kinds), figsize=(5.8 * len(kinds), 5.2),
+                                squeeze=False)
+    cmap = plt.get_cmap(_MATCH_MAP)
+
+    for axis, kind in zip(axes[0], kinds):
+        rows = sorted(pairs[kind], key=lambda row: row[2])
+        for left, right, score in rows:
+            quality = min(max(float(score), 0.0), 1.0)
+            patch = PathPatch(
+                MplPath([(left, 1.0), (left, 0.62), (right, 0.38), (right, 0.0)],
+                        [MplPath.MOVETO, MplPath.CURVE4, MplPath.CURVE4,
+                         MplPath.CURVE4]),
+                fill=False, linewidth=1.5, alpha=0.25 + 0.65 * quality,
+                color=cmap(0.15 + 0.7 * quality))
+            axis.add_patch(patch)
+
+        axis.add_patch(Rectangle((0.0, 1.0), 1.0, 0.05, color="#2a2a33"))
+        axis.add_patch(Rectangle((0.0, -0.05), 1.0, 0.05, color="#2a2a33"))
+        axis.text(0.5, 1.12, "one dictionary", ha="center", fontsize=10.5)
+        axis.text(0.5, -0.18, "the other", ha="center", fontsize=10.5)
+        axis.set_title(_PANEL_LABELS[kind], fontsize=11, pad=14)
+        axis.set_xlim(-0.03, 1.03)
+        axis.set_ylim(-0.26, 1.2)
+        axis.axis("off")
+
+    figure.suptitle(title or "Which feature became which", fontsize=13, y=1.02)
+    figure.text(0.5, -0.03,
+                "Both dictionaries run from most used on the left to least "
+                "used on the right.\nBright ribbons matched well. Steep ones "
+                "changed how much work they do.",
+                ha="center", fontsize=10, color="#5f6368")
+    return _figure_out(figure, path)
+
+
+def plot_match_matrix(blocks: dict[str, list[list[float]]], path: Path,
+                      title: str | None = None) -> Path:
+    """Every drawn feature against every drawn feature, pairing on the diagonal.
+
+    The ribbons make the claim and this one lets it be checked. The features
+    are ordered so that each pair sits on the diagonal, which means a clean
+    one-to-one correspondence shows as a bright diagonal line and nothing else.
+
+    What it can show that no summary can: a bright band around the diagonal
+    rather than a line is crowding, where several features of one dictionary
+    answer to the same feature of the other. That is a different situation from
+    a weak pairing and the mean score cannot tell them apart.
+
+    Only the most heavily used features are drawn, since the whole matrix is
+    both unreadable at this size and far larger than a figure.
+
+    Args:
+        blocks: kind to a square block of the similarity matrix, from
+            ``stitch.compare.detail``.
+        path: where the image goes.
+        title: a heading, usually which depth this is.
+
+    Returns:
+        The path written.
+
+    Raises:
+        ValueError: if no kind carries a block.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    kinds = [kind for kind in _PAIR_ORDER if blocks.get(kind)]
+    if not kinds:
+        raise ValueError("nothing to plot: no similarity blocks")
+
+    figure, axes = plt.subplots(1, len(kinds), figsize=(5.4 * len(kinds), 5.4),
+                                squeeze=False)
+
+    image = None
+    for axis, kind in zip(axes[0], kinds):
+        image = axis.imshow(blocks[kind], cmap=_MATCH_MAP, vmin=0, vmax=1,
+                            interpolation="nearest")
+        axis.set_title(_PANEL_LABELS[kind], fontsize=11, pad=10)
+        axis.set_xticks([])
+        axis.set_yticks([])
+        for spine in axis.spines.values():
+            spine.set_visible(False)
+
+    figure.colorbar(image, ax=axes, fraction=0.03, pad=0.02, label="similarity")
+    figure.suptitle(title or "Every feature against every feature, "
+                             "ordered by its partner", fontsize=13)
+    figure.text(0.5, 0.02,
+                "A bright diagonal is one feature answering to one feature. "
+                "A bright band is several\nfeatures of one dictionary sharing "
+                "a counterpart in the other.",
+                ha="center", fontsize=10, color="#5f6368")
+    return _figure_out(figure, path)
+
+
+def plot_distributions(summary: dict, path: Path,
+                       centres: list[float] | None = None,
+                       title: str | None = None) -> Path:
+    """The three comparisons as separate distributions, stacked.
+
+    The same three shapes ``plot_comparison`` overlays. Separated they are
+    easier to read one at a time, and a shape a mean cannot report stands out:
+    an across distribution with two humps is a set of features that transferred
+    and a set that did not, which is a different claim from everything
+    transferring halfway.
+
+    Args:
+        summary: output of ``stitch.compare.summarise``, built from records
+            carrying distributions.
+        path: where the image goes.
+        centres: the cosine value each bin sits at. Defaults to the bins
+            ``stitch.compare`` records.
+        title: a heading, usually which depth this is.
+
+    Returns:
+        The path written.
+
+    Raises:
+        ValueError: if the summary carries no distributions.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    shapes = {kind: summary.get(f"{kind}_shape") for kind in _PANEL_ORDER}
+    present = [kind for kind in _PANEL_ORDER if shapes.get(kind)]
+    if not present:
+        raise ValueError("nothing to plot: the summary carries no distributions")
+
+    if centres is None:
+        from stitch.compare import bin_centres
+        centres = bin_centres(len(shapes[present[0]]))
+
+    figure, axis = plt.subplots(figsize=(9, 1.5 * len(present) + 1.8))
+
+    for position, kind in enumerate(present):
+        shape = shapes[kind]
+        peak = max(shape) or 1.0
+        height = [position + 0.85 * value / peak for value in shape]
+        axis.fill_between(centres, position, height,
+                          color=_COMPARISON_COLOURS[kind], alpha=0.85,
+                          linewidth=0)
+        axis.plot(centres, height, color="white", linewidth=1.4)
+        axis.text(-0.12, position + 0.12, _PANEL_LABELS[kind], ha="right",
+                  fontsize=10.5)
+
+    axis.set_xlim(-0.1, 1.0)
+    axis.set_ylim(-0.1, len(present))
+    axis.set_yticks([])
+    axis.set_xlabel("how closely each feature is matched in the other dictionary\n"
+                    "(1.0 is the same feature, 0.0 is nothing in common)")
+    for side in ("left", "right", "top"):
+        axis.spines[side].set_visible(False)
+    axis.set_title(title or "Where the three comparisons sit", fontsize=13,
+                   pad=14)
+    return _figure_out(figure, path)
+
+
+def plot_match_shares(shares: dict[str, dict], path: Path,
+                      title: str | None = None) -> Path:
+    """The distributions reduced to how much of the dictionary matched.
+
+    For a reader who will not read a density plot. The two cuts are the two
+    numbers the method already has: a feature counts as matched when it clears
+    the threshold, and as unmatched when it does no better than two untrained
+    dictionaries, which is where a feature that found nothing lands.
+
+    Args:
+        shares: kind to ``strong``, ``partial`` and ``absent``, from
+            ``stitch.compare.shares``.
+        path: where the image goes.
+        title: a heading, usually which depth this is.
+
+    Returns:
+        The path written.
+
+    Raises:
+        ValueError: if no kind carries shares.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    kinds = [kind for kind in _PANEL_ORDER if shares.get(kind)]
+    if not kinds:
+        raise ValueError("nothing to plot: no shares")
+
+    bands = (("strong", "the same feature", "#2a6f97"),
+             ("partial", "something in common", "#e8a33d"),
+             ("absent", "no counterpart", "#b9b9c3"))
+
+    figure, axis = plt.subplots(figsize=(9.5, 1.1 * len(kinds) + 2.0))
+
+    for position, kind in enumerate(kinds):
+        y = len(kinds) - 1 - position
+        left = 0.0
+        for name, _, colour in bands:
+            width = float(shares[kind].get(name, 0.0))
+            axis.add_patch(Rectangle((left, y - 0.3), width, 0.6, color=colour))
+            if width > 0.08:
+                axis.text(left + width / 2, y, f"{width:.0%}", ha="center",
+                          va="center", fontsize=10.5,
+                          color="white" if colour != "#b9b9c3" else "#1b1b1f")
+            left += width
+        axis.text(-0.015, y, _PANEL_LABELS[kind], ha="right", va="center",
+                  fontsize=10.5)
+
+    handles = [Rectangle((0, 0), 1, 1, color=colour) for _, _, colour in bands]
+    axis.legend(handles, [label for _, label, _ in bands], frameon=False,
+                ncol=3, loc="upper center", bbox_to_anchor=(0.5, -0.02),
+                fontsize=10)
+
+    axis.set_xlim(0, 1)
+    axis.set_ylim(-0.7, len(kinds) - 0.3)
+    axis.set_xticks([])
+    axis.set_yticks([])
+    for spine in axis.spines.values():
+        spine.set_visible(False)
+    axis.set_title(title or "How much of one dictionary is in the other",
+                   fontsize=13, pad=14)
+    return _figure_out(figure, path)
+
+
+def plot_position(summary: dict, path: Path, title: str | None = None) -> Path:
+    """The conclusion on its own, with nothing else in the frame.
+
+    The lower panel of ``plot_comparison``, pulled out large. A similarity of
+    0.6 means nothing by itself; what it means is where it falls between two
+    dictionaries that learned nothing and two runs of the same objective. That
+    is one sentence and this is the figure to stop on while saying it.
+
+    Args:
+        summary: output of ``stitch.compare.summarise``.
+        path: where the image goes.
+        title: a heading, usually which depth this is.
+
+    Returns:
+        The path written.
+
+    Raises:
+        ValueError: if the summary has no floor, ceiling and measurement to
+            place, which means there were not enough runs of each kind.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    floor = summary.get("random")
+    ceiling = (summary.get("within") or {}).get("mean")
+    measured = (summary.get("across") or {}).get("mean")
+    if floor is None or ceiling is None or measured is None:
+        raise ValueError("nothing to plot: no measurement to place")
+
+    figure, axis = plt.subplots(figsize=(9.5, 2.8))
+
+    axis.plot([floor, ceiling], [0, 0], color="#c7ccd1", linewidth=10,
+              solid_capstyle="round", zorder=1)
+    axis.scatter([floor], [0], s=150, color=_COMPARISON_COLOURS["random"],
+                 zorder=2)
+    axis.scatter([ceiling], [0], s=150, color=_COMPARISON_COLOURS["within"],
+                 zorder=2)
+    axis.scatter([measured], [0], s=320, marker="D",
+                 color=_COMPARISON_COLOURS["across"], zorder=3)
+
+    span = max(ceiling - floor, 1e-9)
+    axis.annotate("nothing in common", (floor, 0), xytext=(0, -30),
+                  textcoords="offset points", ha="center", fontsize=10,
+                  color="#5f6368")
+    axis.annotate("as alike as two runs\nof the same goal", (ceiling, 0),
+                  xytext=(0, -38), textcoords="offset points", ha="center",
+                  fontsize=10, color="#5f6368")
+    axis.annotate(f"different goals: {(measured - floor) / span:.0%} of the way",
+                  (measured, 0), xytext=(0, 24), textcoords="offset points",
+                  ha="center", fontsize=12, fontweight="bold",
+                  color=_COMPARISON_COLOURS["across"])
+
+    pad = span * 0.2
+    axis.set_xlim(floor - pad, ceiling + pad)
+    axis.set_ylim(-0.8, 0.8)
+    axis.set_xticks([])
+    axis.set_yticks([])
+    for spine in axis.spines.values():
+        spine.set_visible(False)
+    if title:
+        axis.set_title(title, fontsize=13, pad=16)
+    return _figure_out(figure, path)
+
+
+def plot_frequency_bands(bands: dict[str, list[float]], path: Path,
+                         title: str | None = None) -> Path:
+    """The gap between the two readings, split by how often a feature fires.
+
+    Rare features are harder to match for an ordinary reason: a direction
+    estimated from few tokens is estimated badly. So a gap that only appears
+    among the rare features is a statement about how heavily each dictionary
+    was used, and a gap that stays open across every band is a statement about
+    what was learned. The figure exists to keep those two apart, which is why
+    the gap itself is shaded rather than left for the reader to measure.
+
+    Args:
+        bands: ``within`` and ``across``, each a list of per-band means with
+            the rarest band first, from ``stitch.compare.by_kind``.
+        path: where the image goes.
+        title: a heading, usually which depth this is.
+
+    Returns:
+        The path written.
+
+    Raises:
+        ValueError: if neither kind carries any bands.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    present = {kind: list(values) for kind, values in bands.items()
+               if kind in ("within", "across") and values}
+    if not present:
+        raise ValueError("nothing to plot: no frequency bands")
+
+    count = min(len(values) for values in present.values())
+    positions = list(range(count))
+
+    figure, axis = plt.subplots(figsize=(9.5, 4.8))
+
+    if len(present) == 2:
+        axis.fill_between(positions, present["across"][:count],
+                          present["within"][:count], color="#f0d9dc",
+                          alpha=0.8, zorder=1)
+        for position in positions:
+            axis.annotate("", xy=(position, present["within"][position]),
+                          xytext=(position, present["across"][position]),
+                          arrowprops=dict(arrowstyle="<->", color="#8a5f63",
+                                          linewidth=1.2), zorder=2)
+
+    for kind in ("within", "across"):
+        if kind in present:
+            axis.plot(positions, present[kind][:count], "-o",
+                      color=_COMPARISON_COLOURS[kind], linewidth=3,
+                      markersize=10, zorder=3, label=_PANEL_LABELS[kind])
+
+    labels = [""] * count
+    if count:
+        labels[0] = "rarest"
+        labels[-1] = "most frequent"
+    axis.set_xticks(positions)
+    axis.set_xticklabels(labels)
+    axis.set_ylim(0, 1.02)
+    axis.set_xlabel("features grouped by how often they fire")
+    axis.set_ylabel("how well features matched")
+    axis.legend(frameon=False, loc="lower right", fontsize=10)
+    axis.grid(axis="y", alpha=0.25)
+    axis.set_axisbelow(True)
+    for side in ("top", "right"):
+        axis.spines[side].set_visible(False)
+    axis.set_title(title or "The gap, split by how often a feature fires",
+                   fontsize=13, pad=14)
+    figure.text(0.5, -0.03,
+                "A gap open in every band is a difference in what was learned. "
+                "A gap only on the left\nis a difference in how heavily the "
+                "dictionary was used.",
+                ha="center", fontsize=10, color="#5f6368")
+    return _figure_out(figure, path)

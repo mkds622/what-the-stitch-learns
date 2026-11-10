@@ -435,3 +435,215 @@ def test_the_figure_draws_without_a_measurement_to_place(tmp_path):
     summary = comparison_summary(across={"n": 0})
     summary.pop("across_shape")
     assert plot_comparison(summary, tmp_path / "c.png").exists()
+
+# ----------------------------------------------------------------------
+# the rest of the comparison figures
+#
+# Drawing is checked for producing a file and for refusing to draw an empty
+# one, since asserting about pixels tests nothing. What is worth testing is
+# that a figure says no rather than writing a blank image, because a blank
+# image downstream reads as a drawing bug rather than as missing data.
+# ----------------------------------------------------------------------
+
+def per_feature(count=120, high=True):
+    """Matched scores of roughly the shape one kind of comparison gives."""
+    step = 1.0 / count
+    base = 0.6 if high else 0.2
+    return [base + step * index * 0.4 for index in range(count)]
+
+
+def pair_rows(count=40, score=0.8):
+    """Triples of where a feature sits, where its partner sits, and the score."""
+    return [[index / count, ((index * 7) % count) / count, score]
+            for index in range(count)]
+
+
+def block(size=12, strength=0.9):
+    """A similarity block with its pairing on the diagonal."""
+    return [[strength if row == column else 0.2 for column in range(size)]
+            for row in range(size)]
+
+
+def test_the_squares_figure_is_written(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_feature_squares
+    path = plot_feature_squares({"within": per_feature(),
+                                 "across": per_feature(high=False)},
+                                tmp_path / "figures" / "dictionary.png")
+    assert path.exists() and path.stat().st_size > 0
+
+
+def test_the_squares_figure_draws_one_kind(tmp_path):
+    """Seed repeats alone, before there is anything to compare them to."""
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_feature_squares
+    assert plot_feature_squares({"within": per_feature()},
+                                tmp_path / "one.png").exists()
+
+
+def test_the_squares_figure_handles_fewer_features_than_a_row(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_feature_squares
+    assert plot_feature_squares({"within": [0.5, 0.6, 0.7]},
+                                tmp_path / "short.png").exists()
+
+
+def test_squares_without_scores_raise(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_feature_squares
+    with pytest.raises(ValueError, match="nothing to plot"):
+        plot_feature_squares({"within": [], "across": []}, tmp_path / "s.png")
+
+
+def test_the_pairing_figure_is_written(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_pairing
+    path = plot_pairing({"within": pair_rows(), "across": pair_rows(score=0.4)},
+                        tmp_path / "figures" / "pairing.png", title="block 12")
+    assert path.exists() and path.stat().st_size > 0
+
+
+def test_the_pairing_figure_takes_scores_outside_the_colour_range(tmp_path):
+    """A cosine can be negative, and a colour map cannot be indexed below zero."""
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_pairing
+    assert plot_pairing({"across": [[0.1, 0.9, -0.4], [0.5, 0.2, 1.0]]},
+                        tmp_path / "signed.png").exists()
+
+
+def test_a_pairing_without_pairs_raises(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_pairing
+    with pytest.raises(ValueError, match="nothing to plot"):
+        plot_pairing({"within": []}, tmp_path / "p.png")
+
+
+def test_the_matrix_figure_is_written(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_match_matrix
+    path = plot_match_matrix({"within": block(), "across": block(strength=0.5)},
+                             tmp_path / "figures" / "matrix.png")
+    assert path.exists() and path.stat().st_size > 0
+
+
+def test_a_matrix_figure_without_blocks_raises(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_match_matrix
+    with pytest.raises(ValueError, match="nothing to plot"):
+        plot_match_matrix({}, tmp_path / "m.png")
+
+
+def test_the_distributions_figure_is_written(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_distributions
+    path = plot_distributions(comparison_summary(),
+                              tmp_path / "figures" / "distributions.png",
+                              title="block 12")
+    assert path.exists() and path.stat().st_size > 0
+
+
+def test_the_distributions_figure_draws_what_it_has(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_distributions
+    summary = comparison_summary()
+    summary.pop("across_shape")
+    assert plot_distributions(summary, tmp_path / "part.png").exists()
+
+
+def test_a_flat_distribution_does_not_divide_by_zero(tmp_path):
+    """A histogram of a dictionary with nothing in it is all zeros, and the
+    rows are scaled by their own peak."""
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_distributions
+    assert plot_distributions(comparison_summary(within_shape=[0.0] * 20),
+                              tmp_path / "flat.png").exists()
+
+
+def test_distributions_without_shapes_raise(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_distributions
+    with pytest.raises(ValueError, match="no distributions"):
+        plot_distributions({"random": 0.1}, tmp_path / "d.png")
+
+
+def test_the_shares_figure_is_written(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_match_shares
+    path = plot_match_shares(
+        {"within": {"strong": 0.78, "partial": 0.17, "absent": 0.05},
+         "across": {"strong": 0.34, "partial": 0.29, "absent": 0.37}},
+        tmp_path / "figures" / "shares.png")
+    assert path.exists() and path.stat().st_size > 0
+
+
+def test_the_shares_figure_omits_a_band_it_was_not_given(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_match_shares
+    assert plot_match_shares({"across": {"strong": 0.4}},
+                             tmp_path / "partial.png").exists()
+
+
+def test_shares_without_kinds_raise(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_match_shares
+    with pytest.raises(ValueError, match="nothing to plot"):
+        plot_match_shares({}, tmp_path / "s.png")
+
+
+def test_the_position_figure_is_written(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_position
+    path = plot_position(comparison_summary(),
+                         tmp_path / "figures" / "position.png", title="block 12")
+    assert path.exists() and path.stat().st_size > 0
+
+
+def test_a_position_without_a_ceiling_raises(tmp_path):
+    """Without seed repeats there is no scale to place the measurement on, and
+    a figure drawn anyway would be a number presented as a conclusion."""
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_position
+    summary = comparison_summary()
+    summary.pop("within")
+    with pytest.raises(ValueError, match="no measurement to place"):
+        plot_position(summary, tmp_path / "p.png")
+
+
+def test_a_floor_and_a_ceiling_that_agree_do_not_divide_by_zero(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_position
+    summary = comparison_summary(random=0.5, within={"n": 2, "mean": 0.5},
+                                 across={"n": 2, "mean": 0.5})
+    assert plot_position(summary, tmp_path / "flat.png").exists()
+
+
+def test_the_bands_figure_is_written(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_frequency_bands
+    path = plot_frequency_bands({"within": [0.74, 0.82, 0.88, 0.93],
+                                 "across": [0.31, 0.44, 0.56, 0.68]},
+                                tmp_path / "figures" / "bands.png")
+    assert path.exists() and path.stat().st_size > 0
+
+
+def test_the_bands_figure_draws_one_kind(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_frequency_bands
+    assert plot_frequency_bands({"within": [0.7, 0.8]},
+                                tmp_path / "one.png").exists()
+
+
+def test_bands_of_different_lengths_are_cut_to_the_shorter(tmp_path):
+    """Two comparisons split into different numbers of bands would otherwise
+    be drawn against each other on an axis neither of them is on."""
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_frequency_bands
+    assert plot_frequency_bands({"within": [0.7, 0.8, 0.9], "across": [0.3, 0.4]},
+                                tmp_path / "ragged.png").exists()
+
+
+def test_bands_without_curves_raise(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_frequency_bands
+    with pytest.raises(ValueError, match="nothing to plot"):
+        plot_frequency_bands({"within": []}, tmp_path / "b.png")
