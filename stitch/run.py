@@ -30,7 +30,8 @@ from stitch.activations import build_source
 from stitch.coder import build_coder
 from stitch.config import load_config
 from stitch.data import build_loader, build_transform, build_dataset
-from stitch.evaluate import evaluate, feature_frequencies, substitution_accuracy
+from stitch.evaluate import (evaluate, feature_frequencies,
+                             silent_at_wider_window, substitution_accuracy)
 from stitch.labels import label_map_for
 from stitch.models import parse_layer_key, trace
 from stitch.reduced_rank import baseline_from_moments, map_from_moments
@@ -356,6 +357,14 @@ def run(cfg, resume: Path | None = None) -> dict:
     train_dead = {"train_dead": tracker.dead_fraction}
     logger.log_metrics(train_dead, step=int(final.get("tokens", 0)))
 
+    # The same silent share read over a much wider window, so the pair of
+    # numbers shows that the first is a statement about the evaluation window
+    # rather than about the dictionary. Reported and nothing more: the gate,
+    # the frequencies below and everything downstream keep the narrow window.
+    wider = silent_at_wider_window(coder, evaluation.batches(), source_key,
+                                   cfg.eval.wider_tokens, cfg.train.device)
+    logger.log_metrics(wider, step=int(final.get("tokens", 0)))
+
     # What a fixed basis of the same size per token reaches here, so the
     # dictionary is read against something rather than against nothing.
     baseline = resolve_baseline(cfg, source_key, target_key, held_out["eval_l0"])
@@ -387,7 +396,8 @@ def run(cfg, resume: Path | None = None) -> dict:
         logger.log_metrics(substitution, step=int(final.get("tokens", 0)))
 
     summary = {"hash": config_hash, "run_name": name, "scales": scales,
-               **final, **held_out, **train_dead, **baseline, **substitution}
+               **final, **held_out, **train_dead, **wider, **baseline,
+               **substitution}
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     logger.end_run()
 

@@ -349,10 +349,19 @@ class EvalConfig:
     the window can see. The evaluation reads one number of tokens and cannot
     separate the two. Only the training tracker knows which features never
     fired at all, over its own ``coder.dead_features.track_window``.
+
+    ``wider_tokens`` is a second reading of that same share, over a window
+    large enough to catch features the first one misses. It exists to qualify
+    the first number rather than to replace it: the gate still reads the narrow
+    window, the feature frequencies are still measured over the narrow window,
+    and nothing downstream consumes the wider figure. Reporting the pair is
+    what shows that "silent" means "rare on this evaluation set" and not
+    "unused".
     """
 
     batches: int = 50
     images: int = 5000
+    wider_tokens: int = 2_000_000     # tokens in the second silent-share pass
     linear_fit: float = 1.0           # explained variance of the linear stitch here
     fit_fraction: float = 0.8         # share of that fit the coder must reach
     min_l0: float = 1.0
@@ -435,6 +444,9 @@ class Config:
 
         if self.eval.batches < 1:
             raise ValueError("eval.batches must be at least 1")
+
+        if self.eval.wider_tokens < 1:
+            raise ValueError("eval.wider_tokens must be at least 1")
 
         if not 0 < self.eval.max_l0_frac <= 1:
             raise ValueError(

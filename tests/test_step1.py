@@ -253,6 +253,41 @@ def test_the_silent_threshold_is_settable_by_override():
 
 
 # ----------------------------------------------------------------------
+# the second window the silent share is read at
+#
+# The share is defined relative to whatever window measured it, so the number
+# alone cannot separate a feature that never fired from one too rare for the
+# window to see. A second, wider reading is what makes that visible, and it is
+# a setting rather than a constant so that a run's own record says which window
+# produced which number.
+# ----------------------------------------------------------------------
+
+def test_the_wider_window_has_a_default():
+    assert Config().eval.wider_tokens == 2_000_000
+
+
+def test_the_wider_window_is_settable_by_override():
+    cfg = load_config(None, ["eval.wider_tokens=500000"])
+    assert cfg.eval.wider_tokens == 500_000
+
+
+def test_a_wider_window_of_no_tokens_is_refused():
+    """A pass reading nothing would report every feature silent."""
+    cfg = Config()
+    cfg.eval.wider_tokens = 0
+    with pytest.raises(ValueError, match="wider_tokens"):
+        cfg.validate()
+
+
+def test_the_wider_window_is_part_of_the_run_identity():
+    """It changes what a run measures, so two runs reading different windows
+    are not the same configuration and must not share a hash."""
+    a, b = Config(), Config()
+    b.eval.wider_tokens = 500_000
+    assert a.hash() != b.hash()
+
+
+# ----------------------------------------------------------------------
 # logging
 # ----------------------------------------------------------------------
 

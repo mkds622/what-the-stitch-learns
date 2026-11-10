@@ -25,7 +25,7 @@ from stitch.coder import SparseCoder                                    # noqa: 
 from stitch.config import Config                                        # noqa: E402
 from stitch.evaluate import (                                           # noqa: E402
     check_gates, evaluate, feature_frequencies, frequency_concentration,
-    reconstruction_metrics, substitution_accuracy,
+    reconstruction_metrics, silent_at_wider_window, substitution_accuracy,
 )
 from stitch.sweep import LinearStitch                                   # noqa: E402
 
@@ -104,6 +104,7 @@ def cfg():
     c.eval.max_l0_frac = 0.25
     c.eval.max_allowed_silent = 0.5
     c.eval.max_feature_frequency = 0.9
+    c.eval.wider_tokens = 2000
     return c
 
 
@@ -370,6 +371,118 @@ def test_frequencies_are_shares_of_tokens():
     frequencies = feature_frequencies(PerfectCoder(active=2), stream(), KEY, count=4)
     assert frequencies[:2].tolist() == [1.0, 1.0]
     assert frequencies[2:].sum() == 0.0
+
+
+# ----------------------------------------------------------------------
+# the same number at a wider window
+#
+# A fixed evaluation window defines "silent" relative to itself, so the number
+# on its own cannot tell a feature that never fired from one too rare for the
+# window to catch. These pin the second reading, and the one below about the
+# rare feature is the whole reason it exists.
+# ----------------------------------------------------------------------
+
+class RareCoder(PerfectCoder):
+    """Feature zero fires on every token, feature one on one in ``period``.
+
+    Deterministic by position rather than by chance, so the narrow window
+    provably never sees the rare feature and a wider one provably does. The
+    first fire is at position ``period - 1``, so a window shorter than that
+    misses it entirely.
+    """
+
+    def __init__(self, period=1000, **kwargs):
+        super().__init__(**kwargs)
+        self.period = period
+        self.seen = 0
+
+    def encode(self, x):
+        count = x.shape[0]
+        latents = torch.zeros(count, self.d_latent, device=x.device)
+        latents[:, 0] = 1.0
+        positions = torch.arange(self.seen, self.seen + count)
+        latents[(positions % self.period) == self.period - 1, 1] = 1.0
+        self.seen += count
+        return latents
+
+
+def test_the_wider_window_reports_a_share_and_its_window():
+    result = silent_at_wider_window(PerfectCoder(active=1), stream(batches=8),
+                                    KEY, tokens=2 * TOKENS)
+    assert result["eval_dead_or_dormant_wider"] == pytest.approx(31 / 32)
+    assert result["eval_wider_tokens"] == 2 * TOKENS
+
+
+def test_the_wider_window_stops_at_its_token_count():
+    """The stream may be endless, so the token count is what ends the pass."""
+    result = silent_at_wider_window(PerfectCoder(), stream(batches=99), KEY,
+                                    tokens=3 * TOKENS)
+    assert result["eval_wider_tokens"] == 3 * TOKENS
+
+
+def test_a_stream_shorter_than_the_request_is_used_in_full():
+    """And says so, which is what the recorded count is for: the number would
+    otherwise claim a window it never read."""
+    result = silent_at_wider_window(PerfectCoder(), stream(batches=2), KEY,
+                                    tokens=10_000_000)
+    assert result["eval_wider_tokens"] == 2 * TOKENS
+
+
+def test_the_wider_window_stops_on_a_partial_batch():
+    """A token count that falls inside a batch takes the whole batch and
+    records the larger number rather than claiming the smaller one."""
+    result = silent_at_wider_window(PerfectCoder(), stream(batches=8), KEY,
+                                    tokens=TOKENS + 1)
+    assert result["eval_wider_tokens"] == 2 * TOKENS
+
+
+def test_an_empty_stream_raises_for_the_wider_window():
+    with pytest.raises(ValueError, match="no batches"):
+        silent_at_wider_window(PerfectCoder(), iter([]), KEY, tokens=1000)
+
+
+def test_a_rare_feature_is_silent_at_the_narrow_window_and_alive_at_the_wider():
+    """The point of the second reading, as one comparison.
+
+    One feature firing once in a thousand tokens. The narrow window reads 256
+    tokens and never sees it, so it counts among the silent. The wider window
+    reads enough to catch it, and the same feature counts among the live.
+    """
+    narrow = reconstruction_metrics(RareCoder(), stream(batches=4), KEY, KEY, count=4)
+    assert narrow["eval_tokens"] == 4 * TOKENS
+    assert narrow["eval_dead_or_dormant"] == pytest.approx(31 / 32)
+
+    wider = silent_at_wider_window(RareCoder(), stream(batches=40), KEY,
+                                   tokens=2000)
+    assert wider["eval_wider_tokens"] >= 1000
+    assert wider["eval_dead_or_dormant_wider"] == pytest.approx(30 / 32)
+
+
+def test_the_wider_window_never_reports_more_silence_than_the_narrow_one():
+    """More tokens can only ever wake features up, never put them to sleep."""
+    narrow = reconstruction_metrics(RareCoder(), stream(batches=4), KEY, KEY, count=4)
+    wider = silent_at_wider_window(RareCoder(), stream(batches=40), KEY, tokens=2000)
+    assert (wider["eval_dead_or_dormant_wider"]
+            <= narrow["eval_dead_or_dormant"] + 1e-9)
+
+
+def test_the_wider_window_leaves_the_gate_alone(cfg):
+    """It is reported and nothing reads it. The gate keeps the narrow number,
+    so a run cannot pass or fail on a window it was not judged at."""
+    metrics = evaluate(RareCoder(), stream(batches=4), KEY, KEY, cfg)
+    metrics.update(silent_at_wider_window(RareCoder(), stream(batches=40), KEY,
+                                          tokens=2000))
+    gates = check_gates(metrics, cfg, WIDTH)
+    assert gates["features_alive"] is False
+
+
+def test_the_window_comes_from_the_configuration(cfg):
+    """The size is a setting rather than a constant, so a run's own record says
+    which window its number was measured at."""
+    cfg.eval.wider_tokens = 3 * TOKENS
+    result = silent_at_wider_window(PerfectCoder(), stream(batches=99), KEY,
+                                    cfg.eval.wider_tokens)
+    assert result["eval_wider_tokens"] == 3 * TOKENS
 
 
 # ----------------------------------------------------------------------

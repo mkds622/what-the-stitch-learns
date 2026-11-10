@@ -259,6 +259,70 @@ def feature_frequencies(coder: SparseCoder, batches: Iterator[dict[str, Tensor]]
 
 
 # ----------------------------------------------------------------------
+# what the window is doing to the number
+# ----------------------------------------------------------------------
+
+@torch.no_grad()
+def silent_at_wider_window(coder: SparseCoder, batches: Iterator[dict[str, Tensor]],
+                           source_key: str, tokens: int,
+                           device: torch.device | str = "cpu") -> dict[str, float]:
+    """``eval_dead_or_dormant`` again, over a window roughly ten times wider.
+
+    The number it exists to qualify is not a property of the dictionary. Any
+    fixed window defines "silent" relative to itself: a feature firing once per
+    ten million tokens is alive across a training run and absent from any
+    evaluation short enough to be affordable. There is no window-free
+    definition, so the honest form of the number is two of them at two scales.
+
+    This changes nothing else. The validity gate still reads the narrow
+    window's number, ``feature_frequencies`` is still measured over the narrow
+    window, and no result from this pass feeds the dictionary comparison. It is
+    reported so that a reader can see that "silent" means "rare on this
+    evaluation set" rather than "unused".
+
+    Args:
+        coder: the trained coder.
+        batches: an activation stream over the evaluation split.
+        source_key: layer the coder reads.
+        tokens: how many to read before stopping, from ``eval.wider_tokens``.
+            Required rather than defaulted, so the window a number was measured
+            at always comes from the configuration the run recorded and never
+            from a constant that could change underneath it.
+        device: where to run.
+
+    Returns:
+        ``eval_dead_or_dormant_wider``, the share of features that fired on
+        none of those tokens, and ``eval_wider_tokens``, how many were
+        actually read. The second is not decoration: a stream shorter than the
+        request is used in full, and without the count the first number would
+        carry no record of the window that produced it, which is the failure
+        this pair exists to prevent.
+
+    Raises:
+        ValueError: if the stream produced nothing.
+    """
+    device = torch.device(device)
+    coder = coder.to(device).eval()
+
+    fired = torch.zeros(coder.d_latent, device=device)
+    seen = 0
+    for batch in batches:
+        if seen >= tokens:
+            break
+        latents = coder.encode(batch[source_key].to(device))
+        fired += (latents > 0).float().sum(dim=0)
+        seen += latents.shape[0]
+
+    if seen == 0:
+        raise ValueError("the activation stream produced no batches")
+
+    return {
+        "eval_dead_or_dormant_wider": float((fired == 0).float().mean()),
+        "eval_wider_tokens": float(seen),
+    }
+
+
+# ----------------------------------------------------------------------
 # substitution
 # ----------------------------------------------------------------------
 

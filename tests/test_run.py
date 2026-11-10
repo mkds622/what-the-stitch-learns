@@ -375,6 +375,7 @@ def test_a_tiny_run_produces_a_summary(cfg, tmp_path):
     cfg.dataset.num_workers = 0
     cfg.eval.batches = 1
     cfg.eval.images = 4
+    cfg.eval.wider_tokens = 128
 
     summary = run(cfg)
 
@@ -387,6 +388,8 @@ def test_a_tiny_run_produces_a_summary(cfg, tmp_path):
     assert run_dir.name.endswith(summary["hash"][:6])
 
     for key in ("mse", "eval_explained_variance", "gate_passed",
+                "eval_dead_or_dormant", "eval_dead_or_dormant_wider",
+                "eval_wider_tokens",
                 "plain_top1", "substituted_top1", "agreement"):
         assert key in summary
 
@@ -411,6 +414,7 @@ def test_the_scales_are_recorded(cfg, tmp_path):
     cfg.dataset.num_workers = 0
     cfg.eval.batches = 1
     cfg.eval.images = 4
+    cfg.eval.wider_tokens = 128
 
     summary = run(cfg)
     assert set(summary["scales"]) == set(cfg.activations.layers)
