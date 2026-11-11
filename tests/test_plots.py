@@ -403,7 +403,10 @@ def comparison_summary(**overrides):
     bins = 20
     summary = {
         "random": 0.19,
-        "within": {"n": 10, "mean": 0.72, "std": 0.01, "min": 0.70, "max": 0.74},
+        "within": {"case1": {"n": 10, "mean": 0.72, "std": 0.01,
+                             "min": 0.70, "max": 0.74, "position": 0.49},
+                   "case2": {"n": 10, "mean": 0.80, "std": 0.01,
+                             "min": 0.78, "max": 0.82, "position": 0.43}},
         "across": {"n": 25, "mean": 0.45, "std": 0.02, "min": 0.42, "max": 0.48},
         "random_shape": [1.0 / bins] * bins,
         "within_shape": [1.0 / bins] * bins,
@@ -609,11 +612,38 @@ def test_a_position_without_a_ceiling_raises(tmp_path):
         plot_position(summary, tmp_path / "p.png")
 
 
+def test_a_ceiling_is_drawn_for_each_objective(tmp_path):
+    """Two objectives do not agree on how alike their own seeds are, so there
+    is a ceiling each and the measurement sits at a fraction of each."""
+    pytest.importorskip("matplotlib")
+    from stitch.plots import ceilings_of, plot_position
+    summary = comparison_summary()
+    assert [name for name, _, _ in ceilings_of(summary)] == ["case1", "case2"]
+    assert plot_position(summary, tmp_path / "two.png").exists()
+
+
+def test_a_summary_with_one_objective_draws_one_ceiling(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import ceilings_of, plot_position
+    summary = comparison_summary()
+    summary["within"] = {"case1": summary["within"]["case1"]}
+    assert len(ceilings_of(summary)) == 1
+    assert plot_position(summary, tmp_path / "one.png").exists()
+
+
+def test_an_objective_with_no_seed_pairs_is_not_a_ceiling():
+    from stitch.plots import ceilings_of
+    assert ceilings_of({"within": {"case1": {"n": 0}}}) == []
+    assert ceilings_of({"within": {}}) == []
+    assert ceilings_of({}) == []
+
+
 def test_a_floor_and_a_ceiling_that_agree_do_not_divide_by_zero(tmp_path):
     pytest.importorskip("matplotlib")
     from stitch.plots import plot_position
-    summary = comparison_summary(random=0.5, within={"n": 2, "mean": 0.5},
-                                 across={"n": 2, "mean": 0.5})
+    summary = comparison_summary(
+        random=0.5, across={"n": 2, "mean": 0.5},
+        within={"case1": {"n": 2, "mean": 0.5}})
     assert plot_position(summary, tmp_path / "flat.png").exists()
 
 
@@ -647,6 +677,50 @@ def test_bands_without_curves_raise(tmp_path):
     from stitch.plots import plot_frequency_bands
     with pytest.raises(ValueError, match="nothing to plot"):
         plot_frequency_bands({"within": []}, tmp_path / "b.png")
+
+
+def test_the_bands_figure_draws_every_objective(tmp_path, monkeypatch):
+    """The names come from the runs. A figure that only knows the words
+    "within" and "across" drops both ceilings and still writes a file, which
+    is how a line goes missing without anything raising."""
+    pytest.importorskip("matplotlib")
+    import matplotlib
+    matplotlib.use("Agg")
+    from stitch import plots
+
+    drawn: list[str] = []
+    written = plots._figure_out
+
+    def keep(figure, path):
+        drawn.extend(line.get_label() for axis in figure.axes
+                     for line in axis.get_lines())
+        return written(figure, path)
+
+    monkeypatch.setattr(plots, "_figure_out", keep)
+
+    bands = {"case1-main-x4-topk": [0.74, 0.82, 0.88, 0.93],
+             "case2-main-x4-topk": [0.64, 0.72, 0.78, 0.83],
+             "across": [0.31, 0.44, 0.56, 0.68]}
+    plots.plot_frequency_bands(bands, tmp_path / "bands.png")
+
+    for name in bands:
+        assert plots._label(name) in drawn, f"{name} was not drawn"
+
+
+def test_the_distributions_figure_keeps_each_objective_apart(tmp_path):
+    """One row per objective, so no row is an average of two of them."""
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_distributions, shapes_of
+
+    bins = 20
+    summary = {"random_shape": [1.0 / bins] * bins,
+               "across_shape": [1.0 / bins] * bins,
+               "case1-main-x4-topk_shape": [1.0 / bins] * bins,
+               "case2-main-x4-topk_shape": [1.0 / bins] * bins}
+    assert set(shapes_of(summary)) == {"random", "across",
+                                       "case1-main-x4-topk",
+                                       "case2-main-x4-topk"}
+    assert plot_distributions(summary, tmp_path / "rows.png").exists()
 
 # ----------------------------------------------------------------------
 # the depth as an axis
@@ -747,3 +821,63 @@ def test_a_depth_curve_is_written(tmp_path):
     path = plot_curve(series(records, "depth", "eval_l0"),
                       "eval_l0", "depth", tmp_path / "by_depth.png", log_x=False)
     assert path.exists() and path.stat().st_size > 0
+
+
+# ----------------------------------------------------------------------
+# a panel per objective
+#
+# The per-feature figures used to draw one seed pair and one comparison. The
+# seed pair was always the same objective, because the runs are sorted and
+# the first one met was kept, so the other objective's ceiling was never
+# drawn. These pin that every objective handed over gets a panel.
+# ----------------------------------------------------------------------
+
+def test_every_objective_handed_over_gets_a_panel(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_feature_squares
+    path = plot_feature_squares({"case1": per_feature(),
+                                 "case2": per_feature(),
+                                 "across": per_feature(high=False)},
+                                tmp_path / "three.png")
+    assert path.exists() and path.stat().st_size > 0
+
+
+def test_the_ceilings_are_drawn_before_the_comparison():
+    """A reader meets a panel on the left first, and the comparison only
+    means something once the ceilings beside it have been seen."""
+    from stitch.plots import _panels
+    assert _panels({"across": [1], "case2": [1], "case1": [1]}) == [
+        "case1", "case2", "across"]
+
+
+def test_the_known_kinds_keep_their_order():
+    from stitch.plots import _panels
+    assert _panels({"random": [1], "across": [1], "within": [1]}) == [
+        "within", "across", "random"]
+
+
+def test_an_empty_panel_is_not_drawn():
+    from stitch.plots import _panels
+    assert _panels({"case1": [], "across": [1]}) == ["across"]
+
+
+def test_an_objective_panel_is_labelled_with_its_name():
+    from stitch.plots import _label
+    assert _label("case1-main-x16-topk") == "two runs of case1-main-x16-topk"
+    assert _label("across") == "different goals"
+
+
+def test_the_pairing_figure_takes_a_panel_per_objective(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_pairing
+    assert plot_pairing({"case1": pair_rows(), "case2": pair_rows(score=0.6),
+                         "across": pair_rows(score=0.3)},
+                        tmp_path / "three_pairs.png").exists()
+
+
+def test_the_matrix_figure_takes_a_panel_per_objective(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_match_matrix
+    assert plot_match_matrix({"case1": block(), "case2": block(strength=0.7),
+                              "across": block(strength=0.4)},
+                             tmp_path / "three_blocks.png").exists()

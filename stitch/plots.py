@@ -443,6 +443,30 @@ _COMPARISON_COLOURS = {
 }
 
 
+def ceilings_of(summary: dict) -> list[tuple[str, float, float | None]]:
+    """Each objective's ceiling and where the measurement falls against it.
+
+    There is one ceiling per objective rather than one overall, because how
+    alike two dictionaries are when nothing about the task changed is a
+    property of that objective. Two objectives need not agree on it, and here
+    they do not.
+
+    Returns:
+        ``(name, mean, position)`` per objective, lowest ceiling first. The
+        position is None when it could not be worked out. Empty when the
+        summary carries no seed repeats.
+    """
+    within = summary.get("within")
+    if not isinstance(within, dict):
+        return []
+
+    out = []
+    for name, entry in within.items():
+        if isinstance(entry, dict) and entry.get("n"):
+            out.append((name, entry["mean"], entry.get("position")))
+    return sorted(out, key=lambda row: row[1])
+
+
 def plot_comparison(summary: dict, path: Path, centres: list[float] | None = None,
                     title: str | None = None) -> Path:
     """What two dictionaries have in common, drawn for someone who has not
@@ -473,31 +497,26 @@ def plot_comparison(summary: dict, path: Path, centres: list[float] | None = Non
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    shapes = {name: summary.get(f"{name}_shape")
-              for name in ("random", "within", "across")}
-    if not any(shapes.values()):
+    shapes = shapes_of(summary)
+    if not shapes:
         raise ValueError("nothing to plot: the summary carries no distributions")
+
+    order = _panels(shapes)
+    colours = _colours(order)
 
     if centres is None:
         from stitch.compare import bin_centres
-        centres = bin_centres(len(next(shape for shape in shapes.values() if shape)))
+        centres = bin_centres(len(shapes[order[0]]))
 
     figure, (top, bottom) = plt.subplots(
         2, 1, figsize=(7.5, 6), height_ratios=[4, 1],
         gridspec_kw={"hspace": 0.45})
 
-    labels = {
-        "random": "two untrained dictionaries",
-        "within": "same goal, different starting point",
-        "across": "different goals",
-    }
-    for name in ("random", "within", "across"):
-        shape = shapes.get(name)
-        if not shape:
-            continue
-        colour = _COMPARISON_COLOURS[name]
+    for name in order:
+        shape = shapes[name]
+        colour = colours[name]
         top.fill_between(centres, shape, alpha=0.35, color=colour)
-        top.plot(centres, shape, color=colour, linewidth=2, label=labels[name])
+        top.plot(centres, shape, color=colour, linewidth=2, label=_label(name))
 
     top.set_xlabel("how closely each feature is matched in the other dictionary\n"
                    "(1.0 is the same feature, 0.0 is nothing in common)")
@@ -509,33 +528,40 @@ def plot_comparison(summary: dict, path: Path, centres: list[float] | None = Non
     if title:
         top.set_title(title, fontsize=12)
 
-    # The line from floor to ceiling, with the measurement on it.
+    # The line from the floor to each objective's ceiling, with the
+    # measurement on it. One ceiling per objective, since they differ.
     floor = summary.get("random")
-    ceiling = (summary.get("within") or {}).get("mean")
+    ceilings = ceilings_of(summary)
     measured = (summary.get("across") or {}).get("mean")
 
-    if floor is not None and ceiling is not None and measured is not None:
-        bottom.plot([floor, ceiling], [0, 0], color="#c7ccd1", linewidth=8,
+    if floor is not None and ceilings and measured is not None:
+        highest = ceilings[-1][1]
+        bottom.plot([floor, highest], [0, 0], color="#c7ccd1", linewidth=8,
                     solid_capstyle="round", zorder=1)
         bottom.scatter([floor], [0], s=120, color=_COMPARISON_COLOURS["random"], zorder=2)
-        bottom.scatter([ceiling], [0], s=120, color=_COMPARISON_COLOURS["within"], zorder=2)
+        for _, ceiling, _ in ceilings:
+            bottom.scatter([ceiling], [0], s=120,
+                           color=_COMPARISON_COLOURS["within"], zorder=2)
         bottom.scatter([measured], [0], s=260, marker="D",
                        color=_COMPARISON_COLOURS["across"], zorder=3)
 
-        span = max(ceiling - floor, 1e-9)
+        span = max(highest - floor, 1e-9)
         bottom.annotate("nothing in common", (floor, 0), xytext=(0, -26),
                         textcoords="offset points", ha="center", fontsize=9,
                         color="#5f6368")
-        bottom.annotate("as alike as two runs\nof the same goal", (ceiling, 0),
+        bottom.annotate("as alike as two runs\nof the same goal", (highest, 0),
                         xytext=(0, -34), textcoords="offset points", ha="center",
                         fontsize=9, color="#5f6368")
-        bottom.annotate(f"measured: {(measured - floor) / span:.0%} of the way",
+
+        places = "  ".join(f"{position:.0%}" for _, _, position in ceilings
+                           if position is not None)
+        bottom.annotate(f"measured: {places} of the way",
                         (measured, 0), xytext=(0, 20), textcoords="offset points",
                         ha="center", fontsize=11, fontweight="bold",
                         color=_COMPARISON_COLOURS["across"])
 
         pad = span * 0.18
-        bottom.set_xlim(floor - pad, ceiling + pad)
+        bottom.set_xlim(floor - pad, highest + pad)
     else:
         bottom.text(0.5, 0.5, "not enough runs to place the measurement",
                     ha="center", va="center", fontsize=10, color="#5f6368")
@@ -579,13 +605,78 @@ _PANEL_LABELS = {
     "across": "different goals",
 }
 
-#: Order the stacked rows run in, bottom upwards: floor, comparison, ceiling.
-_PANEL_ORDER = ("random", "across", "within")
-
 #: Order the side-by-side panels run in. The other way round, because a reader
 #: meets a panel on the left before the one on the right, and the comparison
-#: only means something once the ceiling beside it has been seen.
+#: only means something once the ceilings beside it have been seen.
 _PAIR_ORDER = ("within", "across", "random")
+
+
+def _panels(given: dict) -> list[str]:
+    """The panels to draw, left to right, from whatever was handed over.
+
+    There is a seed pair per objective rather than one, so the panels are not
+    a fixed set of three. The known kinds keep their order and anything else,
+    which is an objective's own seed pair named after it, is drawn first and
+    alphabetically, so every ceiling appears before the comparison it is the
+    reference for.
+    """
+    present = [kind for kind in given if given.get(kind)]
+    known = [kind for kind in _PAIR_ORDER if kind in present]
+    other = sorted(kind for kind in present if kind not in _PAIR_ORDER)
+    return other + known
+
+
+def _label(kind: str) -> str:
+    """What a panel is called. An objective's own name where it has one."""
+    return _PANEL_LABELS.get(kind, f"two runs of {kind}")
+
+
+#: Shades for the objectives' own curves. They are variations of the ceiling
+#: colour, not new colours, because every one of them is a ceiling and should
+#: read as one beside the floor and the comparison. Cycled, so any number of
+#: objectives can be drawn.
+_CEILING_SHADES = ("#3b78c3", "#7fb0e4", "#1d4e86", "#a9cbee")
+
+
+def _stack(given: dict) -> list[str]:
+    """The rows of a stacked figure, bottom upwards.
+
+    The floor sits at the bottom and the comparison above it, which is the
+    order a reader builds the claim in. Each objective's own ceiling goes on
+    top, alphabetically, however many there are.
+    """
+    present = [kind for kind in given if given.get(kind)]
+    low = [kind for kind in ("random", "across") if kind in present]
+    return low + sorted(kind for kind in present if kind not in ("random", "across"))
+
+
+def _colours(order: list[str]) -> dict[str, str]:
+    """A colour per kind, with the fixed three keeping theirs.
+
+    Anything else is an objective, and takes the next ceiling shade, so two
+    objectives are told apart without either being mistaken for the floor or
+    for the comparison.
+    """
+    out, shade = {}, 0
+    for kind in order:
+        if kind in _COMPARISON_COLOURS:
+            out[kind] = _COMPARISON_COLOURS[kind]
+        else:
+            out[kind] = _CEILING_SHADES[shade % len(_CEILING_SHADES)]
+            shade += 1
+    return out
+
+
+def shapes_of(summary: dict) -> dict[str, list[float]]:
+    """Every match distribution a summary carries, keyed the way panels are.
+
+    The summary writes one distribution per objective plus ``across`` and
+    ``random``, each under its own name with ``_shape`` appended. Reading them
+    back by suffix keeps the figures free of any fixed list of kinds, which is
+    what let an objective's curve be dropped without anything raising.
+    """
+    return {key[: -len("_shape")]: value for key, value in summary.items()
+            if key.endswith("_shape") and value}
 
 #: One sequential map for everything that shades a feature by how well it
 #: matched, so a colour means the same thing in every figure that uses one.
@@ -636,7 +727,7 @@ def plot_feature_squares(scores: dict[str, list[float]], path: Path,
     import matplotlib.pyplot as plt
     import numpy as np
 
-    kinds = [kind for kind in _PAIR_ORDER if scores.get(kind)]
+    kinds = _panels(scores)
     if not kinds:
         raise ValueError("nothing to plot: no per-feature scores")
 
@@ -661,7 +752,7 @@ def plot_feature_squares(scores: dict[str, list[float]], path: Path,
         axis.set_yticks(np.arange(-0.5, rows, 1), minor=True)
         axis.grid(which="minor", color="white", linewidth=1.1)
         axis.tick_params(which="minor", length=0)
-        axis.set_title(_PANEL_LABELS[kind], fontsize=11, pad=8)
+        axis.set_title(_label(kind), fontsize=11, pad=8)
         axis.set_xticks([])
         axis.set_yticks([])
         for spine in axis.spines.values():
@@ -709,7 +800,7 @@ def plot_pairing(pairs: dict[str, list], path: Path,
     from matplotlib.patches import PathPatch, Rectangle
     from matplotlib.path import Path as MplPath
 
-    kinds = [kind for kind in _PAIR_ORDER if pairs.get(kind)]
+    kinds = _panels(pairs)
     if not kinds:
         raise ValueError("nothing to plot: no pairs")
 
@@ -733,7 +824,7 @@ def plot_pairing(pairs: dict[str, list], path: Path,
         axis.add_patch(Rectangle((0.0, -0.05), 1.0, 0.05, color="#2a2a33"))
         axis.text(0.5, 1.12, "one dictionary", ha="center", fontsize=10.5)
         axis.text(0.5, -0.18, "the other", ha="center", fontsize=10.5)
-        axis.set_title(_PANEL_LABELS[kind], fontsize=11, pad=14)
+        axis.set_title(_label(kind), fontsize=11, pad=14)
         axis.set_xlim(-0.03, 1.03)
         axis.set_ylim(-0.26, 1.2)
         axis.axis("off")
@@ -779,7 +870,7 @@ def plot_match_matrix(blocks: dict[str, list[list[float]]], path: Path,
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    kinds = [kind for kind in _PAIR_ORDER if blocks.get(kind)]
+    kinds = _panels(blocks)
     if not kinds:
         raise ValueError("nothing to plot: no similarity blocks")
 
@@ -790,7 +881,7 @@ def plot_match_matrix(blocks: dict[str, list[list[float]]], path: Path,
     for axis, kind in zip(axes[0], kinds):
         image = axis.imshow(blocks[kind], cmap=_MATCH_MAP, vmin=0, vmax=1,
                             interpolation="nearest")
-        axis.set_title(_PANEL_LABELS[kind], fontsize=11, pad=10)
+        axis.set_title(_label(kind), fontsize=11, pad=10)
         axis.set_xticks([])
         axis.set_yticks([])
         for spine in axis.spines.values():
@@ -836,10 +927,12 @@ def plot_distributions(summary: dict, path: Path,
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    shapes = {kind: summary.get(f"{kind}_shape") for kind in _PANEL_ORDER}
-    present = [kind for kind in _PANEL_ORDER if shapes.get(kind)]
+    shapes = shapes_of(summary)
+    present = _stack(shapes)
     if not present:
         raise ValueError("nothing to plot: the summary carries no distributions")
+
+    colours = _colours(present)
 
     if centres is None:
         from stitch.compare import bin_centres
@@ -852,10 +945,10 @@ def plot_distributions(summary: dict, path: Path,
         peak = max(shape) or 1.0
         height = [position + 0.85 * value / peak for value in shape]
         axis.fill_between(centres, position, height,
-                          color=_COMPARISON_COLOURS[kind], alpha=0.85,
+                          color=colours[kind], alpha=0.85,
                           linewidth=0)
         axis.plot(centres, height, color="white", linewidth=1.4)
-        axis.text(-0.12, position + 0.12, _PANEL_LABELS[kind], ha="right",
+        axis.text(-0.12, position + 0.12, _label(kind), ha="right",
                   fontsize=10.5)
 
     axis.set_xlim(-0.1, 1.0)
@@ -865,7 +958,7 @@ def plot_distributions(summary: dict, path: Path,
                     "(1.0 is the same feature, 0.0 is nothing in common)")
     for side in ("left", "right", "top"):
         axis.spines[side].set_visible(False)
-    axis.set_title(title or "Where the three comparisons sit", fontsize=13,
+    axis.set_title(title or "Where the comparisons sit", fontsize=13,
                    pad=14)
     return _figure_out(figure, path)
 
@@ -896,7 +989,7 @@ def plot_match_shares(shares: dict[str, dict], path: Path,
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
 
-    kinds = [kind for kind in _PANEL_ORDER if shares.get(kind)]
+    kinds = _stack(shares)
     if not kinds:
         raise ValueError("nothing to plot: no shares")
 
@@ -917,7 +1010,7 @@ def plot_match_shares(shares: dict[str, dict], path: Path,
                           va="center", fontsize=10.5,
                           color="white" if colour != "#b9b9c3" else "#1b1b1f")
             left += width
-        axis.text(-0.015, y, _PANEL_LABELS[kind], ha="right", va="center",
+        axis.text(-0.015, y, _label(kind), ha="right", va="center",
                   fontsize=10.5)
 
     handles = [Rectangle((0, 0), 1, 1, color=colour) for _, _, colour in bands]
@@ -961,37 +1054,47 @@ def plot_position(summary: dict, path: Path, title: str | None = None) -> Path:
     import matplotlib.pyplot as plt
 
     floor = summary.get("random")
-    ceiling = (summary.get("within") or {}).get("mean")
+    ceilings = ceilings_of(summary)
     measured = (summary.get("across") or {}).get("mean")
-    if floor is None or ceiling is None or measured is None:
+    if floor is None or not ceilings or measured is None:
         raise ValueError("nothing to plot: no measurement to place")
 
-    figure, axis = plt.subplots(figsize=(9.5, 2.8))
+    figure, axis = plt.subplots(figsize=(9.5, 3.2))
 
-    axis.plot([floor, ceiling], [0, 0], color="#c7ccd1", linewidth=10,
+    highest = ceilings[-1][1]
+    axis.plot([floor, highest], [0, 0], color="#c7ccd1", linewidth=10,
               solid_capstyle="round", zorder=1)
     axis.scatter([floor], [0], s=150, color=_COMPARISON_COLOURS["random"],
                  zorder=2)
-    axis.scatter([ceiling], [0], s=150, color=_COMPARISON_COLOURS["within"],
-                 zorder=2)
+    axis.scatter([ceiling for _, ceiling, _ in ceilings],
+                 [0] * len(ceilings), s=150,
+                 color=_COMPARISON_COLOURS["within"], zorder=2)
     axis.scatter([measured], [0], s=320, marker="D",
                  color=_COMPARISON_COLOURS["across"], zorder=3)
 
-    span = max(ceiling - floor, 1e-9)
+    span = max(highest - floor, 1e-9)
     axis.annotate("nothing in common", (floor, 0), xytext=(0, -30),
                   textcoords="offset points", ha="center", fontsize=10,
                   color="#5f6368")
-    axis.annotate("as alike as two runs\nof the same goal", (ceiling, 0),
-                  xytext=(0, -38), textcoords="offset points", ha="center",
-                  fontsize=10, color="#5f6368")
-    axis.annotate(f"different goals: {(measured - floor) / span:.0%} of the way",
+
+    # One ceiling per objective, each labelled, because they differ and the
+    # measurement sits at a different fraction of each.
+    for index, (name, ceiling, _) in enumerate(ceilings):
+        axis.annotate(f"two runs of\n{name}", (ceiling, 0),
+                      xytext=(0, -38 - 26 * index), textcoords="offset points",
+                      ha="center", fontsize=10, color="#5f6368")
+
+    places = ", ".join(f"{position:.0%} of {name}"
+                       for name, _, position in ceilings
+                       if position is not None)
+    axis.annotate(f"different goals: {places}",
                   (measured, 0), xytext=(0, 24), textcoords="offset points",
                   ha="center", fontsize=12, fontweight="bold",
                   color=_COMPARISON_COLOURS["across"])
 
     pad = span * 0.2
-    axis.set_xlim(floor - pad, ceiling + pad)
-    axis.set_ylim(-0.8, 0.8)
+    axis.set_xlim(floor - pad, highest + pad)
+    axis.set_ylim(-1.0, 0.8)
     axis.set_xticks([])
     axis.set_yticks([])
     for spine in axis.spines.values():
@@ -1013,8 +1116,10 @@ def plot_frequency_bands(bands: dict[str, list[float]], path: Path,
     the gap itself is shaded rather than left for the reader to measure.
 
     Args:
-        bands: ``within`` and ``across``, each a list of per-band means with
-            the rarest band first, from ``stitch.compare.by_kind``.
+        bands: one entry per objective plus ``across``, each a list of
+            per-band means with the rarest band first, from
+            ``stitch.compare.by_kind``. Whatever names the runs carry are
+            drawn, so an objective is never dropped for not being on a list.
         path: where the image goes.
         title: a heading, usually which depth this is.
 
@@ -1028,31 +1133,40 @@ def plot_frequency_bands(bands: dict[str, list[float]], path: Path,
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    present = {kind: list(values) for kind, values in bands.items()
-               if kind in ("within", "across") and values}
+    present = {kind: list(values) for kind, values in bands.items() if values}
     if not present:
         raise ValueError("nothing to plot: no frequency bands")
+
+    # Every kind that is not the comparison is an objective's own ceiling.
+    # Named rather than listed, because the names come from the runs and a
+    # fixed list silently drops whatever it does not recognise.
+    ceilings = sorted(kind for kind in present if kind != "across")
+    colours = _colours(["across"] + ceilings)
 
     count = min(len(values) for values in present.values())
     positions = list(range(count))
 
     figure, axis = plt.subplots(figsize=(9.5, 4.8))
 
-    if len(present) == 2:
+    # The gap is shaded only where there is one ceiling to measure it against.
+    # With two objectives on the axes a single shaded band would be the gap to
+    # neither of them, which is the pooling this figure exists to avoid, so
+    # the curves are left to be read against each other.
+    if "across" in present and len(ceilings) == 1:
+        ceiling = present[ceilings[0]]
         axis.fill_between(positions, present["across"][:count],
-                          present["within"][:count], color="#f0d9dc",
+                          ceiling[:count], color="#f0d9dc",
                           alpha=0.8, zorder=1)
         for position in positions:
-            axis.annotate("", xy=(position, present["within"][position]),
+            axis.annotate("", xy=(position, ceiling[position]),
                           xytext=(position, present["across"][position]),
                           arrowprops=dict(arrowstyle="<->", color="#8a5f63",
                                           linewidth=1.2), zorder=2)
 
-    for kind in ("within", "across"):
-        if kind in present:
-            axis.plot(positions, present[kind][:count], "-o",
-                      color=_COMPARISON_COLOURS[kind], linewidth=3,
-                      markersize=10, zorder=3, label=_PANEL_LABELS[kind])
+    for kind in ceilings + (["across"] if "across" in present else []):
+        axis.plot(positions, present[kind][:count], "-o",
+                  color=colours[kind], linewidth=3,
+                  markersize=10, zorder=3, label=_label(kind))
 
     labels = [""] * count
     if count:

@@ -795,23 +795,40 @@ def group_of(run: str | Path) -> str:
 
 def pooled_shapes(records: list[dict],
                   shape_key: str = "histogram") -> dict[str, list[float]]:
-    """The average match distribution for seed repeats and for the comparison.
+    """The average match distribution for each objective, and for the comparison.
+
+    Keyed by objective, matching the ceilings in :func:`summarise` and the
+    bands in :func:`by_kind`. A seed pair's distribution is a property of the
+    objective it came from, and two objectives need not agree on it, so
+    averaging both into one curve draws a shape neither of them has and buries
+    the distance between them inside what looks like seed noise. The
+    comparison's own pairs stay together under ``across``, which is the one
+    place pairs from different objectives belong in the same average.
 
     Averaged over pairs rather than concatenated, so that a configuration with
     more surviving features does not weigh more heavily than one with fewer.
+
+    Args:
+        records: output of ``compare_runs``, one per pair.
+        shape_key: which distribution to average, which moves with the reading
+            being summarised.
+
+    Returns:
+        One entry per objective plus ``across_shape``, each key being the name
+        with ``_shape`` appended, so a reader finds a distribution under the
+        same name its ceiling carries.
     """
-    groups: dict[str, list[list[float]]] = {"within_shape": [], "across_shape": []}
+    groups: dict[str, list[list[float]]] = {}
     for record in records:
         if shape_key not in record:
             continue
-        key = "within_shape" if same_configuration(record) else "across_shape"
-        groups[key].append(record[shape_key])
+        name = (group_of(record["a"]) if same_configuration(record)
+                else "across")
+        groups.setdefault(name, []).append(record[shape_key])
 
-    out = {}
-    for key, shapes in groups.items():
-        if shapes:
-            out[key] = [sum(column) / len(shapes) for column in zip(*shapes)]
-    return out
+    return {f"{name}_shape": [sum(column) / len(shapes)
+                              for column in zip(*shapes)]
+            for name, shapes in sorted(groups.items()) if shapes}
 
 
 def summarise(records: list[dict], baseline: dict | None = None,
@@ -830,13 +847,40 @@ def summarise(records: list[dict], baseline: dict | None = None,
             this is what keeps a chain from being assembled out of two.
         shape_key: the matching distribution field, which moves with ``key``.
 
+    There is a ceiling per objective, not one ceiling. How alike two
+    dictionaries are when nothing about the task changed is a property of one
+    objective, and the two do not have to agree on it. Pooling their seed pairs
+    produces a mean neither objective has, and reports the distance between
+    them as though it were seed noise. So the seed pairs are split by which
+    objective they came from, and the across number is placed against each
+    ceiling separately.
+
     Returns:
-        Mean and spread of each kind, and where ``across`` falls between
-        ``random`` and ``within`` as a fraction, where 1 means
-        indistinguishable from a seed repeat and 0 means no better than random.
+        ``across``, and one entry per objective under ``within``, each with a
+        mean, a spread and where ``across`` falls between ``random`` and that
+        objective's ceiling. A fraction of 1 means indistinguishable from a
+        seed repeat of that objective and 0 means no better than random.
     """
-    within = [r[key] for r in records if same_configuration(r)]
-    across = [r[key] for r in records if not same_configuration(r)]
+    across = [r[key] for r in records
+              if not same_configuration(r) and key in r]
+
+    # A seed pair belongs to one objective, and the groups of its two runs are
+    # the same group precisely because it is a seed pair. Bucketed by the
+    # group the runs recorded, which is what decides a seed repeat, and
+    # labelled by their name, which is what a reader can act on. The recorded
+    # group is a hash, so it would make an unreadable label; two different
+    # groups sharing a name keep the hash to stay apart.
+    grouped: dict[str, tuple[str, list[float]]] = {}
+    for record in records:
+        if not (same_configuration(record) and key in record):
+            continue
+        group = str(record.get("a_group", group_of(record["a"])))
+        label, values = grouped.setdefault(group, (group_of(record["a"]), []))
+        values.append(record[key])
+
+    names = [label for label, _ in grouped.values()]
+    within = {(label if names.count(label) == 1 else f"{label} ({group})"): values
+              for group, (label, values) in grouped.items()}
 
     def stats(values: list[float]) -> dict:
         if not values:
@@ -846,7 +890,9 @@ def summarise(records: list[dict], baseline: dict | None = None,
         return {"n": len(values), "mean": mean, "std": spread,
                 "min": min(values), "max": max(values)}
 
-    out = {"within": stats(within), "across": stats(across)}
+    out = {"within": {name: stats(values)
+                      for name, values in sorted(within.items())},
+           "across": stats(across)}
     out.update(pooled_shapes(records, shape_key))
     if baseline is not None:
         out["random"] = baseline["mean"]
@@ -855,9 +901,10 @@ def summarise(records: list[dict], baseline: dict | None = None,
 
     if within and across and baseline is not None:
         floor = baseline["mean"]
-        ceiling = out["within"]["mean"]
-        if ceiling > floor:
-            out["position"] = (out["across"]["mean"] - floor) / (ceiling - floor)
+        for name, ceiling in out["within"].items():
+            if ceiling.get("n") and ceiling["mean"] > floor:
+                ceiling["position"] = (
+                    (out["across"]["mean"] - floor) / (ceiling["mean"] - floor))
 
     return out
 
@@ -1057,27 +1104,40 @@ def shares(distribution: list[float], floor: float, close: float,
 
 
 def by_kind(records: list[dict], key: str) -> dict[str, list[float]]:
-    """One per-band curve for the seed repeats and one for the comparison.
+    """One per-band curve per objective's seed repeats, and one for the
+    comparison.
 
-    Averaged over the pairs of each kind, which is the same averaging the
-    three-number chain does, so the bands and the headline numbers are read off
-    the same set of pairs.
+    The bands are the features of the side being scored, split into equal
+    groups by how often they fire. Which features those are, and therefore
+    which firing rates set the groups, is a property of that side. So a case 1
+    seed pair groups by a case 1 run and a case 2 seed pair by a case 2 run,
+    and averaging the two into one row builds a row out of two different
+    groupings.
+
+    Split by objective instead, which is what the ceilings do. The across row
+    scores the features of whichever objective sorts first, so it is the row
+    beside that objective's that reads as a gap. The other objective's row is
+    its own statement about its own features rather than half of a comparison.
 
     Args:
         records: comparison records.
         key: which per-band field, such as ``encoder_assigned_by_frequency``.
 
     Returns:
-        ``within`` and ``across``, each a list of per-band means, rarest band
-        first. A kind with no pairs carrying the field is left out.
+        One entry per objective, named after it, plus ``across``. Each is a
+        list of per-band means, rarest band first. A kind with no pairs
+        carrying the field is left out.
     """
-    out: dict[str, list[float]] = {}
-    for name, wanted in (("within", True), ("across", False)):
-        chosen = [record[key] for record in records
-                  if key in record and same_configuration(record) is wanted]
-        if chosen:
-            out[name] = [sum(column) / len(chosen) for column in zip(*chosen)]
-    return out
+    grouped: dict[str, list[list[float]]] = {}
+    for record in records:
+        if key not in record:
+            continue
+        name = (group_of(record["a"]) if same_configuration(record)
+                else "across")
+        grouped.setdefault(name, []).append(record[key])
+
+    return {name: [sum(column) / len(rows) for column in zip(*rows)]
+            for name, rows in sorted(grouped.items()) if rows}
 
 
 def representatives(pairs: list[tuple[Path, Path]],
@@ -1097,13 +1157,21 @@ def representatives(pairs: list[tuple[Path, Path]],
         pairs: the run directories compared, in the order they were compared.
         records: what each comparison produced, in the same order.
 
+    There is a seed pair per objective, not one. Keeping only the first one
+    met is not a neutral tiebreak: the runs are sorted, so it picks the same
+    objective every time, and the other objective's own ceiling is never
+    drawn. Since the two objectives differ on exactly that, each gets a panel
+    of its own, labelled with the objective it came from.
+
     Returns:
-        ``within`` and ``across``, each a pair of run directories. A kind with
-        no pairs is left out.
+        One entry per objective's seed pair, labelled by that objective, plus
+        ``across`` for the comparison. Each is a pair of run directories. A
+        kind with no pairs is left out.
     """
     out: dict[str, tuple[Path, Path]] = {}
     for (path_a, path_b), record in zip(pairs, records):
-        kind = "within" if same_configuration(record) else "across"
+        kind = (group_of(record["a"]) if same_configuration(record)
+                else "across")
         out.setdefault(kind, (Path(path_a), Path(path_b)))
     return out
 

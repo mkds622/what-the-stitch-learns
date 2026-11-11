@@ -334,9 +334,10 @@ def test_the_summary_can_be_read_off_the_pairing():
     ]
     summary = summarise(records, baseline={"mean": 0.20}, key="assigned_mean",
                         shape_key="assigned_histogram")
-    assert summary["within"]["mean"] == pytest.approx(0.80)
+    ceiling = summary["within"]["case1-main-x16-l1"]
+    assert ceiling["mean"] == pytest.approx(0.80)
     assert summary["across"]["mean"] == pytest.approx(0.40)
-    assert summary["position"] == pytest.approx(1.0 / 3.0)
+    assert ceiling["position"] == pytest.approx(1.0 / 3.0)
 
 
 # ----------------------------------------------------------------------
@@ -542,8 +543,9 @@ def test_the_distributions_do_not_cross_between_readings(tmp_path):
 
     decoder = summarise(records)
     encoder = summarise(records, key="encoder_mean", shape_key="encoder_histogram")
-    assert decoder["within_shape"] == records[0]["histogram"]
-    assert encoder["within_shape"] == records[0]["encoder_histogram"]
+    key = f"{group_of(records[0]['a'])}_shape"
+    assert decoder[key] == records[0]["histogram"]
+    assert encoder[key] == records[0]["encoder_histogram"]
 
 
 def test_neither_distribution_is_written_out(tmp_path):
@@ -669,7 +671,7 @@ def test_the_summary_uses_the_recorded_groups():
     summary = summarise(records)
     # By name both pairs are seed repeats. By what the runs recorded, the
     # first is a comparison across depths and the second is the repeat.
-    assert summary["within"]["mean"] == pytest.approx(0.50)
+    assert summary["within"]["case1-main-x32-topk"]["mean"] == pytest.approx(0.50)
     assert summary["across"]["mean"] == pytest.approx(0.90)
 
 
@@ -679,7 +681,7 @@ def test_the_summary_separates_seed_repeats_from_the_comparison():
         {"a": "case1-main-x16-l1-s0-a", "b": "case2-main-x16-l1-s0-c", "mean": 0.50},
     ]
     summary = summarise(records)
-    assert summary["within"]["mean"] == pytest.approx(0.90)
+    assert summary["within"]["case1-main-x16-l1"]["mean"] == pytest.approx(0.90)
     assert summary["across"]["mean"] == pytest.approx(0.50)
 
 
@@ -689,7 +691,7 @@ def test_position_reports_where_across_falls_between_the_references():
         {"a": "case1-main-x16-l1-s0-a", "b": "case2-main-x16-l1-s0-c", "mean": 0.50},
     ]
     summary = summarise(records, baseline={"mean": 0.10})
-    assert summary["position"] == pytest.approx(0.5)
+    assert summary["within"]["case1-main-x16-l1"]["position"] == pytest.approx(0.5)
 
 
 def test_an_objective_that_changed_nothing_sits_at_the_ceiling():
@@ -697,11 +699,12 @@ def test_an_objective_that_changed_nothing_sits_at_the_ceiling():
         {"a": "case1-main-x16-l1-s0-a", "b": "case1-main-x16-l1-s1-b", "mean": 0.80},
         {"a": "case1-main-x16-l1-s0-a", "b": "case2-main-x16-l1-s0-c", "mean": 0.80},
     ]
-    assert summarise(records, baseline={"mean": 0.20})["position"] == pytest.approx(1.0)
+    summary = summarise(records, baseline={"mean": 0.20})
+    assert summary["within"]["case1-main-x16-l1"]["position"] == pytest.approx(1.0)
 
 
 def test_a_summary_without_pairs_does_not_raise():
-    assert summarise([])["within"] == {"n": 0}
+    assert summarise([])["within"] == {}
 
 
 def test_the_comparison_is_written(tmp_path):
@@ -743,16 +746,20 @@ def test_the_distribution_is_absent_unless_asked_for():
     assert "histogram" not in similarity(unit(16, 8), unit(16, 8))
 
 
-def test_pooled_shapes_average_within_and_across_separately():
+def test_pooled_shapes_keep_each_objective_apart():
+    """A seed pair's distribution belongs to its own objective. Averaging the
+    two objectives into one curve draws a shape neither of them has."""
     from stitch.compare import pooled_shapes
     records = [
         {"a": "case1-x-s0-a", "b": "case1-x-s1-b", "histogram": [1.0, 0.0]},
-        {"a": "case1-x-s0-a", "b": "case2-x-s0-c", "histogram": [0.0, 1.0]},
-        {"a": "case1-x-s1-b", "b": "case2-x-s0-c", "histogram": [0.0, 1.0]},
+        {"a": "case2-x-s0-c", "b": "case2-x-s1-d", "histogram": [0.0, 1.0]},
+        {"a": "case1-x-s0-a", "b": "case2-x-s0-c", "histogram": [0.5, 0.5]},
     ]
     shapes = pooled_shapes(records)
-    assert shapes["within_shape"] == [1.0, 0.0]
-    assert shapes["across_shape"] == [0.0, 1.0]
+    assert shapes[f"{group_of('case1-x-s0-a')}_shape"] == [1.0, 0.0]
+    assert shapes[f"{group_of('case2-x-s0-c')}_shape"] == [0.0, 1.0]
+    assert shapes["across_shape"] == [0.5, 0.5]
+    assert "within_shape" not in shapes
 
 
 def test_pooled_shapes_are_absent_without_distributions():
@@ -1009,38 +1016,71 @@ def test_a_floor_above_the_threshold_raises():
 # ----------------------------------------------------------------------
 
 def banded(a: str, b: str, values: list[float]) -> dict:
-    """A record carrying per-band means and the groups that place it."""
-    return {"a": a, "b": b, "a_group": a[:-1], "b_group": b[:-1],
+    """A record carrying per-band means and the groups that place it.
+
+    The groups are the run name with its seed and hash removed, which is what
+    makes two runs of one objective a seed pair.
+    """
+    return {"a": a, "b": b,
+            "a_group": group_of(a), "b_group": group_of(b),
             "encoder_assigned_by_frequency": values}
 
 
-def test_each_kind_gets_its_own_curve():
+def test_each_objective_gets_its_own_band_curve():
+    """The bands are the features of the side being scored, grouped by that
+    side's firing rates. A case 1 seed pair groups by a case 1 run and a case
+    2 seed pair by a case 2 run, so averaging the two builds one row out of
+    two different groupings."""
     from stitch.compare import by_kind
-    records = [banded("c1s0", "c1s1", [0.7, 0.9]),
-               banded("c1s0", "c2s0", [0.3, 0.5])]
+    records = [banded("case1-main-x16-topk-s0-a", "case1-main-x16-topk-s1-b",
+                      [0.7, 0.9]),
+               banded("case2-main-x16-topk-s0-c", "case2-main-x16-topk-s1-d",
+                      [0.5, 0.6]),
+               banded("case1-main-x16-topk-s0-a", "case2-main-x16-topk-s0-c",
+                      [0.3, 0.5])]
     out = by_kind(records, "encoder_assigned_by_frequency")
-    assert out["within"] == [0.7, 0.9]
+    assert out["case1-main-x16-topk"] == [0.7, 0.9]
+    assert out["case2-main-x16-topk"] == [0.5, 0.6]
     assert out["across"] == [0.3, 0.5]
 
 
-def test_the_pairs_of_a_kind_are_averaged():
+def test_the_two_objectives_are_not_averaged_together():
     from stitch.compare import by_kind
-    records = [banded("c1s0", "c1s1", [0.6, 0.8]),
-               banded("c1s0", "c1s2", [0.8, 1.0])]
-    assert by_kind(records, "encoder_assigned_by_frequency")["within"] == [0.7, 0.9]
+    records = [banded("case1-main-x16-topk-s0-a", "case1-main-x16-topk-s1-b",
+                      [0.7]),
+               banded("case2-main-x16-topk-s0-c", "case2-main-x16-topk-s1-d",
+                      [0.5])]
+    out = by_kind(records, "encoder_assigned_by_frequency")
+    assert "within" not in out
+    assert len(out) == 2
+
+
+def test_the_pairs_of_one_objective_are_averaged():
+    from stitch.compare import by_kind
+    records = [banded("case1-main-x16-topk-s0-a", "case1-main-x16-topk-s1-b",
+                      [0.6, 0.8]),
+               banded("case1-main-x16-topk-s0-a", "case1-main-x16-topk-s2-c",
+                      [0.8, 1.0])]
+    out = by_kind(records, "encoder_assigned_by_frequency")
+    assert out["case1-main-x16-topk"] == [0.7, 0.9]
 
 
 def test_a_kind_with_no_pairs_is_left_out():
     from stitch.compare import by_kind
-    out = by_kind([banded("c1s0", "c1s1", [0.7])], "encoder_assigned_by_frequency")
+    out = by_kind([banded("case1-main-x16-topk-s0-a",
+                          "case1-main-x16-topk-s1-b", [0.7])],
+                  "encoder_assigned_by_frequency")
     assert "across" not in out
 
 
 def test_records_without_the_bands_are_left_out():
     from stitch.compare import by_kind
-    records = [banded("c1s0", "c1s1", [0.6]),
-               {"a": "c1s0", "b": "c1s3", "a_group": "c1s", "b_group": "c1s"}]
-    assert by_kind(records, "encoder_assigned_by_frequency")["within"] == [0.6]
+    records = [banded("case1-main-x16-topk-s0-a", "case1-main-x16-topk-s1-b",
+                      [0.6]),
+               {"a": "case1-main-x16-topk-s0-a", "b": "case1-main-x16-topk-s3-d",
+                "a_group": "g1", "b_group": "g1"}]
+    out = by_kind(records, "encoder_assigned_by_frequency")
+    assert out["case1-main-x16-topk"] == [0.6]
 
 
 def test_no_records_give_no_curves():
@@ -1048,28 +1088,52 @@ def test_no_records_give_no_curves():
     assert by_kind([], "encoder_assigned_by_frequency") == {}
 
 
-def test_one_pair_of_each_kind_is_chosen():
-    from stitch.compare import representatives
-    pairs = [(Path("c1s0"), Path("c1s1")), (Path("c1s0"), Path("c2s0"))]
-    chosen = representatives(pairs, [banded("c1s0", "c1s1", [0.7]),
-                                     banded("c1s0", "c2s0", [0.3])])
-    assert chosen["within"] == (Path("c1s0"), Path("c1s1"))
-    assert chosen["across"] == (Path("c1s0"), Path("c2s0"))
+def named_pair(a: str, b: str, group_a: str, group_b: str) -> dict:
+    """A record whose names carry an objective and whose groups decide the kind."""
+    return {"a": a, "b": b, "a_group": group_a, "b_group": group_b}
 
 
-def test_the_first_pair_of_a_kind_is_the_one_chosen():
-    """Run order rather than a judgement about which pair looks better."""
+def test_each_objective_gets_its_own_panel():
+    """Not one within panel. The objectives differ on how alike their own
+    seeds are, so each one's seed pair is drawn."""
     from stitch.compare import representatives
-    pairs = [(Path("c1s0"), Path("c1s1")), (Path("c1s0"), Path("c1s2"))]
-    chosen = representatives(pairs, [banded("c1s0", "c1s1", [0.7]),
-                                     banded("c1s0", "c1s2", [0.9])])
-    assert chosen["within"] == (Path("c1s0"), Path("c1s1"))
+    pairs = [(Path("one"), Path("two")), (Path("three"), Path("four")),
+             (Path("one"), Path("three"))]
+    chosen = representatives(pairs, [
+        named_pair("case1-main-x16-topk-s0-a", "case1-main-x16-topk-s1-b", "g1", "g1"),
+        named_pair("case2-main-x16-topk-s0-c", "case2-main-x16-topk-s1-d", "g2", "g2"),
+        named_pair("case1-main-x16-topk-s0-a", "case2-main-x16-topk-s0-c", "g1", "g2")])
+
+    assert chosen["case1-main-x16-topk"] == (Path("one"), Path("two"))
+    assert chosen["case2-main-x16-topk"] == (Path("three"), Path("four"))
+    assert chosen["across"] == (Path("one"), Path("three"))
+
+
+def test_the_second_objective_is_no_longer_dropped():
+    """What this exists to prevent. Sorted, one objective always came first,
+    so keeping only the first seed pair drew the same arm every time."""
+    from stitch.compare import representatives
+    pairs = [(Path("a"), Path("b")), (Path("c"), Path("d"))]
+    chosen = representatives(pairs, [
+        named_pair("case1-main-x16-topk-s0-a", "case1-main-x16-topk-s1-b", "g1", "g1"),
+        named_pair("case2-main-x16-topk-s0-c", "case2-main-x16-topk-s1-d", "g2", "g2")])
+    assert len(chosen) == 2
+
+
+def test_the_first_pair_of_an_objective_is_the_one_chosen():
+    from stitch.compare import representatives
+    pairs = [(Path("a"), Path("b")), (Path("a"), Path("c"))]
+    chosen = representatives(pairs, [
+        named_pair("case1-main-x16-topk-s0-a", "case1-main-x16-topk-s1-b", "g1", "g1"),
+        named_pair("case1-main-x16-topk-s0-a", "case1-main-x16-topk-s2-c", "g1", "g1")])
+    assert chosen["case1-main-x16-topk"] == (Path("a"), Path("b"))
 
 
 def test_a_kind_that_was_never_compared_is_left_out():
     from stitch.compare import representatives
-    chosen = representatives([(Path("c1s0"), Path("c1s1"))],
-                             [banded("c1s0", "c1s1", [0.7])])
+    chosen = representatives([(Path("a"), Path("b"))],
+                             [banded("case1-main-x16-topk-s0-a",
+                                     "case1-main-x16-topk-s1-b", [0.7])])
     assert "across" not in chosen
 
 
@@ -1656,3 +1720,67 @@ def test_a_run_recording_no_layers_is_refused(tmp_path):
     (run / "artifacts" / "scales.json").write_text(json.dumps({}))
     with pytest.raises(ValueError, match="no layers"):
         source_layer([run])
+
+
+# ----------------------------------------------------------------------
+# a ceiling per objective
+#
+# How alike two dictionaries are when nothing about the task changed is a
+# property of one objective, and two objectives need not agree on it. Pooling
+# their seed pairs gives a mean neither has, and reports the distance between
+# them as though it were seed noise.
+# ----------------------------------------------------------------------
+
+def seed_pair(group: str, name: str, left: int, right: int, value: float) -> dict:
+    return {"a": f"{name}-s{left}-a", "b": f"{name}-s{right}-b",
+            "a_group": group, "b_group": group, "mean": value}
+
+
+def test_each_objective_gets_its_own_ceiling():
+    records = [seed_pair("g1", "case1-main-x16-topk", 0, 1, 0.36),
+               seed_pair("g1", "case1-main-x16-topk", 0, 2, 0.38),
+               seed_pair("g2", "case2-main-x16-topk", 0, 1, 0.42),
+               seed_pair("g2", "case2-main-x16-topk", 0, 2, 0.44),
+               {"a": "case1-main-x16-topk-s0-a", "b": "case2-main-x16-topk-s0-c",
+                "a_group": "g1", "b_group": "g2", "mean": 0.20}]
+    summary = summarise(records)
+    assert set(summary["within"]) == {"case1-main-x16-topk", "case2-main-x16-topk"}
+    assert summary["within"]["case1-main-x16-topk"]["mean"] == pytest.approx(0.37)
+    assert summary["within"]["case2-main-x16-topk"]["mean"] == pytest.approx(0.43)
+
+
+def test_the_ceilings_are_not_pooled_into_one():
+    """The number this change exists to remove: 0.40 is a mean neither
+    objective has, and its spread is the gap between them."""
+    records = [seed_pair("g1", "case1-main-x16-topk", 0, 1, 0.36),
+               seed_pair("g2", "case2-main-x16-topk", 0, 1, 0.44)]
+    summary = summarise(records)
+    assert "mean" not in summary["within"]
+    assert [entry["n"] for entry in summary["within"].values()] == [1, 1]
+
+
+def test_the_measurement_is_placed_against_each_ceiling():
+    records = [seed_pair("g1", "case1-main-x16-topk", 0, 1, 0.50),
+               seed_pair("g2", "case2-main-x16-topk", 0, 1, 0.90),
+               {"a": "case1-main-x16-topk-s0-a", "b": "case2-main-x16-topk-s0-c",
+                "a_group": "g1", "b_group": "g2", "mean": 0.30}]
+    summary = summarise(records, baseline={"mean": 0.10})
+    assert summary["within"]["case1-main-x16-topk"]["position"] == pytest.approx(0.5)
+    assert summary["within"]["case2-main-x16-topk"]["position"] == pytest.approx(0.25)
+
+
+def test_one_objective_alone_still_has_its_ceiling():
+    """Seed repeats before there is anything to compare them against."""
+    summary = summarise([seed_pair("g1", "case1-main-x16-topk", 0, 1, 0.40)])
+    assert summary["within"]["case1-main-x16-topk"]["mean"] == pytest.approx(0.40)
+    assert summary["across"] == {"n": 0}
+
+
+def test_two_objectives_sharing_a_name_stay_apart():
+    """Two depths of one objective read as one group by name, and the
+    recorded groups are what keep them separate."""
+    records = [seed_pair("shallow", "case1-main-x16-topk", 0, 1, 0.30),
+               seed_pair("deep", "case1-main-x16-topk", 0, 1, 0.70)]
+    summary = summarise(records)
+    assert len(summary["within"]) == 2
+    assert all("case1-main-x16-topk (" in name for name in summary["within"])

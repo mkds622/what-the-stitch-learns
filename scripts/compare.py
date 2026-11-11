@@ -57,9 +57,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stitch.compare import (                                          # noqa: E402
-    by_kind, compare_firing, compare_runs, detail, from_grids, load_dictionary,
-    random_baseline, representatives, same_configuration, shares, source_layer,
-    summarise, write_comparison,
+    by_kind, compare_firing, compare_runs, detail, from_grids, group_of,
+    load_dictionary, random_baseline, representatives, same_configuration,
+    shares, source_layer, summarise, write_comparison,
 )
 
 log = logging.getLogger("compare")
@@ -221,9 +221,12 @@ def _draw(directory: Path, chain: dict, bands: dict | None,
 
     floor = chain.get("random")
     if floor is not None:
-        drawn = {kind: shares(chain[f"{kind}_shape"], floor, close)
-                 for kind in ("random", "within", "across")
-                 if chain.get(f"{kind}_shape")}
+        # Read off whatever distributions the summary carries. There is one
+        # per objective and the names come from the runs, so naming them here
+        # would drop any objective the list did not anticipate.
+        drawn = {key[: -len("_shape")]: shares(value, floor, close)
+                 for key, value in chain.items()
+                 if key.endswith("_shape") and value}
         if drawn:
             plot_match_shares(drawn, directory / FIGURES["shares"], title=title)
 
@@ -319,9 +322,22 @@ def main(argv=None) -> int:
                              "for the dataset and the backbone. The depth is "
                              "taken from the runs themselves, so this does not "
                              "have to name the one they were trained at")
-    parser.add_argument("--firing-tokens", type=int, default=2_000_000,
+    # One pass over the evaluation split, which is what the firing comparison
+    # is meant to read. The stream wraps rather than ending, so a count larger
+    # than the split reads the same tokens twice and overstates how much
+    # independent data the correlation rests on.
+    #
+    # The number is a property of the dataset: images in the evaluation split
+    # times tokens per image, which for a ViT-B/16 at 224 is 196 patches plus
+    # the class token. It sits here as a literal because the stream exposes
+    # neither quantity. Deriving it from len(loader.dataset) and the token
+    # dimension of the first extracted block would remove the need to keep it
+    # in step with the split.
+    parser.add_argument("--firing-tokens", type=int, default=984_803,
                         dest="firing_tokens",
-                        help="evaluation tokens the firing comparison reads")
+                        help="evaluation tokens the firing comparison reads. "
+                             "The default is one pass over the evaluation "
+                             "split and changes with it")
     parser.add_argument("--firing-binary", action="store_true",
                         dest="firing_binary",
                         help="compare whether features fired rather than how "
@@ -408,7 +424,11 @@ def main(argv=None) -> int:
                               bands=args.bands, with_pairing=args.firing)
 
         if args.firing:
-            kind = "within" if same_configuration(record) else "across"
+            # Keyed the same way the weight figures are, so each objective's
+            # own seed pair gets a panel. Keyed on two kinds it would draw
+            # whichever objective sorts first and never the other.
+            kind = (group_of(record["a"]) if same_configuration(record)
+                    else "across")
             wanted = drawing and assigning and kind not in firing_detail
             # Fed the pairing the encoders just produced, so the firing
             # reading can also say whether the features matched by direction
@@ -426,7 +446,7 @@ def main(argv=None) -> int:
                 pairing=pairing, keep_detail=wanted))
 
             if wanted:
-                log.info("keeping the %s firing panels from %s and %s",
+                log.info("keeping the firing panel for %s from %s and %s",
                          kind, Path(a).name, Path(b).name)
                 firing_detail[kind] = record.pop("firing_detail")
 
@@ -504,16 +524,28 @@ def main(argv=None) -> int:
 
     def report(heading: str, chain: dict) -> None:
         print(f"\n{heading}")
-        for name in ("random", "within", "across"):
-            value = chain.get(name)
-            if isinstance(value, dict) and value.get("n"):
-                print(f"{name:>8}  {value['mean']:.4f}  "
-                      f"+/- {value['std']:.4f}  over {value['n']} pairs")
-            elif isinstance(value, float):
-                print(f"{name:>8}  {value:.4f}")
-        if "position" in chain:
-            print(f"across sits {chain['position']:.0%} of the way "
-                  f"from random to a seed repeat")
+
+        floor = chain.get("random")
+        if isinstance(floor, float):
+            print(f"{'random':>20}  {floor:.4f}")
+
+        # One ceiling per objective. How alike two dictionaries are when
+        # nothing about the task changed belongs to that objective, and the
+        # two do not agree on it, so there is no single ceiling to report.
+        for name, entry in (chain.get("within") or {}).items():
+            if isinstance(entry, dict) and entry.get("n"):
+                print(f"{name:>20}  {entry['mean']:.4f}  "
+                      f"+/- {entry['std']:.4f}  over {entry['n']} pairs")
+
+        across = chain.get("across")
+        if isinstance(across, dict) and across.get("n"):
+            print(f"{'across':>20}  {across['mean']:.4f}  "
+                  f"+/- {across['std']:.4f}  over {across['n']} pairs")
+
+        for name, entry in (chain.get("within") or {}).items():
+            if isinstance(entry, dict) and "position" in entry:
+                print(f"across sits {entry['position']:.0%} of the way from "
+                      f"random to a seed repeat of {name}")
 
     report("decoder, what a feature writes out", summary)
     report("encoder, what a feature looks for", summary["encoder"])
@@ -525,10 +557,9 @@ def main(argv=None) -> int:
         bands = by_kind(records, "encoder_assigned_by_frequency")
         if bands:
             print("\nencoder, one-to-one, by firing frequency (rarest band first)")
-            for name in ("within", "across"):
-                if name in bands:
-                    print(f"{name:>8}  "
-                          + "  ".join(f"{value:.4f}" for value in bands[name]))
+            for name, values in bands.items():
+                print(f"{name:>20}  "
+                      + "  ".join(f"{value:.4f}" for value in values))
             print("A gap present in every band is a difference in what was "
                   "learned.\nA gap only in the rare bands is a difference in "
                   "how heavily the\ndictionary was used.")
@@ -539,11 +570,18 @@ def main(argv=None) -> int:
             report("firing, one-to-one pairing", summary["firing_assigned"])
             along = summary["firing_along_weights"]
             print("\nfiring along the encoder pairing")
-            for name in ("within", "across"):
-                value = along.get(name)
-                if isinstance(value, dict) and value.get("n"):
-                    print(f"{name:>8}  {value['mean']:.4f}  "
-                          f"+/- {value['std']:.4f}  over {value['n']} pairs")
+            # Read the same way every other reading is read: the ceilings sit
+            # under "within", one per objective, and only the comparison is a
+            # single number. Treating "within" as one entry prints nothing for
+            # it, since a dictionary of objectives carries no count of its own.
+            for name, entry in (along.get("within") or {}).items():
+                if isinstance(entry, dict) and entry.get("n"):
+                    print(f"{name:>20}  {entry['mean']:.4f}  "
+                          f"+/- {entry['std']:.4f}  over {entry['n']} pairs")
+            across = along.get("across")
+            if isinstance(across, dict) and across.get("n"):
+                print(f"{'across':>20}  {across['mean']:.4f}  "
+                      f"+/- {across['std']:.4f}  over {across['n']} pairs")
             print("How alike the features paired by direction actually behave.\n"
                   "Far below the firing pairing's own number means the\n"
                   "directions paired features that do not fire together.")
