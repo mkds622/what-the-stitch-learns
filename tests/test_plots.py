@@ -647,3 +647,103 @@ def test_bands_without_curves_raise(tmp_path):
     from stitch.plots import plot_frequency_bands
     with pytest.raises(ValueError, match="nothing to plot"):
         plot_frequency_bands({"within": []}, tmp_path / "b.png")
+
+# ----------------------------------------------------------------------
+# the depth as an axis
+#
+# Every other axis is a setting the grid swept, recorded in a run's point. The
+# depth is not: a grid is told which depth to train at and varies the seed, so
+# the depth never reaches the point and the four depths were run as four
+# separate grids. It survives in the layer each run recorded, which is what
+# makes a figure across the depths possible at all.
+# ----------------------------------------------------------------------
+
+def at_depth(layer: str, *values: float, metric="eval_l0") -> list[dict]:
+    """Records from one depth's grid, one per seed, as a grid writes them."""
+    return [{"run_name": f"{layer}-s{seed}", "point": {"train.seed": seed},
+             "scales": {layer: 2.3}, metric: value}
+            for seed, value in enumerate(values)]
+
+
+def test_the_depth_is_read_from_the_layer():
+    from stitch.plots import depth_of
+    assert depth_of({"scales": {"A@add_12": 2.3}}) == 12.0
+    assert depth_of({"scales": {"A@add_4": 1.0}}) == 4.0
+
+
+def test_a_cross_model_run_is_read_from_the_layer_it_reads():
+    """It records two and reads the first, and both are the same depth."""
+    from stitch.plots import depth_of
+    assert depth_of({"scales": {"A@add_20": 1.0, "B@add_20": 1.1}}) == 20.0
+
+
+def test_a_record_with_no_layer_has_no_depth():
+    from stitch.plots import depth_of
+    assert depth_of({"point": {"train.seed": 0}}) is None
+    assert depth_of({"scales": {}}) is None
+
+
+def test_a_layer_with_no_number_has_no_depth():
+    from stitch.plots import depth_of
+    assert depth_of({"scales": {"A@head": 1.0}}) is None
+
+
+def test_four_grids_become_one_curve_across_the_depths():
+    """The figure the four-depth design exists for, from four grids that were
+    each run on their own."""
+    records = combine_results([at_depth("A@add_4", 10.0, 12.0),
+                               at_depth("A@add_12", 20.0, 22.0),
+                               at_depth("A@add_20", 30.0, 30.0),
+                               at_depth("A@add_24", 40.0, 44.0)])
+    points = series(records, "depth", "eval_l0")
+    assert [point.x for point in points] == [4.0, 12.0, 20.0, 24.0]
+    assert [point.n for point in points] == [2, 2, 2, 2]
+    assert points[0].mean == pytest.approx(11.0)
+
+
+def test_the_seeds_at_a_depth_are_its_spread():
+    points = series(at_depth("A@add_12", 10.0, 20.0, 30.0), "depth", "eval_l0")
+    assert points[0].std == pytest.approx(10.0)
+    assert (points[0].low, points[0].high) == (10.0, 30.0)
+
+
+def test_depths_come_out_in_order_whatever_order_the_grids_were_given():
+    records = combine_results([at_depth("A@add_24", 1.0),
+                               at_depth("A@add_4", 2.0),
+                               at_depth("A@add_12", 3.0)])
+    points = series(records, "depth", "eval_l0")
+    assert [point.x for point in points] == [4.0, 12.0, 24.0]
+
+
+def test_a_record_without_a_layer_is_left_off_the_depth_axis():
+    """Rather than counted at zero, which would put a phantom point at the
+    left-hand end of every figure."""
+    records = at_depth("A@add_12", 10.0) + [
+        {"run_name": "x", "point": {"train.seed": 9}, "eval_l0": 99.0}]
+    points = series(records, "depth", "eval_l0")
+    assert [point.x for point in points] == [12.0]
+    assert points[0].n == 1
+
+
+def test_a_failed_run_is_left_off_the_depth_axis_too():
+    records = at_depth("A@add_12", 10.0, 12.0) + [
+        {"run_name": "x", "scales": {"A@add_12": 2.3}, "error": "boom"}]
+    assert series(records, "depth", "eval_l0")[0].n == 2
+
+
+def test_the_ordinary_axes_are_unchanged():
+    """The depth is an addition, and nothing that worked before moves."""
+    points = series(grid({1e6: [10.0, 12.0], 2e6: [8.0]}), "train.tokens", "eval_l0")
+    assert [point.x for point in points] == [1e6, 2e6]
+    assert [point.n for point in points] == [2, 1]
+
+
+def test_a_depth_curve_is_written(tmp_path):
+    pytest.importorskip("matplotlib")
+    records = combine_results([at_depth("A@add_4", 10.0, 12.0),
+                               at_depth("A@add_12", 20.0, 22.0),
+                               at_depth("A@add_20", 30.0, 31.0),
+                               at_depth("A@add_24", 40.0, 44.0)])
+    path = plot_curve(series(records, "depth", "eval_l0"),
+                      "eval_l0", "depth", tmp_path / "by_depth.png", log_x=False)
+    assert path.exists() and path.stat().st_size > 0

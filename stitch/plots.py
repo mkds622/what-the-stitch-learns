@@ -48,6 +48,49 @@ def format_x(value: float) -> str:
     return f"{value:,.0f}" if abs(value) >= 1000 else f"{value:g}"
 
 
+#: The axis name that means the depth a run trained at. It is not an ordinary
+#: setting, because a grid is told the depth and varies the seed, so the depth
+#: never reaches a run's point.
+DEPTH = "depth"
+
+
+def depth_of(record: dict) -> float | None:
+    """The block a run trained at, as a number, from the layer it recorded.
+
+    The depth is in every record, just not where a setting would be. A run
+    writes the scalar it divided each layer by, and the key there is the layer
+    it read: ``A@add_12``. The number in that node name is what orders the
+    depths, and it is the only place the depth survives, since the grid is
+    handed it rather than sweeping it.
+
+    Returns:
+        The number in the layer's node name, or None when the record carries
+        no layer or the name holds no number.
+    """
+    scales = record.get("scales")
+    if not isinstance(scales, dict) or not scales:
+        return None
+
+    node = next(iter(scales)).partition("@")[2]
+    digits = "".join(character for character in node if character.isdigit())
+    return float(digits) if digits else None
+
+
+def axis_of(record: dict, x: str) -> float | None:
+    """Where a record sits on an axis, whether that is a setting or the depth.
+
+    Returns:
+        The position, or None when this record is not on this axis at all,
+        which is how a record from another sweep is left out rather than
+        counted at zero.
+    """
+    if x == DEPTH:
+        return depth_of(record)
+
+    value = record.get("point", {}).get(x)
+    return None if value is None else float(value)
+
+
 def combine_results(groups) -> list[dict]:
     """Several grids' records as one set of runs.
 
@@ -94,18 +137,24 @@ def series(results: list[dict], x: str, metric: str) -> list[Point]:
 
     Args:
         results: records from a grid.
-        x: the axis to plot along, such as ``train.tokens``.
+        x: the axis to plot along, such as ``train.tokens``, or ``depth`` for
+            the block each run trained at, which is read from the layer it
+            recorded because it is not a setting the grid swept.
         metric: the number to plot.
 
     Returns:
-        Points in increasing order of ``x``. Records that failed or lack the
-        metric are left out rather than counted as zero.
+        Points in increasing order of ``x``. Records that failed, lack the
+        metric, or do not sit on this axis are left out rather than counted as
+        zero.
     """
     grouped: dict[float, list[float]] = {}
     for record in results:
-        if "error" in record or metric not in record or x not in record.get("point", {}):
+        if "error" in record or metric not in record:
             continue
-        grouped.setdefault(float(record["point"][x]), []).append(float(record[metric]))
+        position = axis_of(record, x)
+        if position is None:
+            continue
+        grouped.setdefault(position, []).append(float(record[metric]))
 
     points = []
     for value in sorted(grouped):

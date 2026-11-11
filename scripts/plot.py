@@ -18,6 +18,18 @@
     # one curve from several grids, for a sweep extended in a later run
     python scripts/plot.py --results grids/lr.json grids/lr_high.json \
         --x train.lr --metric eval_effective_features --out figures/lr.png
+
+    # one metric across the depths, every grid's seeds as the spread
+    python scripts/plot.py --results grids/main_case1_add_4.json \
+                                     grids/main_case1_add_12.json \
+        --x depth --metric eval_explained_variance --linear-x \
+        --out figures/case1_ev_by_depth.png
+
+``--x depth`` is the one axis that is not a setting. A grid is told which
+depth to train at and varies the seed, so the depth never reaches a run's
+point. It is read from the layer each run recorded instead, which makes a
+figure across the depths possible from grids that were run one depth at a
+time.
 """
 
 import argparse
@@ -58,7 +70,11 @@ def main(argv=None) -> int:
                              "grid draws as a single curve rather than needing "
                              "the files merged by hand")
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--x", default="train.tokens")
+    parser.add_argument("--x", default="train.tokens",
+                        help="the axis to plot along. A setting, such as "
+                             "train.tokens, or 'depth' for the block each run "
+                             "trained at, which is read from the layer it "
+                             "recorded")
     parser.add_argument("--metric", default="eval_l0")
     parser.add_argument("--noise", type=Path, default=None,
                         help="a seed grid, whose spread becomes the tolerance")
