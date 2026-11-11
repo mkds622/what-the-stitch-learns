@@ -1076,3 +1076,507 @@ def test_a_kind_that_was_never_compared_is_left_out():
 def test_nothing_compared_chooses_nothing():
     from stitch.compare import representatives
     assert representatives([], []) == {}
+
+
+# ----------------------------------------------------------------------
+# what the features respond to
+#
+# The weight readings compare what each feature looks for. Under TopK that does
+# not decide whether it fires, because only k of the dictionary get through on
+# any token and which ones win is settled across the whole dictionary at once.
+# These pin the reading that sees that, against coders whose firing is known by
+# construction rather than trained.
+# ----------------------------------------------------------------------
+
+def params(directory: Path, **overrides) -> Path:
+    """The run parameters, as the logger writes them, flat and dotted."""
+    import json
+    recorded = {"coder.sparsity.mode": "topk", "coder.sparsity.k": 1,
+                "coder.sparsity.k_frac": 0.1,
+                "coder.sparsity.normalize_decoder": True}
+    recorded.update(overrides)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "params.json").write_text(json.dumps(recorded))
+    return directory
+
+
+def runnable(directory: Path, width: int = 8, features: int = 16,
+             k: int = 2, seed: int = 0) -> Path:
+    """A run whose coder can be rebuilt and run, not only read."""
+    from stitch.coder import SparseCoder
+    torch.manual_seed(seed)
+    coder = SparseCoder(d_in=width, d_out=width, expansion=features // width,
+                        sparsity="topk", k=k)
+    checkpoints = directory / "checkpoints"
+    checkpoints.mkdir(parents=True, exist_ok=True)
+    torch.save({"step": 100, "tokens": 400,
+                "coder": coder.state_dict(),
+                "tracker": {"steps_since_fired": torch.zeros(features,
+                                                             dtype=torch.long)}},
+               checkpoints / "step_000000100.pt")
+
+    # Every real run records the scalars its activations were divided by, and
+    # anything that feeds a trained coder reads them back, so a run without
+    # them is not a run.
+    import json
+    artifacts = directory / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (artifacts / "scales.json").write_text(json.dumps({"A@add_12": 1.0}))
+
+    return params(directory, **{"coder.sparsity.k": k})
+
+
+def activation_stream(width=8, batches=20, size=64, seed=0):
+    """A finite stream of the shape an activation source yields."""
+    generator = torch.Generator().manual_seed(seed)
+    for _ in range(batches):
+        yield {"A@add_12": torch.randn(size, width, generator=generator)}
+
+
+class Fires(torch.nn.Module):
+    """A coder whose firing is decided by the token, not by training.
+
+    ``which`` maps a token to the feature that fires on it, so two of these
+    with the same rule fire together perfectly and two with different rules do
+    not. It carries only what the correlation needs.
+    """
+
+    def __init__(self, features=16, width=8, rule=0, live=None):
+        super().__init__()
+        self.d_latent = features
+        self.d_in = width
+        self.rule = rule
+        self.live = features if live is None else live
+
+    def encode(self, x):
+        count = x.shape[0]
+        latents = torch.zeros(count, self.d_latent)
+        chosen = (torch.arange(count) + self.rule) % self.live
+        latents[torch.arange(count), chosen] = 1.0 + 0.5 * (x[:, 0] > 0).float()
+        return latents
+
+
+def test_a_coder_is_rebuilt_at_the_size_it_was_trained(tmp_path):
+    from stitch.compare import load_coder
+    coder = load_coder(runnable(tmp_path / "a", width=8, features=16, k=2))
+    assert (coder.d_in, coder.d_latent, coder.k) == (8, 16, 2)
+
+
+def test_a_rebuilt_coder_carries_its_trained_weights(tmp_path):
+    from stitch.compare import load_coder, load_dictionary
+    run = runnable(tmp_path / "a")
+    coder = load_coder(run)
+    directions, _ = load_dictionary(run, drop_dead=False)
+    rebuilt = coder.decoder.weight / coder.decoder.weight.norm(dim=0, keepdim=True)
+    assert torch.allclose(rebuilt, directions, atol=1e-5)
+
+
+def test_a_run_without_parameters_cannot_be_rebuilt(tmp_path):
+    from stitch.compare import load_coder
+    run = runnable(tmp_path / "a")
+    (run / "params.json").unlink()
+    with pytest.raises(FileNotFoundError, match="params.json"):
+        load_coder(run)
+
+
+def test_k_is_derived_when_only_the_fraction_was_recorded(tmp_path):
+    """Older runs recorded the fraction and left k null, as the config does."""
+    from stitch.compare import load_coder
+    run = runnable(tmp_path / "a", width=8, features=16, k=2)
+    params(run, **{"coder.sparsity.k": None, "coder.sparsity.k_frac": 0.25})
+    assert load_coder(run).k == 2
+
+
+# ----------------------------------------------------------------------
+# the correlation itself
+# ----------------------------------------------------------------------
+
+def test_a_coder_correlates_perfectly_with_itself():
+    from stitch.compare import firing_correlation
+    coder = Fires()
+    out = firing_correlation(coder, coder, activation_stream(), "A@add_12",
+                             tokens=640)
+    live = out["rate_a"] > 0
+    assert torch.allclose(out["correlation"].diagonal()[live],
+                          torch.ones(int(live.sum())), atol=1e-4)
+
+
+def test_a_shifted_coder_correlates_off_the_diagonal():
+    """Feature i of one is feature i+1 of the other, which the weights cannot
+    see because nothing about the directions moved."""
+    from stitch.compare import firing_correlation
+    out = firing_correlation(Fires(rule=0), Fires(rule=1), activation_stream(),
+                             "A@add_12", tokens=640)
+    scores = out["correlation"]
+    assert scores.diagonal().max() < 0.5
+    assert scores[0, 1] == pytest.approx(1.0, abs=1e-4)
+
+
+def test_the_rates_are_shares_of_the_tokens_read():
+    from stitch.compare import firing_correlation
+    out = firing_correlation(Fires(), Fires(), activation_stream(), "A@add_12",
+                             tokens=640)
+    assert out["tokens"] == 640
+    assert float(out["rate_a"].sum()) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_the_pass_stops_at_its_token_count():
+    from stitch.compare import firing_correlation
+    out = firing_correlation(Fires(), Fires(), activation_stream(batches=99),
+                             "A@add_12", tokens=128)
+    assert out["tokens"] == 128
+
+
+def test_a_stream_shorter_than_the_request_is_used_in_full():
+    from stitch.compare import firing_correlation
+    out = firing_correlation(Fires(), Fires(), activation_stream(batches=2),
+                             "A@add_12", tokens=10_000)
+    assert out["tokens"] == 128
+
+
+def test_an_empty_stream_raises_for_the_correlation():
+    from stitch.compare import firing_correlation
+    with pytest.raises(ValueError, match="no batches"):
+        firing_correlation(Fires(), Fires(), iter([]), "A@add_12", tokens=100)
+
+
+def test_coders_reading_different_widths_cannot_be_fed_together():
+    """They would need different tokens, and the whole reading is that both saw
+    the same ones."""
+    from stitch.compare import firing_correlation
+    with pytest.raises(ValueError, match="different widths"):
+        firing_correlation(Fires(width=8), Fires(width=16),
+                           activation_stream(), "A@add_12", tokens=128)
+
+
+def test_a_feature_that_never_fires_correlates_with_nothing():
+    """Zero rather than a division by its own absent variance."""
+    from stitch.compare import firing_correlation
+    out = firing_correlation(Fires(features=32, live=16),
+                             Fires(features=32, live=16),
+                             activation_stream(), "A@add_12", tokens=640)
+    silent = out["rate_a"] == 0
+    assert silent.any()
+    assert float(out["correlation"][silent].abs().max()) == 0.0
+
+
+def test_the_binary_reading_ignores_how_hard_a_feature_fired():
+    """The values reading sees the strength, the binary one only the fact."""
+    from stitch.compare import firing_correlation
+    shared = dict(batches=20, size=64)
+    values = firing_correlation(Fires(), Fires(rule=1),
+                                activation_stream(**shared), "A@add_12",
+                                tokens=640)["correlation"]
+    binary = firing_correlation(Fires(), Fires(rule=1),
+                                activation_stream(**shared), "A@add_12",
+                                tokens=640, binary=True)["correlation"]
+    assert not torch.allclose(values, binary, atol=1e-6)
+    assert binary[0, 1] == pytest.approx(1.0, abs=1e-4)
+
+
+def test_the_floor_destroys_the_correspondence_and_keeps_the_rates():
+    """Shuffling one side within the batch removes which token each firing
+    belonged to and nothing else, so a perfect match collapses."""
+    from stitch.compare import firing_correlation
+    out = firing_correlation(Fires(), Fires(), activation_stream(), "A@add_12",
+                             tokens=640, null=True)
+    assert out["correlation"].diagonal().max() > 0.99
+    assert out["null"].diagonal().max() < 0.5
+
+
+def test_the_floor_is_measured_in_the_same_pass():
+    """One traversal, so the backbone runs once rather than twice."""
+    from stitch.compare import firing_correlation
+    out = firing_correlation(Fires(), Fires(), activation_stream(), "A@add_12",
+                             tokens=640, null=True)
+    assert set(out) == {"correlation", "rate_a", "rate_b", "tokens", "null"}
+
+
+def test_no_floor_is_measured_when_it_is_not_asked_for():
+    from stitch.compare import firing_correlation
+    out = firing_correlation(Fires(), Fires(), activation_stream(), "A@add_12",
+                             tokens=640, null=False)
+    assert "null" not in out
+
+
+# ----------------------------------------------------------------------
+# reading a matrix that is already built
+# ----------------------------------------------------------------------
+
+def test_a_score_matrix_reads_the_same_way_as_directions():
+    """The firing matrix arrives built, so these take it rather than building
+    one. They must agree with the weight readings on the same numbers."""
+    from stitch.compare import scores_similarity, similarity
+    a, b = unit(16, 24, seed=0), unit(16, 24, seed=1)
+    assert scores_similarity(a.T @ b)["mean"] == pytest.approx(
+        similarity(a, b)["mean"])
+
+
+def test_a_score_matrix_pairs_the_same_way_as_directions():
+    from stitch.compare import scores_assigned_similarity
+    from stitch.compare import assigned_similarity
+    a, b = unit(16, 24, seed=0), unit(16, 24, seed=1)
+    assert scores_assigned_similarity(a.T @ b)["assigned_mean"] == pytest.approx(
+        assigned_similarity(a, b)["assigned_mean"])
+
+
+def test_an_empty_score_matrix_raises():
+    from stitch.compare import scores_similarity
+    with pytest.raises(ValueError, match="empty dictionary"):
+        scores_similarity(torch.zeros(0, 0))
+
+
+def test_a_pairing_can_be_read_in_another_matrix():
+    """The question the weight pairing cannot answer about itself."""
+    from stitch.compare import along_pairing
+    scores = torch.tensor([[0.1, 0.9], [0.8, 0.2]])
+    rows, columns = torch.tensor([0, 1]), torch.tensor([1, 0])
+    assert along_pairing(scores, rows, columns).tolist() == [
+        pytest.approx(0.9), pytest.approx(0.8)]
+
+
+def test_the_pairing_comes_back_when_it_is_asked_for():
+    """So that a second reading can use it without solving the assignment
+    again, which is the slow half."""
+    from stitch.compare import assigned_similarity
+    a, b = unit(16, 24, seed=0), unit(16, 24, seed=1)
+    out = assigned_similarity(a, b, with_pairing=True)
+    assert out["assigned_rows"].numel() == 24
+    assert sorted(out["assigned_columns"].tolist()) == list(range(24))
+
+
+def test_the_pairing_is_absent_unless_asked_for():
+    from stitch.compare import assigned_similarity
+    a, b = unit(16, 24, seed=0), unit(16, 24, seed=1)
+    assert "assigned_rows" not in assigned_similarity(a, b)
+
+
+def test_the_pairing_is_never_written_out(tmp_path):
+    """It is tensors, and twelve thousand of them per pair."""
+    import json
+    from stitch.compare import write_comparison
+    record = {"a": "x", "b": "y", "mean": 0.5,
+              "encoder_assigned_rows": torch.arange(4),
+              "encoder_assigned_columns": torch.arange(4),
+              "firing_histogram": [0.5, 0.5]}
+    out = tmp_path / "c.json"
+    write_comparison([record], {"random": 0.1}, out)
+    written = json.loads(out.read_text())["pairs"][0]
+    assert "encoder_assigned_rows" not in written
+    assert "firing_histogram" not in written
+    assert written["mean"] == 0.5
+
+
+# ----------------------------------------------------------------------
+# the pair-level reading
+# ----------------------------------------------------------------------
+
+def test_a_firing_comparison_carries_its_own_floor(tmp_path):
+    from stitch.compare import compare_firing
+    a = runnable(tmp_path / "a", seed=0)
+    b = runnable(tmp_path / "b", seed=1)
+    record = compare_firing(a, b, activation_stream(), "A@add_12", tokens=640)
+    assert "firing_mean" in record
+    assert "firing_null_mean" in record
+    assert "firing_assigned_mean" in record
+    assert record["firing_tokens"] == 640
+
+
+def test_a_firing_comparison_can_skip_its_floor(tmp_path):
+    from stitch.compare import compare_firing
+    a = runnable(tmp_path / "a", seed=0)
+    b = runnable(tmp_path / "b", seed=1)
+    record = compare_firing(a, b, activation_stream(), "A@add_12", tokens=640,
+                            null=False)
+    assert not any(key.startswith("firing_null") for key in record)
+
+
+def test_a_firing_comparison_reads_a_given_pairing(tmp_path):
+    from stitch.compare import compare_firing
+    a = runnable(tmp_path / "a", seed=0)
+    b = runnable(tmp_path / "b", seed=1)
+    pairing = (torch.arange(16), torch.arange(16))
+    record = compare_firing(a, b, activation_stream(), "A@add_12", tokens=640,
+                            pairing=pairing)
+    assert "firing_along_weights" in record
+    assert -1.0 <= record["firing_along_weights"] <= 1.0
+
+
+def test_a_firing_comparison_without_a_pairing_says_nothing_about_one(tmp_path):
+    from stitch.compare import compare_firing
+    a = runnable(tmp_path / "a", seed=0)
+    b = runnable(tmp_path / "b", seed=1)
+    record = compare_firing(a, b, activation_stream(), "A@add_12", tokens=640)
+    assert "firing_along_weights" not in record
+
+
+def test_a_coder_compared_with_itself_fires_identically(tmp_path):
+    """The ceiling the reading has to reach, since a coder and its own copy
+    cannot respond to different inputs."""
+    from stitch.compare import compare_firing
+    a = runnable(tmp_path / "a", seed=0)
+    import shutil
+    shutil.copytree(a, tmp_path / "b")
+    record = compare_firing(a, tmp_path / "b", activation_stream(),
+                            "A@add_12", tokens=640, null=False)
+    assert record["firing_mean"] > 0.99
+
+
+# ----------------------------------------------------------------------
+# each coder in its own units
+#
+# The scalars are measured from the opening tokens of a shuffled training
+# loader and that shuffle is seeded, so two runs differing only by seed can
+# record different ones. A shared stream has one set of scalars and the coders
+# do not, so the scaling cannot happen in the stream. These pin that it
+# happens per coder instead, and that nothing silently uses one run's units
+# for another run's coder.
+# ----------------------------------------------------------------------
+
+def scaled_run(directory: Path, scale: float, **kwargs) -> Path:
+    """A run whose recorded scale is whatever the test needs it to be."""
+    import json
+    run = runnable(directory, **kwargs)
+    (run / "artifacts" / "scales.json").write_text(
+        json.dumps({"A@add_12": scale}))
+    return run
+
+
+class Threshold(torch.nn.Module):
+    """Fires feature zero only on tokens whose first entry clears a bar.
+
+    Scale-sensitive on purpose: the same tokens at a different scale cross the
+    bar a different number of times, so a coder handed the wrong units gives a
+    visibly different answer rather than a subtly wrong one.
+    """
+
+    def __init__(self, bar=1.0, features=4, width=8):
+        super().__init__()
+        self.d_latent = features
+        self.d_in = width
+        self.bar = bar
+
+    def encode(self, x):
+        latents = torch.zeros(x.shape[0], self.d_latent)
+        latents[:, 0] = (x[:, 0] > self.bar).float()
+        latents[:, 1] = (x[:, 1] > self.bar).float()
+        return latents
+
+
+def test_the_scale_reaches_the_coder():
+    """Doubling a coder's scale changes what it fires on, which is the whole
+    reason the units have to be its own."""
+    from stitch.compare import firing_correlation
+    plain = firing_correlation(Threshold(), Threshold(), activation_stream(),
+                               "A@add_12", tokens=640)
+    scaled = firing_correlation(Threshold(), Threshold(), activation_stream(),
+                                "A@add_12", tokens=640, scale_a=4.0, scale_b=4.0)
+    assert float(plain["rate_a"][0]) != pytest.approx(float(scaled["rate_a"][0]))
+
+
+def test_the_two_coders_can_be_given_different_scales():
+    """Which is the case the shared stream cannot serve by scaling itself."""
+    from stitch.compare import firing_correlation
+    out = firing_correlation(Threshold(), Threshold(), activation_stream(),
+                             "A@add_12", tokens=640, scale_a=1.0, scale_b=4.0)
+    assert float(out["rate_a"][0]) != pytest.approx(float(out["rate_b"][0]))
+
+
+def test_matching_scales_leave_the_two_sides_agreeing():
+    from stitch.compare import firing_correlation
+    out = firing_correlation(Threshold(), Threshold(), activation_stream(),
+                             "A@add_12", tokens=640, scale_a=2.0, scale_b=2.0)
+    assert float(out["rate_a"][0]) == pytest.approx(float(out["rate_b"][0]))
+
+
+def test_each_run_supplies_its_own_scale(tmp_path):
+    """The record says which scale each coder was given, so a comparison can
+    be checked after the fact rather than trusted."""
+    from stitch.compare import compare_firing
+    a = scaled_run(tmp_path / "a", 1.5, seed=0)
+    b = scaled_run(tmp_path / "b", 2.5, seed=1)
+    record = compare_firing(a, b, activation_stream(), "A@add_12", tokens=640,
+                            null=False)
+    assert record["firing_scale_a"] == pytest.approx(1.5)
+    assert record["firing_scale_b"] == pytest.approx(2.5)
+
+
+def test_a_run_without_recorded_scales_stops_the_comparison(tmp_path):
+    """Rather than defaulting to one and comparing a coder against tokens in
+    units it never saw."""
+    from stitch.compare import compare_firing
+    a = scaled_run(tmp_path / "a", 1.5, seed=0)
+    b = runnable(tmp_path / "b", seed=1)
+    (b / "artifacts" / "scales.json").unlink()
+    with pytest.raises(FileNotFoundError, match="scales.json"):
+        compare_firing(a, b, activation_stream(), "A@add_12", tokens=640)
+
+
+# ----------------------------------------------------------------------
+# the firing figures' material
+#
+# Taken out of the correlation matrix during the pass that built it, rather
+# than by running the pass again.
+# ----------------------------------------------------------------------
+
+def test_the_detail_comes_out_of_the_matrix():
+    from stitch.compare import detail_from_scores
+    scores = torch.rand(20, 20)
+    rows, columns = torch.arange(20), torch.arange(20)
+    rates = torch.rand(20)
+    out = detail_from_scores(scores, rows, columns, rates, rates,
+                             squares=10, ribbons=5, block=6)
+    assert len(out["squares"]) == 10
+    assert len(out["pairs"]) == 5
+    assert len(out["block"]) == 6 and len(out["block"][0]) == 6
+    assert out["features"] == 20
+
+
+def test_the_detail_block_carries_the_pairing_on_its_diagonal():
+    """What the matrix figure relies on, for the firing reading as for the
+    weight one."""
+    from stitch.compare import detail_from_scores
+    scores = torch.full((12, 12), 0.1)
+    order = torch.tensor([3, 7, 1, 9, 5, 0, 2, 4, 6, 8, 10, 11])
+    scores[torch.arange(12), order] = 0.95
+    rates = torch.linspace(1.0, 0.1, 12)
+    block = torch.tensor(detail_from_scores(
+        scores, torch.arange(12), order, rates, rates, block=12)["block"])
+    assert torch.allclose(block.diagonal(), torch.full((12,), 0.95), atol=1e-6)
+
+
+def test_the_detail_is_asked_for_rather_than_always_built(tmp_path):
+    from stitch.compare import compare_firing
+    a = scaled_run(tmp_path / "a", 1.0, seed=0)
+    b = scaled_run(tmp_path / "b", 1.0, seed=1)
+    plain = compare_firing(a, b, activation_stream(), "A@add_12", tokens=640,
+                           null=False)
+    kept = compare_firing(a, b, activation_stream(), "A@add_12", tokens=640,
+                          null=False, keep_detail=True)
+    assert "firing_detail" not in plain
+    assert set(kept["firing_detail"]) == {"squares", "pairs", "block", "features"}
+
+
+def test_the_pairing_is_not_left_in_the_record(tmp_path):
+    """It is tensors. Asking for the detail must not smuggle them through."""
+    from stitch.compare import compare_firing
+    a = scaled_run(tmp_path / "a", 1.0, seed=0)
+    b = scaled_run(tmp_path / "b", 1.0, seed=1)
+    record = compare_firing(a, b, activation_stream(), "A@add_12", tokens=640,
+                            null=False, keep_detail=True)
+    assert "firing_assigned_rows" not in record
+    assert "firing_assigned_columns" not in record
+
+
+def test_the_detail_is_never_written_out(tmp_path):
+    import json
+    from stitch.compare import write_comparison
+    record = {"a": "x", "b": "y", "firing_mean": 0.5,
+              "firing_detail": {"block": [[1.0]]},
+              "firing_assigned_rows": torch.arange(4)}
+    out = tmp_path / "c.json"
+    write_comparison([record], {"random": 0.1}, out)
+    written = json.loads(out.read_text())["pairs"][0]
+    assert "firing_detail" not in written
+    assert "firing_assigned_rows" not in written
+    assert written["firing_mean"] == 0.5

@@ -224,6 +224,9 @@ def load_sides(path: Path, drop_dead: bool = True) -> dict[str, tuple[Tensor, di
 #: Where the evaluation writes the per-feature firing rates, relative to a run.
 FREQUENCIES = Path("artifacts") / "feature_frequencies.json"
 
+#: Where the run writes the scalar each layer was divided by, relative to a run.
+SCALES = Path("artifacts") / "scales.json"
+
 
 def run_directory(path: Path) -> Path:
     """The run a path points into, given a run, its checkpoints or a checkpoint."""
@@ -262,6 +265,32 @@ def load_frequencies(path: Path, alive: Tensor | None = None) -> Tensor | None:
 # ----------------------------------------------------------------------
 # the measure
 # ----------------------------------------------------------------------
+
+def load_scales(path: Path) -> dict[str, float]:
+    """The scalar each layer was divided by during a run.
+
+    Needed by anything that feeds a trained coder new activations. The coder
+    was trained in scaled units, the scalars were fixed once at the start of
+    the run from the training split, and a stream that measured its own would
+    hand the coder tokens in units it has never seen.
+
+    Args:
+        path: a run directory or a checkpoint inside one.
+
+    Returns:
+        Layer key to scalar.
+
+    Raises:
+        FileNotFoundError: if the run recorded none, which means its coder
+            cannot be fed anything.
+    """
+    file = run_directory(path) / SCALES
+    if not file.is_file():
+        raise FileNotFoundError(
+            f"{file} is missing, so the units this coder was trained in are "
+            f"unknown and it cannot be given tokens")
+    return {key: float(value) for key, value in json.loads(file.read_text()).items()}
+
 
 def best_match(a: Tensor, b: Tensor, chunk: int = 1024) -> Tensor:
     """For each column of ``a``, its highest cosine with any column of ``b``.
@@ -413,7 +442,7 @@ def by_frequency(scores: Tensor, frequencies: Tensor | None,
 def assigned_similarity(a: Tensor, b: Tensor, close: float = 0.9,
                         keep_distribution: bool = False,
                         frequencies: Tensor | None = None,
-                        bands: int = 4) -> dict:
+                        bands: int = 4, with_pairing: bool = False) -> dict:
     """The same reading as :func:`similarity`, under a one-to-one pairing.
 
     One number rather than two: a pairing where nothing is used twice is
@@ -427,12 +456,18 @@ def assigned_similarity(a: Tensor, b: Tensor, close: float = 0.9,
         frequencies: firing rates for the columns of ``a``, if the bands are
             wanted.
         bands: how many frequency bands to split into.
+        with_pairing: also hand back which feature was paired with which. The
+            pairing is wanted by any reading that asks whether the features
+            matched here behave alike, and recomputing it there would mean
+            solving the assignment a second time, which is the slow half.
 
     Returns:
         The mean, median and matched share over the pairs, how many pairs there
-        were, and the per-band means when frequencies were given.
+        were, the per-band means when frequencies were given, and the pairing
+        itself when it was asked for. The pairing is tensors rather than
+        numbers and is stripped before anything is written out.
     """
-    rows, _, scores = assignment(a, b)
+    rows, columns, scores = assignment(a, b)
 
     out = {
         "assigned_mean": float(scores.mean()),
@@ -448,6 +483,9 @@ def assigned_similarity(a: Tensor, b: Tensor, close: float = 0.9,
 
     if keep_distribution:
         out["assigned_histogram"] = histogram(scores)
+    if with_pairing:
+        out["assigned_rows"] = rows
+        out["assigned_columns"] = columns
     return out
 
 
@@ -552,7 +590,8 @@ def from_grids(paths: list[Path], run_root: Path) -> list[Path]:
 
 def compare_runs(path_a: Path, path_b: Path, close: float = 0.9,
                  drop_dead: bool = True, keep_distribution: bool = False,
-                 assign: bool = True, bands: int = 4) -> dict:
+                 assign: bool = True, bands: int = 4,
+                 with_pairing: bool = False) -> dict:
     """Two runs, read from disk and compared on both sides of the coder.
 
     The decoder reading is the one the unprefixed fields carry, and it is the
@@ -586,6 +625,10 @@ def compare_runs(path_a: Path, path_b: Path, close: float = 0.9,
             is the slow half, so it is the thing to turn off when a sweep of
             comparisons is only being looked at roughly.
         bands: how many frequency bands to split the one-to-one scores into.
+        with_pairing: also hand back the encoder pairing, under
+            ``encoder_assigned_rows`` and ``encoder_assigned_columns``. Only
+            the encoder's, since it is the only side comparable across the two
+            objectives and so the only one worth asking a second reading about.
 
     Returns:
         The similarity fields for the decoder, the same fields prefixed
@@ -616,7 +659,7 @@ def compare_runs(path_a: Path, path_b: Path, close: float = 0.9,
             record[key] = value
         for key, value in assigned_similarity(encoder_a, encoder_b, close,
                                               keep_distribution, frequencies,
-                                              bands).items():
+                                              bands, with_pairing).items():
             record[f"encoder_{key}"] = value
 
     record.update({
@@ -775,18 +818,33 @@ def summarise(records: list[dict], baseline: dict | None = None,
     return out
 
 
+#: Fields a record carries for the code's own use and nothing reads off disk.
+#: The distributions, which the summary already averages, and the pairings,
+#: which are tensors.
+DROPPED = (
+    "histogram", "encoder_histogram",
+    "assigned_histogram", "encoder_assigned_histogram",
+    "encoder_assigned_rows", "encoder_assigned_columns",
+    "firing_histogram", "firing_assigned_histogram",
+    "firing_null_histogram", "firing_null_assigned_histogram",
+    "firing_along_weights_histogram",
+    "firing_assigned_rows", "firing_assigned_columns", "firing_detail",
+)
+
+
 def write_comparison(records: list[dict], summary: dict, path: Path) -> None:
     """Write the comparisons where a plot or a table can read them.
 
     Per-pair distributions are left out: the summary holds their average,
     which is what anything downstream reads, and two hundred numbers per pair
-    would bury the fields a person opening the file is looking for.
+    would bury the fields a person opening the file is looking for. So is the
+    pairing itself, which is tensors rather than numbers and is twelve thousand
+    of them per pair.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     trimmed = [{key: value for key, value in record.items()
-                if key not in ("histogram", "encoder_histogram",
-                               "assigned_histogram", "encoder_assigned_histogram")}
+                if key not in DROPPED}
                for record in records]
     path.write_text(json.dumps({"summary": summary, "pairs": trimmed}, indent=2))
     log.info("wrote %d comparisons to %s", len(records), path)
@@ -1004,3 +1062,494 @@ def representatives(pairs: list[tuple[Path, Path]],
         kind = "within" if same_configuration(record) else "across"
         out.setdefault(kind, (Path(path_a), Path(path_b)))
     return out
+
+
+# ----------------------------------------------------------------------
+# comparing what the features respond to, rather than what they look for
+#
+# Everything above compares weights: the direction each feature reads, or the
+# direction it writes. That is the whole of a dictionary as an object, and it
+# is not the whole of what a dictionary does.
+#
+# Under TopK a feature's direction does not decide whether it fires. Only k of
+# the dictionary are allowed through on any token and which ones win is settled
+# by competition across every feature at once, so a feature can be looking for
+# something very close to what arrived, lose its place, and never fire. Two
+# coders can therefore be looking for near-identical things and still respond
+# to different tokens, and no reading of the weights can see it.
+#
+# What follows answers the other question: given the same tokens, do the two
+# coders' features switch on together. It needs the tokens, which means the
+# backbone has to run, because the per-token firing was never stored. A run
+# counted how often each feature fired and threw the detail away; keeping it
+# would be gigabytes per run.
+# ----------------------------------------------------------------------
+
+def load_coder(path: Path, device: torch.device | str = "cpu"):
+    """A trained coder, rebuilt from its checkpoint and able to run.
+
+    The rest of this module reads weight tensors out of a checkpoint and never
+    builds anything. This one has to, because a firing pattern is what a coder
+    produces rather than what it contains.
+
+    The widths come from the weights themselves rather than from the
+    configuration, so a coder is always rebuilt at the size it was trained at.
+    Only the sparsity settings are read from the run's recorded parameters,
+    since nothing in the weights says how many features were allowed through.
+
+    Args:
+        path: a run directory, or a checkpoint inside one.
+        device: where the coder should end up.
+
+    Returns:
+        The coder, in evaluation mode, with its trained weights loaded.
+
+    Raises:
+        FileNotFoundError: if the run recorded no parameters, which means the
+            sparsity settings cannot be recovered.
+    """
+    from stitch.coder import SparseCoder
+
+    path = Path(path)
+    checkpoint = latest_checkpoint(path) if path.is_dir() else path
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)["coder"]
+
+    parameters = run_directory(checkpoint) / "params.json"
+    if not parameters.is_file():
+        raise FileNotFoundError(
+            f"{parameters} is missing, so the sparsity the coder was trained "
+            f"under cannot be recovered and it cannot be run")
+    recorded = json.loads(parameters.read_text())
+
+    d_latent, d_in = state["encoder.weight"].shape
+    d_out = state["decoder.weight"].shape[0]
+
+    mode = recorded.get("coder.sparsity.mode", "topk")
+    k = recorded.get("coder.sparsity.k")
+    if mode == "topk" and k is None:
+        k = max(1, round(recorded["coder.sparsity.k_frac"] * d_in))
+
+    coder = SparseCoder(
+        d_in=d_in, d_out=d_out, expansion=d_latent // d_in, sparsity=mode, k=k,
+        normalize_decoder=recorded.get("coder.sparsity.normalize_decoder", True))
+    coder.load_state_dict(state)
+    return coder.to(device).eval()
+
+
+@torch.no_grad()
+def firing_correlation(coder_a, coder_b, batches, source_key: str, tokens: int,
+                       scale_a: float = 1.0, scale_b: float = 1.0,
+                       binary: bool = False, null: bool = False,
+                       device: torch.device | str = "cpu",
+                       seed: int = 0) -> dict:
+    """How together every feature of one coder fires with every feature of the other.
+
+    Accumulated in one streaming pass rather than materialised: the per-token
+    firings of a twelve thousand feature dictionary over a million tokens are
+    gigabytes, while the sums this needs are a matrix of features by features
+    and two vectors.
+
+    Both coders are fed the same batch at the same moment, which is the whole
+    point and is also why this cannot be done inside a training run, where only
+    one of the two coders exists.
+
+    Args:
+        coder_a: one trained coder, already on ``device``.
+        coder_b: the other. Both must read the same layer.
+        batches: an activation stream, usually over the evaluation split.
+        source_key: the layer both coders read. The tokens must arrive
+            unscaled, since each coder has its own scale applied below.
+        tokens: how many to read before stopping.
+        scale_a: the scalar ``coder_a``'s layer was divided by during its run.
+        scale_b: the same for ``coder_b``. Separate rather than shared,
+            because the scalars are measured from the first tokens of a
+            shuffled training loader and that shuffle is seeded, so two runs
+            differing only by seed can record different ones. A coder handed
+            tokens in another run's units sees shifted pre-activations, and
+            under TopK a shift changes which features win the competition, with
+            nothing to signal it because the widths still match.
+        binary: compare whether features fired rather than how hard. Firing
+            alone answers "do these two respond to the same inputs" and nothing
+            else; the values also carry how strongly, so a feature that is a
+            scaled copy of another still matches and one that fires on the same
+            tokens but weakly scores lower.
+        null: also build a second matrix with one coder's rows shuffled within
+            each batch, which destroys the token-by-token correspondence while
+            leaving every feature's own firing rate alone. Whatever correlation
+            survives that is what two unrelated dictionaries of these shapes
+            and these firing rates reach by chance, which is the floor the real
+            matrix is read against. Accumulated in the same pass, so the
+            backbone runs once rather than twice.
+        device: where to run.
+        seed: for the shuffle, so a floor is reproducible.
+
+    Returns:
+        ``correlation``, ``(features_a, features_b)`` in ``[-1, 1]`` and zero
+        wherever a feature never varied, since a feature that never fired
+        correlates with nothing; ``rate_a`` and ``rate_b``, the share of tokens
+        each feature fired on, measured over these tokens so the frequency
+        bands belong to this pass and not a different one; ``tokens``, how many
+        were read; and ``null``, the same matrix with the correspondence
+        destroyed, when it was asked for.
+
+    Raises:
+        ValueError: if the stream produced nothing, or the two coders read
+            different widths and so cannot be fed the same tokens.
+    """
+    if coder_a.d_in != coder_b.d_in:
+        raise ValueError(
+            f"the coders read different widths, {coder_a.d_in} and "
+            f"{coder_b.d_in}, so they cannot be given the same tokens")
+
+    device = torch.device(device)
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+
+    width_a, width_b = coder_a.d_latent, coder_b.d_latent
+    vector = lambda size: torch.zeros(size, dtype=torch.float64, device=device)
+
+    # The one object in this loop whose size matters, and the one that does not
+    # need the precision. Double precision runs at a fraction of single on a
+    # GPU, a small fraction on consumer hardware, and this is a matrix of
+    # features by features accumulated once per batch: in double it is the
+    # whole cost of the comparison. The vectors beside it are twelve thousand
+    # numbers long, so they stay in double, where the variance is worked out
+    # as a difference of two similar quantities and the precision is worth
+    # having.
+    matrix = lambda: torch.zeros(width_a, width_b, dtype=torch.float32,
+                                 device=device)
+
+    cross = matrix()
+    shuffled = matrix() if null else None
+    sum_a, sum_b = vector(width_a), vector(width_b)
+    square_a, square_b = vector(width_a), vector(width_b)
+    fired_a, fired_b = vector(width_a), vector(width_b)
+    seen = 0
+
+    for batch in batches:
+        if seen >= tokens:
+            break
+        x = batch[source_key].to(device)
+
+        # Each coder in the units it was trained in, which are not necessarily
+        # the same units.
+        latents_a = coder_a.encode(x * scale_a)
+        latents_b = coder_b.encode(x * scale_b)
+
+        # Counted before anything is thresholded, so the rates describe the
+        # dictionaries and not the comparison.
+        fired_a += (latents_a > 0).to(torch.float64).sum(dim=0)
+        fired_b += (latents_b > 0).to(torch.float64).sum(dim=0)
+
+        if binary:
+            latents_a = (latents_a > 0).to(torch.float32)
+            latents_b = (latents_b > 0).to(torch.float32)
+        else:
+            latents_a = latents_a.to(torch.float32)
+            latents_b = latents_b.to(torch.float32)
+
+        cross += latents_a.T @ latents_b
+        if shuffled is not None:
+            # The same tokens in a different order. Every column's own
+            # statistics are untouched, so the only thing removed is which
+            # token each firing belonged to.
+            order = torch.randperm(latents_b.shape[0], generator=generator).to(device)
+            shuffled += latents_a.T @ latents_b[order]
+
+        sum_a += latents_a.sum(dim=0, dtype=torch.float64)
+        sum_b += latents_b.sum(dim=0, dtype=torch.float64)
+        square_a += (latents_a * latents_a).sum(dim=0, dtype=torch.float64)
+        square_b += (latents_b * latents_b).sum(dim=0, dtype=torch.float64)
+        seen += x.shape[0]
+
+    if seen == 0:
+        raise ValueError("the activation stream produced no batches")
+
+    # Worked out in double, where the variance is a difference of two similar
+    # quantities, then brought down to single for the broadcast against the
+    # matrix, where the precision would buy nothing and the memory is real.
+    mean_a, mean_b = sum_a / seen, sum_b / seen
+    # Clamped at zero because a feature that never varies has a variance that
+    # is zero up to rounding, and rounding can put it just below.
+    deviation_a = (square_a / seen - mean_a * mean_a).clamp_min(0).sqrt()
+    deviation_b = (square_b / seen - mean_b * mean_b).clamp_min(0).sqrt()
+
+    mean_a, mean_b = mean_a.to(torch.float32), mean_b.to(torch.float32)
+    scale = (deviation_a.to(torch.float32)[:, None]
+             * deviation_b.to(torch.float32)[None, :])
+
+    def normalise(total):
+        covariance = total / seen - mean_a[:, None] * mean_b[None, :]
+        # A feature that never fired, or fired on every token, has nothing to
+        # correlate. Zero rather than a division, which is the honest value: it
+        # co-varies with nothing because it does not vary.
+        out = torch.where(scale > 0, covariance / scale.clamp_min(1e-12),
+                          torch.zeros_like(covariance))
+        return out.clamp(-1.0, 1.0).cpu()
+
+    result = {
+        "correlation": normalise(cross),
+        "rate_a": (fired_a / seen).to(torch.float32).cpu(),
+        "rate_b": (fired_b / seen).to(torch.float32).cpu(),
+        "tokens": seen,
+    }
+    if shuffled is not None:
+        result["null"] = normalise(shuffled)
+    return result
+
+
+# ----------------------------------------------------------------------
+# reading a score matrix
+#
+# The weight readings build their scores from two sets of directions, as a
+# matrix product. A firing reading arrives with the matrix already built and
+# nothing to build it from, so these take the matrix itself. The field names
+# match the weight readings', so the same summarising machinery reads both.
+# ----------------------------------------------------------------------
+
+def scores_similarity(scores: Tensor, close: float = 0.9,
+                      keep_distribution: bool = False) -> dict:
+    """:func:`similarity`, read off a matrix that is already built.
+
+    Args:
+        scores: ``(features_a, features_b)``.
+        close: the value above which two features count as the same.
+        keep_distribution: also return the shape of the best-match scores.
+
+    Returns:
+        The same fields :func:`similarity` returns.
+    """
+    if scores.numel() == 0:
+        raise ValueError("an empty dictionary cannot be compared")
+
+    forward = scores.max(dim=1).values
+    backward = scores.max(dim=0).values
+
+    out = {
+        "mean_a_to_b": float(forward.mean()),
+        "mean_b_to_a": float(backward.mean()),
+        "mean": float((forward.mean() + backward.mean()) / 2),
+        "median_a_to_b": float(forward.median()),
+        "matched_a_to_b": float((forward >= close).float().mean()),
+        "matched_b_to_a": float((backward >= close).float().mean()),
+    }
+    if keep_distribution:
+        out["histogram"] = histogram(torch.cat([forward, backward]))
+    return out
+
+
+def scores_assignment(scores: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """:func:`assignment`, read off a matrix that is already built."""
+    if scores.numel() == 0:
+        raise ValueError("an empty dictionary cannot be compared")
+
+    from scipy.optimize import linear_sum_assignment
+
+    rows, columns = linear_sum_assignment(scores.numpy(), maximize=True)
+    rows, columns = torch.as_tensor(rows), torch.as_tensor(columns)
+    return rows, columns, scores[rows, columns]
+
+
+def scores_assigned_similarity(scores: Tensor, close: float = 0.9,
+                               keep_distribution: bool = False,
+                               frequencies: Tensor | None = None,
+                               bands: int = 4,
+                               with_pairing: bool = False) -> dict:
+    """:func:`assigned_similarity`, read off a matrix that is already built.
+
+    ``with_pairing`` hands back which feature was paired with which, for the
+    same reason its counterpart does: the figures that draw individual features
+    need the pairing, and solving the assignment again to get it is the slow
+    half of this whole module.
+    """
+    rows, columns, paired = scores_assignment(scores)
+
+    out = {
+        "assigned_mean": float(paired.mean()),
+        "assigned_median": float(paired.median()),
+        "assigned_matched": float((paired >= close).float().mean()),
+        "assigned_pairs": int(paired.numel()),
+    }
+
+    if frequencies is not None:
+        banded = by_frequency(paired, frequencies[rows], bands)
+        if banded is not None:
+            out["assigned_by_frequency"] = banded
+
+    if keep_distribution:
+        out["assigned_histogram"] = histogram(paired)
+    if with_pairing:
+        out["assigned_rows"] = rows
+        out["assigned_columns"] = columns
+    return out
+
+
+def along_pairing(scores: Tensor, rows: Tensor, columns: Tensor) -> Tensor:
+    """The score each pair of an existing pairing reaches in another reading.
+
+    The question the weight pairing cannot answer about itself: the features it
+    matched by direction, do they actually fire on the same tokens. This reads
+    the firing matrix at the positions the weight pairing chose, rather than
+    searching the firing matrix for a pairing of its own.
+
+    Args:
+        scores: ``(features_a, features_b)``, the other reading.
+        rows: indices into ``a``, from an assignment.
+        columns: the matching indices into ``b``.
+
+    Returns:
+        One score per pair, in the order the pairing gave them.
+    """
+    return scores[rows, columns]
+
+
+def detail_from_scores(scores: Tensor, rows: Tensor, columns: Tensor,
+                       rate_a: Tensor, rate_b: Tensor,
+                       squares: int = SQUARES, ribbons: int = RIBBONS,
+                       block: int = BLOCK) -> dict:
+    """:func:`detail`, built from a matrix that is already paired.
+
+    The weight version loads two dictionaries and works the matrix out. This
+    one is handed both, because the firing matrix is expensive to produce and
+    already exists by the time anything wants to draw it, and because the
+    pairing has already been solved.
+
+    Args:
+        scores: ``(features_a, features_b)``.
+        rows: indices into ``a``, from the pairing on ``scores``.
+        columns: the matching indices into ``b``.
+        rate_a: how often each feature of ``a`` fired, for the ordering.
+        rate_b: the same for ``b``.
+        squares: how many per-feature scores to return.
+        ribbons: how many pairs to return.
+        block: the side of the square piece of ``scores`` to return.
+
+    Returns:
+        The same fields :func:`detail` returns.
+    """
+    paired = scores[rows, columns]
+    rank_a = _ranks(rate_a, scores.shape[0])
+    rank_b = _ranks(rate_b, scores.shape[1])
+
+    step = max(rows.numel() // max(ribbons, 1), 1)
+    chosen = torch.arange(0, rows.numel(), step)[:ribbons]
+    active = rank_a[rows].argsort()[:block]
+
+    return {
+        "squares": [float(value) for value in paired[:squares]],
+        "pairs": [[float(rank_a[rows[index]]), float(rank_b[columns[index]]),
+                   float(paired[index])] for index in chosen.tolist()],
+        "block": scores[rows[active]][:, columns[active]].tolist(),
+        "features": int(rows.numel()),
+    }
+
+
+def compare_firing(path_a: Path, path_b: Path, batches, source_key: str,
+                   tokens: int, close: float = 0.9, binary: bool = False,
+                   bands: int = 4, keep_distribution: bool = False,
+                   assign: bool = True, null: bool = True,
+                   device: torch.device | str = "cpu",
+                   pairing: tuple[Tensor, Tensor] | None = None,
+                   keep_detail: bool = False, seed: int = 0) -> dict:
+    """Two runs compared by what their features respond to.
+
+    One stream feeds both coders, so every number here is measured on the same
+    tokens in the same order, and the floor is measured in the same pass.
+
+    Unlike the weight readings, this one is meaningful across the two
+    objectives without qualification. The decoders live in different models'
+    spaces and cannot be compared; the encoders can, because both read the same
+    activation. Firing is a step further still: it is a property of what the
+    coder did rather than of the space it did it in, so there is nothing about
+    the two objectives that makes it harder to read than within one.
+
+    Args:
+        path_a: a run directory or checkpoint.
+        path_b: the run it is compared against.
+        batches: an activation stream over the evaluation split.
+        source_key: the layer both coders read.
+        tokens: how many to read.
+        close: the correlation above which two features count as responding to
+            the same inputs.
+        binary: compare whether features fired rather than how hard.
+        bands: how many firing-frequency bands to split the pairing into.
+        keep_distribution: also record the shapes, for the figures.
+        assign: also pair one-to-one, as the weight reading does.
+        null: also measure what this pair reaches with the token
+            correspondence destroyed, which is the floor the numbers are read
+            against. Measured in the same pass, so it costs a second matrix
+            and no second run of the backbone.
+        device: where to run.
+        pairing: ``(rows, columns)`` from the weight comparison. Given, the
+            firing scores along that pairing are reported too, which is the
+            question the weight pairing cannot answer about itself: whether
+            the features it matched by direction behave alike.
+        keep_detail: also hand back the per-feature material the figures that
+            draw individual features need, taken from the matrix while it is
+            still in hand. It is tensors and lists rather than numbers and is
+            stripped before anything is written out. Needs ``assign``, since
+            those figures are drawn against the pairing.
+        seed: for the shuffle the floor uses.
+
+    Returns:
+        ``firing_`` fields mirroring the weight reading's, the
+        ``firing_null_`` floor when it was measured, and
+        ``firing_along_weights`` when a weight pairing was given.
+    """
+    coder_a = load_coder(path_a, device)
+    coder_b = load_coder(path_b, device)
+
+    # Each coder in its own units. Read from the runs rather than shared,
+    # because two runs differing only by seed can have measured different
+    # scalars and a coder given another run's units is being asked a different
+    # question with nothing to show for it.
+    scale_a = load_scales(path_a)[source_key]
+    scale_b = load_scales(path_b)[source_key]
+
+    measured = firing_correlation(coder_a, coder_b, batches, source_key, tokens,
+                                  scale_a=scale_a, scale_b=scale_b,
+                                  binary=binary, null=null, device=device,
+                                  seed=seed)
+    scores = measured["correlation"]
+
+    record = {f"firing_{key}": value for key, value in
+              scores_similarity(scores, close, keep_distribution).items()}
+
+    if assign:
+        assigned = scores_assigned_similarity(
+            scores, close, keep_distribution, measured["rate_a"], bands,
+            with_pairing=keep_detail)
+        if keep_detail:
+            record["firing_detail"] = detail_from_scores(
+                scores, assigned.pop("assigned_rows"),
+                assigned.pop("assigned_columns"),
+                measured["rate_a"], measured["rate_b"])
+        for key, value in assigned.items():
+            record[f"firing_{key}"] = value
+
+    if "null" in measured:
+        floor = measured["null"]
+        for key, value in scores_similarity(floor, close,
+                                            keep_distribution).items():
+            record[f"firing_null_{key}"] = value
+        if assign:
+            for key, value in scores_assigned_similarity(
+                    floor, close, keep_distribution).items():
+                record[f"firing_null_{key}"] = value
+
+    if pairing is not None:
+        rows, columns = pairing
+        along = along_pairing(scores, rows, columns)
+        record["firing_along_weights"] = float(along.mean())
+        record["firing_along_weights_matched"] = float((along >= close).float().mean())
+        if keep_distribution:
+            record["firing_along_weights_histogram"] = histogram(along)
+
+    record.update({
+        "firing_tokens": float(measured["tokens"]),
+        "firing_scale_a": float(scale_a),
+        "firing_scale_b": float(scale_b),
+        "firing_binary": bool(binary),
+        "firing_width_a": int(scores.shape[0]),
+        "firing_width_b": int(scores.shape[1]),
+    })
+    return record

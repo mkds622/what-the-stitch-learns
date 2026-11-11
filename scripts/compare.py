@@ -20,11 +20,23 @@ comparison, and a set containing both gives all three numbers at once.
         --out comparisons/main_add_12.json --reading encoder \
         --figures figures/add_12 --title "block 12"
 
+    # also comparing what the features respond to, not only what they look for
+    python scripts/compare.py --from-grid grids/main_case1_add_12.json \
+                                          grids/main_case2_add_12.json \
+        --out comparisons/main_add_12.json --reading encoder \
+        --firing --config configs/case1_main.yaml --device cuda
+
 Three of the figures draw individual features, which means reading them back
 out of the checkpoints of one pair of runs of each kind. Nothing about them is
 written to the comparison file, so those three can only be drawn while the
 checkpoints are still there. Everything else is drawn from the comparison file
 and keeps working after the runs are archived.
+
+--firing is a different kind of cost. Everything else here reads weights off
+disk; that one runs both coders over real tokens, so it needs the backbone, the
+dataset, and a GPU to be reasonable. It is what answers whether two coders
+respond to the same inputs, which no reading of the weights can, because under
+TopK a feature's direction does not decide whether it fires.
 
 A run directory name carries the objective, the tag, the expansion, the
 sparsity mode, the seed and a hash, but not the coefficient, the budget or the
@@ -45,8 +57,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stitch.compare import (                                          # noqa: E402
-    by_kind, compare_runs, detail, from_grids, load_dictionary,
-    random_baseline, representatives, shares, summarise, write_comparison,
+    by_kind, compare_firing, compare_runs, detail, from_grids, load_dictionary,
+    random_baseline, representatives, same_configuration, shares, summarise,
+    write_comparison,
 )
 
 log = logging.getLogger("compare")
@@ -91,6 +104,68 @@ def _assigned(baseline: dict | None) -> dict | None:
     return out
 
 
+def _activations(config: Path, device: str):
+    """The evaluation stream every coder is fed from, unscaled.
+
+    Built once and handed to every pair, because the backbone is the expensive
+    part and it is the same backbone every time: both objectives read the same
+    layer of the same model, so one stream serves them all.
+
+    It hands out raw activations rather than scaled ones. A stream has one set
+    of scalars and the coders do not: they were measured from the opening
+    tokens of a shuffled training loader whose shuffle is seeded, so two runs
+    differing only by seed can have recorded different ones. Scaling here would
+    mean picking one run's units and silently giving every other coder tokens
+    it was not trained on. Each coder's own scalar is applied where it is
+    encoded instead.
+
+    Args:
+        config: the configuration the runs were trained under, which is where
+            the dataset, the backbone and the layer come from.
+        device: where the backbone runs.
+
+    Returns:
+        ``(source, source_key)``.
+    """
+    from stitch.activations import build_source
+    from stitch.config import load_config
+    from stitch.data import build_dataset, build_loader, build_transform
+    from stitch.run import load_models
+
+    cfg = load_config(config)
+    cfg.train.device = device
+    models, backbones = load_models(cfg)
+
+    loader = build_loader(
+        cfg, build_dataset(cfg, cfg.dataset.eval_split,
+                           build_transform(next(iter(backbones.values())))),
+        cfg.activations.extraction_batch_size, shuffle=False)
+
+    source = build_source(cfg, models, loader)
+    source.set_scales({key: 1.0 for key in cfg.activations.layers})
+    return source, cfg.activations.layers[0]
+
+
+def _firing_floor(records: list[dict], key: str = "firing_null_assigned_mean",
+                  shape: str = "firing_null_assigned_histogram") -> dict | None:
+    """The firing floor, averaged over the pairs that measured one.
+
+    Measured per pair rather than once, because how well two unrelated
+    dictionaries correlate depends on how many features they have and how often
+    each one fires, and those differ between runs. Averaged here for the same
+    reason the other numbers are.
+    """
+    floors = [record[key] for record in records if key in record]
+    if not floors:
+        return None
+
+    out = {"mean": sum(floors) / len(floors)}
+    shapes = [record[shape] for record in records if shape in record]
+    if shapes:
+        out["histogram"] = [sum(column) / len(shapes) for column in zip(*shapes)]
+    return out
+
+
 def _chain(summary: dict, reading: str, assigning: bool) -> dict:
     """The floor, ceiling and measurement the figures are drawn from.
 
@@ -104,15 +179,24 @@ def _chain(summary: dict, reading: str, assigning: bool) -> dict:
     return summary if reading == "decoder" else summary["encoder"]
 
 
-def _figures(directory: Path, summary: dict, records: list[dict],
-             pairs: list[tuple[Path, Path]], reading: str, assigning: bool,
-             close: float, title: str | None) -> None:
-    """Draw the set.
+def _draw(directory: Path, chain: dict, bands: dict | None,
+          detailed: dict | None, close: float, title: str | None) -> None:
+    """One set of eight, from one reading.
 
-    Three of the eight need the features themselves rather than their
-    summaries, and nothing about those is written to disk, so they are drawn
-    from the checkpoints of one pair of runs of each kind. They are the figures
-    that stop being drawable once the checkpoints are deleted.
+    Five of them are a function of the three-number chain and its
+    distributions, so they can be drawn from a comparison file long after the
+    runs are gone. The other three draw individual features and need the
+    per-feature material, which is never written to disk.
+
+    Args:
+        directory: where the eight images go.
+        chain: a floor, a ceiling, an across number and their distributions,
+            all from one pairing and one reading.
+        bands: ``within`` and ``across`` per-band means, or None.
+        detailed: per-feature material for one pair of each kind, or None,
+            in which case the three that draw features are skipped.
+        close: the threshold a feature counts as matched at.
+        title: a heading, usually which depth this is.
     """
     from stitch.plots import (
         plot_comparison, plot_distributions, plot_feature_squares,
@@ -121,7 +205,6 @@ def _figures(directory: Path, summary: dict, records: list[dict],
     )
 
     directory = Path(directory)
-    chain = _chain(summary, reading, assigning)
 
     plot_comparison(chain, directory / FIGURES["summary"], title=title)
     plot_distributions(chain, directory / FIGURES["distributions"], title=title)
@@ -135,22 +218,11 @@ def _figures(directory: Path, summary: dict, records: list[dict],
         if drawn:
             plot_match_shares(drawn, directory / FIGURES["shares"], title=title)
 
-    if assigning:
-        key = "assigned_by_frequency" if reading == "decoder" \
-            else "encoder_assigned_by_frequency"
-        bands = by_kind(records, key)
-        if bands:
-            plot_frequency_bands(bands, directory / FIGURES["bands"], title=title)
+    if bands:
+        plot_frequency_bands(bands, directory / FIGURES["bands"], title=title)
 
-    chosen = representatives(pairs, records)
-    if not chosen:
+    if not detailed:
         return
-
-    detailed = {}
-    for kind, (path_a, path_b) in chosen.items():
-        log.info("reading features for the %s panels from %s and %s",
-                 kind, Path(path_a).name, Path(path_b).name)
-        detailed[kind] = detail(path_a, path_b, side=reading)
 
     plot_feature_squares({kind: value["squares"] for kind, value in detailed.items()},
                          directory / FIGURES["dictionary"], title=title)
@@ -158,6 +230,50 @@ def _figures(directory: Path, summary: dict, records: list[dict],
                  directory / FIGURES["pairing"], title=title)
     plot_match_matrix({kind: value["block"] for kind, value in detailed.items()},
                       directory / FIGURES["matrix"], title=title)
+
+
+def _figures(directory: Path, summary: dict, records: list[dict],
+             pairs: list[tuple[Path, Path]], reading: str, assigning: bool,
+             close: float, title: str | None,
+             firing_detail: dict | None = None) -> None:
+    """Draw a set from the weights, and a second set from the firing.
+
+    Two independent sets of the same eight figures, in their own directories.
+    Nothing is shared between them and nothing is replaced: the weight set says
+    what the features look for, the firing set says what they respond to, and
+    the project's question needs both.
+
+    The weight set reads the checkpoints of one pair of runs of each kind for
+    its three per-feature figures, so those three stop being drawable once the
+    checkpoints are deleted. The firing set's three were taken out of the
+    correlation matrix while it was still in hand, during the pass that was
+    happening anyway.
+    """
+    directory = Path(directory)
+
+    chosen = representatives(pairs, records)
+    detailed = {}
+    for kind, (path_a, path_b) in chosen.items():
+        log.info("reading features for the %s panels from %s and %s",
+                 kind, Path(path_a).name, Path(path_b).name)
+        detailed[kind] = detail(path_a, path_b, side=reading)
+
+    weight_bands = None
+    if assigning:
+        weight_bands = by_kind(
+            records, "assigned_by_frequency" if reading == "decoder"
+            else "encoder_assigned_by_frequency")
+
+    _draw(directory, _chain(summary, reading, assigning), weight_bands,
+          detailed or None, close, title)
+
+    if "firing" not in summary:
+        return
+
+    firing = summary["firing_assigned"] if assigning else summary["firing"]
+    _draw(directory / "firing", firing,
+          by_kind(records, "firing_assigned_by_frequency") if assigning else None,
+          firing_detail or None, close, title)
 
 
 def main(argv=None) -> int:
@@ -183,6 +299,32 @@ def main(argv=None) -> int:
                              "bands, leaving only the best match. The pairing "
                              "is the slow half, so this is for looking at a "
                              "large set of comparisons roughly")
+    parser.add_argument("--firing", action="store_true",
+                        help="also compare what the features respond to, by "
+                             "running both coders over the evaluation split "
+                             "and correlating their firing. Needs --config, "
+                             "the checkpoints, the dataset and the backbone, "
+                             "and is the slowest part of the comparison")
+    parser.add_argument("--config", type=Path, default=None,
+                        help="the configuration the runs were trained under, "
+                             "which is where the firing comparison gets the "
+                             "dataset, the backbone and the layer")
+    parser.add_argument("--firing-tokens", type=int, default=2_000_000,
+                        dest="firing_tokens",
+                        help="evaluation tokens the firing comparison reads")
+    parser.add_argument("--firing-binary", action="store_true",
+                        dest="firing_binary",
+                        help="compare whether features fired rather than how "
+                             "hard. Answers only whether two features respond "
+                             "to the same inputs, and is blind to a feature "
+                             "that fires on the same tokens but weakly")
+    parser.add_argument("--no-firing-null", action="store_true",
+                        dest="no_firing_null",
+                        help="skip the shuffled floor the firing numbers are "
+                             "read against, which costs a second matrix")
+    parser.add_argument("--device", default="cpu",
+                        help="where the firing comparison runs the backbone "
+                             "and the coders")
     parser.add_argument("--bands", type=int, default=4,
                         help="how many firing-frequency bands to split the "
                              "one-to-one scores into, rarest first")
@@ -210,6 +352,11 @@ def main(argv=None) -> int:
     if not args.runs and not args.from_grid:
         raise SystemExit("give either --runs or --from-grid")
 
+    if args.firing and args.config is None:
+        raise SystemExit(
+            "--firing runs both coders over real tokens, so it needs --config "
+            "to know which dataset, which backbone and which layer")
+
     directories = (from_grids(args.from_grid, args.run_root) if args.from_grid
                    else expand(args.runs))
     log.info("comparing %d runs, %d pairs",
@@ -224,11 +371,50 @@ def main(argv=None) -> int:
     # the names.
     pairs = list(itertools.combinations(directories, 2))
 
+    source = source_key = None
+    if args.firing:
+        # Built once. The backbone is the expensive part of this and it is the
+        # same backbone for every pair, since both objectives read the same
+        # layer of the same model.
+        source, source_key = _activations(args.config, args.device)
+        log.info("firing comparison reads %s over %d tokens on %s",
+                 source_key, args.firing_tokens, args.device)
+
+    # The per-feature firing figures draw one pair of each kind. Which pair
+    # that is is decided here, as the loop reaches it, so the material can be
+    # taken out of the correlation matrix while it is still in hand rather
+    # than by running the whole pass again later.
+    firing_detail: dict[str, dict] = {}
+
     records = []
     for a, b in pairs:
         record = compare_runs(a, b, args.close, drop_dead=not args.keep_dead,
                               keep_distribution=drawing, assign=assigning,
-                              bands=args.bands)
+                              bands=args.bands, with_pairing=args.firing)
+
+        if args.firing:
+            kind = "within" if same_configuration(record) else "across"
+            wanted = drawing and assigning and kind not in firing_detail
+            # Fed the pairing the encoders just produced, so the firing
+            # reading can also say whether the features matched by direction
+            # behave alike, which is the one thing the weights cannot check
+            # about themselves.
+            pairing = None
+            if assigning and "encoder_assigned_rows" in record:
+                pairing = (record["encoder_assigned_rows"],
+                           record["encoder_assigned_columns"])
+            record.update(compare_firing(
+                a, b, source.batches(), source_key, args.firing_tokens,
+                close=args.close, binary=args.firing_binary, bands=args.bands,
+                keep_distribution=drawing, assign=assigning,
+                null=not args.no_firing_null, device=args.device,
+                pairing=pairing, keep_detail=wanted))
+
+            if wanted:
+                log.info("keeping the %s firing panels from %s and %s",
+                         kind, Path(a).name, Path(b).name)
+                firing_detail[kind] = record.pop("firing_detail")
+
         records.append(record)
         if assigning:
             log.info("%s vs %s: decoder %.4f best / %.4f paired, "
@@ -270,6 +456,24 @@ def main(argv=None) -> int:
     summary = summarise(records, baseline)
     summary["encoder"] = summarise(records, encoder_baseline, key="encoder_mean",
                                    shape_key="encoder_histogram")
+    if args.firing:
+        # The same chain again, read off what the features responded to rather
+        # than off what they look for. Its floor is its own: a cosine floor
+        # between random directions says nothing about how well two unrelated
+        # firing patterns correlate.
+        summary["firing"] = summarise(
+            records, _firing_floor(records, "firing_null_mean",
+                                   "firing_null_histogram"),
+            key="firing_mean", shape_key="firing_histogram")
+        if assigning:
+            summary["firing_assigned"] = summarise(
+                records, _firing_floor(records),
+                key="firing_assigned_mean",
+                shape_key="firing_assigned_histogram")
+            summary["firing_along_weights"] = summarise(
+                records, None, key="firing_along_weights",
+                shape_key="firing_along_weights_histogram")
+
     if assigning:
         # The same three-number chain, read off the one-to-one pairing. Kept
         # as its own entry rather than folded in, because a floor, a ceiling
@@ -314,8 +518,25 @@ def main(argv=None) -> int:
                   "learned.\nA gap only in the rare bands is a difference in "
                   "how heavily the\ndictionary was used.")
 
+    if args.firing:
+        report("firing, what a feature responds to", summary["firing"])
+        if assigning:
+            report("firing, one-to-one pairing", summary["firing_assigned"])
+            along = summary["firing_along_weights"]
+            print("\nfiring along the encoder pairing")
+            for name in ("within", "across"):
+                value = along.get(name)
+                if isinstance(value, dict) and value.get("n"):
+                    print(f"{name:>8}  {value['mean']:.4f}  "
+                          f"+/- {value['std']:.4f}  over {value['n']} pairs")
+            print("How alike the features paired by direction actually behave.\n"
+                  "Far below the firing pairing's own number means the\n"
+                  "directions paired features that do not fire together.")
+
     print("\nOnly the encoder reading is comparable across the two objectives:\n"
-          "the decoders write into different models' spaces.")
+          "the decoders write into different models' spaces.\n"
+          "The firing reading is comparable either way: it describes what a\n"
+          "coder did, not the space it did it in.")
 
     if args.figure is not None:
         from stitch.plots import plot_comparison
@@ -325,8 +546,11 @@ def main(argv=None) -> int:
 
     if args.figures is not None:
         _figures(args.figures, summary, records, pairs, args.reading, assigning,
-                 args.close, args.title)
+                 args.close, args.title, firing_detail)
         print(f"figures written to {args.figures}, drawn from the {args.reading}")
+        if args.firing:
+            print(f"and a second set from the firing, in "
+                  f"{Path(args.figures) / 'firing'}")
     return 0
 
 
