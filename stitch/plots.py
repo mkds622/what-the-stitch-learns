@@ -1175,16 +1175,21 @@ def plot_frequency_bands(bands: dict[str, list[float]], path: Path,
     axis.set_xticks(positions)
     axis.set_xticklabels(labels)
     axis.set_ylim(0, 1.02)
-    axis.set_xlabel("features grouped by how often they fire")
+    axis.set_xlabel("features grouped by how often they fire", labelpad=12)
     axis.set_ylabel("how well features matched")
-    axis.legend(frameon=False, loc="lower right", fontsize=10)
+    # Top left. Every curve rises to the right and none of them reaches the
+    # upper band, so the legend sits clear of the lines wherever the gap
+    # happens to open.
+    axis.legend(frameon=False, loc="upper left", fontsize=10)
     axis.grid(axis="y", alpha=0.25)
     axis.set_axisbelow(True)
     for side in ("top", "right"):
         axis.spines[side].set_visible(False)
     axis.set_title(title or "The gap, split by how often a feature fires",
                    fontsize=13, pad=14)
-    figure.text(0.5, -0.03,
+    # Below the axis label, not level with it. The figure is written with a
+    # tight bounding box, so the space is made here and not by the margin.
+    figure.text(0.5, -0.09,
                 "A gap open in every band is a difference in what was learned. "
                 "A gap only on the left\nis a difference in how heavily the "
                 "dictionary was used.",
