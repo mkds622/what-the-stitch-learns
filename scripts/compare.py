@@ -58,8 +58,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stitch.compare import (                                          # noqa: E402
     by_kind, compare_firing, compare_runs, detail, from_grids, load_dictionary,
-    random_baseline, representatives, same_configuration, shares, summarise,
-    write_comparison,
+    random_baseline, representatives, same_configuration, shares, source_layer,
+    summarise, write_comparison,
 )
 
 log = logging.getLogger("compare")
@@ -104,28 +104,36 @@ def _assigned(baseline: dict | None) -> dict | None:
     return out
 
 
-def _activations(config: Path, device: str):
-    """The evaluation stream every coder is fed from, unscaled.
+def _activations(config: Path, layer: str, device: str):
+    """The evaluation stream every coder is fed from, unscaled, at one layer.
 
     Built once and handed to every pair, because the backbone is the expensive
-    part and it is the same backbone every time: both objectives read the same
-    layer of the same model, so one stream serves them all.
+    part and it is the same backbone every time: every objective here reads the
+    same layer of the same model, so one stream serves them all.
 
-    It hands out raw activations rather than scaled ones. A stream has one set
-    of scalars and the coders do not: they were measured from the opening
-    tokens of a shuffled training loader whose shuffle is seeded, so two runs
+    The depth comes from the runs, not from the configuration. A training
+    configuration names one depth and the grid overrides it per run, so the
+    file on disk says nothing reliable about which depth a given set of runs
+    was trained at. The configuration is read for the dataset and the backbone,
+    and its layer is replaced in memory with the one the runs recorded. Nothing
+    is written. This also loads one backbone where the configuration names two.
+
+    It hands out raw activations, not scaled ones. A stream has one set of
+    scalars and the coders do not: they were measured from the opening tokens
+    of a shuffled training loader whose shuffle is seeded, so two runs
     differing only by seed can have recorded different ones. Scaling here would
     mean picking one run's units and silently giving every other coder tokens
     it was not trained on. Each coder's own scalar is applied where it is
-    encoded instead.
+    encoded.
 
     Args:
-        config: the configuration the runs were trained under, which is where
-            the dataset, the backbone and the layer come from.
+        config: the configuration the runs were trained under, for the dataset
+            and the backbone.
+        layer: the layer to extract, from :func:`stitch.compare.source_layer`.
         device: where the backbone runs.
 
     Returns:
-        ``(source, source_key)``.
+        The stream.
     """
     from stitch.activations import build_source
     from stitch.config import load_config
@@ -134,6 +142,7 @@ def _activations(config: Path, device: str):
 
     cfg = load_config(config)
     cfg.train.device = device
+    cfg.activations.layers = [layer]
     models, backbones = load_models(cfg)
 
     loader = build_loader(
@@ -142,8 +151,8 @@ def _activations(config: Path, device: str):
         cfg.activations.extraction_batch_size, shuffle=False)
 
     source = build_source(cfg, models, loader)
-    source.set_scales({key: 1.0 for key in cfg.activations.layers})
-    return source, cfg.activations.layers[0]
+    source.set_scales({layer: 1.0})
+    return source
 
 
 def _firing_floor(records: list[dict], key: str = "firing_null_assigned_mean",
@@ -307,8 +316,9 @@ def main(argv=None) -> int:
                              "and is the slowest part of the comparison")
     parser.add_argument("--config", type=Path, default=None,
                         help="the configuration the runs were trained under, "
-                             "which is where the firing comparison gets the "
-                             "dataset, the backbone and the layer")
+                             "for the dataset and the backbone. The depth is "
+                             "taken from the runs themselves, so this does not "
+                             "have to name the one they were trained at")
     parser.add_argument("--firing-tokens", type=int, default=2_000_000,
                         dest="firing_tokens",
                         help="evaluation tokens the firing comparison reads")
@@ -355,7 +365,7 @@ def main(argv=None) -> int:
     if args.firing and args.config is None:
         raise SystemExit(
             "--firing runs both coders over real tokens, so it needs --config "
-            "to know which dataset, which backbone and which layer")
+            "to know which dataset and which backbone")
 
     directories = (from_grids(args.from_grid, args.run_root) if args.from_grid
                    else expand(args.runs))
@@ -373,10 +383,15 @@ def main(argv=None) -> int:
 
     source = source_key = None
     if args.firing:
+        # The depth these runs trained at, taken from the runs. Every layer in
+        # the model is the same width, so a comparison pointed at the wrong
+        # depth would run and produce numbers that look like an answer.
+        source_key = source_layer(directories)
+
         # Built once. The backbone is the expensive part of this and it is the
-        # same backbone for every pair, since both objectives read the same
+        # same backbone for every pair, since every run here reads the same
         # layer of the same model.
-        source, source_key = _activations(args.config, args.device)
+        source = _activations(args.config, source_key, args.device)
         log.info("firing comparison reads %s over %d tokens on %s",
                  source_key, args.firing_tokens, args.device)
 

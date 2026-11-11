@@ -1580,3 +1580,79 @@ def test_the_detail_is_never_written_out(tmp_path):
     assert "firing_detail" not in written
     assert "firing_assigned_rows" not in written
     assert written["firing_mean"] == 0.5
+
+
+# ----------------------------------------------------------------------
+# which depth is being compared
+#
+# A training configuration names one depth and the grid overrides it per run,
+# so the file on disk says nothing reliable about where a given set of runs
+# trained. Every layer in the model is the same width, so a comparison pointed
+# at the wrong depth runs and produces numbers that look like an answer. The
+# depth is therefore taken from the runs.
+# ----------------------------------------------------------------------
+
+def at_layer(directory: Path, *layers: str, **kwargs) -> Path:
+    """A run whose recorded scales name these layers, in this order."""
+    import json
+    run = runnable(directory, **kwargs)
+    (run / "artifacts" / "scales.json").write_text(
+        json.dumps({layer: 1.0 for layer in layers}))
+    return run
+
+
+def test_the_layer_comes_from_the_runs(tmp_path):
+    from stitch.compare import source_layer
+    runs = [at_layer(tmp_path / "a", "A@add_4", seed=0),
+            at_layer(tmp_path / "b", "A@add_4", seed=1)]
+    assert source_layer(runs) == "A@add_4"
+
+
+def test_a_cross_model_run_reads_the_first_layer_it_recorded(tmp_path):
+    """It reconstructs the second and reads the first."""
+    from stitch.compare import source_layer
+    runs = [at_layer(tmp_path / "a", "A@add_20", seed=0),
+            at_layer(tmp_path / "b", "A@add_20", "B@add_20", seed=1)]
+    assert source_layer(runs) == "A@add_20"
+
+
+def test_runs_from_two_depths_are_refused(tmp_path):
+    """The failure this exists to prevent: it would otherwise run, because
+    every depth in the model is the same width."""
+    from stitch.compare import source_layer
+    runs = [at_layer(tmp_path / "a", "A@add_4", seed=0),
+            at_layer(tmp_path / "b", "A@add_12", seed=1)]
+    with pytest.raises(ValueError, match="same layer"):
+        source_layer(runs)
+
+
+def test_the_refusal_says_which_depths_it_found(tmp_path):
+    from stitch.compare import source_layer
+    runs = [at_layer(tmp_path / "a", "A@add_4", seed=0),
+            at_layer(tmp_path / "b", "A@add_12", seed=1)]
+    with pytest.raises(ValueError) as caught:
+        source_layer(runs)
+    assert "A@add_4" in str(caught.value) and "A@add_12" in str(caught.value)
+
+
+def test_no_runs_have_no_layer():
+    from stitch.compare import source_layer
+    with pytest.raises(ValueError, match="no runs"):
+        source_layer([])
+
+
+def test_a_run_with_no_recorded_scales_cannot_supply_a_layer(tmp_path):
+    from stitch.compare import source_layer
+    run = runnable(tmp_path / "a", seed=0)
+    (run / "artifacts" / "scales.json").unlink()
+    with pytest.raises(FileNotFoundError, match="scales.json"):
+        source_layer([run])
+
+
+def test_a_run_recording_no_layers_is_refused(tmp_path):
+    from stitch.compare import source_layer
+    import json
+    run = runnable(tmp_path / "a", seed=0)
+    (run / "artifacts" / "scales.json").write_text(json.dumps({}))
+    with pytest.raises(ValueError, match="no layers"):
+        source_layer([run])

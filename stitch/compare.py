@@ -292,6 +292,50 @@ def load_scales(path: Path) -> dict[str, float]:
     return {key: float(value) for key, value in json.loads(file.read_text()).items()}
 
 
+def source_layer(paths: list[Path]) -> str:
+    """The layer every one of these runs read, from the runs themselves.
+
+    The depth a run trained at is recorded with it, in the scales it wrote. So
+    a comparison does not have to be told which depth it is looking at, and
+    cannot be told the wrong one: every layer in this model is the same width,
+    so a comparison pointed at the wrong depth would run and produce numbers
+    that look like an answer.
+
+    The layer a coder reads is the first one its run recorded. A run
+    reconstructing another model's activation records two, in the order the
+    configuration named them, and reads the first.
+
+    Args:
+        paths: the run directories being compared.
+
+    Returns:
+        The layer key they all read.
+
+    Raises:
+        ValueError: if they do not all read the same one, which means they are
+            not comparable and nothing below this would notice.
+        FileNotFoundError: if a run recorded no scales.
+    """
+    if not paths:
+        raise ValueError("no runs to take a layer from")
+
+    found = {}
+    for path in paths:
+        keys = list(load_scales(path))
+        if not keys:
+            raise ValueError(f"{run_directory(path)} recorded no layers")
+        found.setdefault(keys[0], []).append(run_directory(path).name)
+
+    if len(found) > 1:
+        detail = "; ".join(f"{key} ({len(names)} runs)"
+                           for key, names in sorted(found.items()))
+        raise ValueError(
+            f"these runs did not all read the same layer: {detail}. "
+            f"Comparing them would compare two depths")
+
+    return next(iter(found))
+
+
 def best_match(a: Tensor, b: Tensor, chunk: int = 1024) -> Tensor:
     """For each column of ``a``, its highest cosine with any column of ``b``.
 
