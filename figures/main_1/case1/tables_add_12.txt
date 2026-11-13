@@ -1,0 +1,91 @@
+--- eval_explained_variance
+
+spread of eval_explained_variance across train.seed
+
+n    mean       std        min        max
+------------------------------------------------
+5    0.91125    0.00036    0.91087    0.91164
+--- eval_l0
+
+spread of eval_l0 across train.seed
+
+n    mean       std        min        max
+------------------------------------------------
+5    118.00000  0.00000    117.99999  118.00000
+--- eval_l0_frac
+
+spread of eval_l0_frac across train.seed
+
+n    mean       std        min        max
+------------------------------------------------
+5    0.15365    0.00000    0.15365    0.15365
+--- eval_effective_expansion
+
+spread of eval_effective_expansion across train.seed
+
+n    mean       std        min        max
+------------------------------------------------
+5    31.99792   0.00148    31.99609   32.00000
+--- eval_effective_features
+
+spread of eval_effective_features across train.seed
+
+n    mean       std        min        max
+------------------------------------------------
+5    6687.64480 90.05687   6587.83898 6819.35251
+--- eval_frequency_gini
+
+spread of eval_frequency_gini across train.seed
+
+n    mean       std        min        max
+------------------------------------------------
+5    0.63021    0.00201    0.62690    0.63182
+--- eval_max_feature_frequency
+
+spread of eval_max_feature_frequency across train.seed
+
+n    mean       std        min        max
+------------------------------------------------
+5    0.45363    0.01475    0.43205    0.47154
+--- eval_dead_or_dormant
+
+spread of eval_dead_or_dormant across train.seed
+
+n    mean       std        min        max
+------------------------------------------------
+5    0.00007    0.00005    0.00000    0.00012
+--- eval_dead_or_dormant_wider
+
+spread of eval_dead_or_dormant_wider across train.seed
+
+n    mean       std        min        max
+------------------------------------------------
+5    0.00001    0.00002    0.00000    0.00004
+--- train_dead
+
+spread of train_dead across train.seed
+
+n    mean       std        min        max
+------------------------------------------------
+5    0.00000    0.00000    0.00000    0.00000
+--- baseline_ratio
+
+spread of baseline_ratio across train.seed
+
+n    mean       std        min        max
+------------------------------------------------
+5    1.17564    0.00047    1.17514    1.17614
+--- agreement
+
+spread of agreement across train.seed
+
+n    mean       std        min        max
+------------------------------------------------
+5    0.95731    0.00170    0.95459    0.95879
+--- gate_passed
+
+spread of gate_passed across train.seed
+
+n    mean       std        min        max
+------------------------------------------------
+5    1.00000    0.00000    1.00000    1.00000
