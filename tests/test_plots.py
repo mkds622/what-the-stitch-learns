@@ -881,3 +881,90 @@ def test_the_matrix_figure_takes_a_panel_per_objective(tmp_path):
     assert plot_match_matrix({"case1": block(), "case2": block(strength=0.7),
                               "across": block(strength=0.4)},
                              tmp_path / "three_blocks.png").exists()
+
+# ----------------------------------------------------------------------
+# separating a figure by depth or by objective
+# ----------------------------------------------------------------------
+
+def arm(objective: str, layer: str, *values: float, metric="eval_l0") -> list[dict]:
+    """One arm's runs at one depth, named the way a grid names them."""
+    return [{"run_name": f"{objective}-main-x16-topk-s{seed}-abc123",
+             "point": {"train.seed": seed},
+             "scales": {layer: 2.3}, metric: value}
+            for seed, value in enumerate(values)]
+
+
+def test_the_objective_is_read_from_the_run_name():
+    from stitch.plots import objective_of
+    assert objective_of({"run_name": "case1-main-x16-topk-s0-abc123"}) == "case1"
+    assert objective_of({"run_name": "case2-main-x16-topk-s4-def456"}) == "case2"
+
+
+def test_a_record_with_no_name_has_no_objective():
+    from stitch.plots import objective_of
+    assert objective_of({"point": {"train.seed": 0}}) is None
+    assert objective_of({"run_name": ""}) is None
+
+
+def test_the_key_resolves_depth_and_objective_and_falls_back_to_the_point():
+    """The two things worth separating a figure by are not swept axes, so a
+    caller has to be able to name them as though they were."""
+    from stitch.plots import key_of
+    record = arm("case1", "A@add_12", 1.0)[0]
+    assert key_of(record, "depth") == "12"
+    assert key_of(record, "objective") == "case1"
+    assert key_of(record, "train.seed") == "0"
+    assert key_of(record, "coder.expansion") is None
+
+
+def test_split_by_objective_keeps_the_two_arms_apart():
+    """The gap between the objectives is the measurement. Averaging them into
+    one curve would hide it inside what reads as seed spread."""
+    from stitch.plots import split_series
+    records = (arm("case1", "A@add_4", 10.0, 12.0) + arm("case2", "A@add_4", 30.0, 32.0)
+               + arm("case1", "A@add_20", 20.0, 22.0) + arm("case2", "A@add_20", 40.0, 42.0))
+    curves = split_series(records, "depth", "eval_l0", "objective")
+
+    assert sorted(curves) == ["case1", "case2"]
+    assert [point.x for point in curves["case1"]] == [4.0, 20.0]
+    assert [point.mean for point in curves["case1"]] == [11.0, 21.0]
+    assert [point.mean for point in curves["case2"]] == [31.0, 41.0]
+    # the band is the seeds within one arm, never the two arms together
+    assert curves["case1"][0].low == 10.0 and curves["case1"][0].high == 12.0
+
+
+def test_split_by_depth_gives_one_curve_per_block():
+    from stitch.plots import split_series
+    records = arm("case1", "A@add_4", 1.0) + arm("case1", "A@add_24", 2.0)
+    curves = split_series(records, "train.seed", "eval_l0", "depth")
+    assert sorted(curves) == ["24", "4"]
+
+
+def test_a_record_without_the_split_key_is_left_out():
+    from stitch.plots import split_series
+    records = arm("case1", "A@add_4", 1.0) + [{"point": {"train.seed": 0}, "eval_l0": 9.0}]
+    curves = split_series(records, "depth", "eval_l0", "objective")
+    assert sorted(curves) == ["case1"]
+
+
+def test_the_tradeoff_can_be_coloured_by_depth(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_tradeoff
+    records = []
+    for layer, ev in [("A@add_4", 0.95), ("A@add_12", 0.91),
+                      ("A@add_20", 0.72), ("A@add_24", 0.60)]:
+        for row in arm("case1", layer, 115.0, 115.0, metric="eval_l0"):
+            row["eval_explained_variance"] = ev
+            records.append(row)
+    assert plot_tradeoff(records, tmp_path / "by_depth.png",
+                         label_by="depth").exists()
+
+
+def test_the_tradeoff_can_be_coloured_by_objective(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_tradeoff
+    records = arm("case1", "A@add_12", 115.0) + arm("case2", "A@add_12", 115.0)
+    for row in records:
+        row["eval_explained_variance"] = 0.9
+    assert plot_tradeoff(records, tmp_path / "by_objective.png",
+                         label_by="objective").exists()

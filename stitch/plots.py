@@ -53,6 +53,10 @@ def format_x(value: float) -> str:
 #: never reaches a run's point.
 DEPTH = "depth"
 
+#: The objective a run was trained on. Like DEPTH, a name a caller can ask for
+#: as though it were a setting, resolved from what the record carries.
+OBJECTIVE = "objective"
+
 
 def depth_of(record: dict) -> float | None:
     """The block a run trained at, as a number, from the layer it recorded.
@@ -74,6 +78,52 @@ def depth_of(record: dict) -> float | None:
     node = next(iter(scales)).partition("@")[2]
     digits = "".join(character for character in node if character.isdigit())
     return float(digits) if digits else None
+
+
+def objective_of(record: dict) -> str | None:
+    """Which objective a run was trained on, from its name.
+
+    Like the depth, this is in every record but not where a setting would be:
+    the objective comes from the configuration file rather than from a swept
+    axis, so two arms of the same programme are two grids rather than two
+    values of one setting. The run name opens with it.
+
+    Returns:
+        The leading part of the run name, or None when the record carries no
+        name to read it from.
+    """
+    name = record.get("run_name")
+    if not isinstance(name, str) or not name:
+        return None
+    return name.split("-")[0]
+
+
+def key_of(record: dict, name: str) -> str | None:
+    """What separates one curve or one group of points from another.
+
+    A grid records the axes it swept and nothing else, so the two things most
+    worth separating a figure by, the depth and the objective, are both absent
+    from ``point``. Both are recoverable from what the run did record, and
+    resolving them here means a caller asks for them by name exactly as it
+    asks for a setting.
+
+    Args:
+        record: one run's record.
+        name: ``depth``, ``objective``, or a dotted setting in ``point``.
+
+    Returns:
+        The value as text, or None when this record does not carry it, which
+        is how a record from another sweep is left out rather than grouped
+        under a placeholder.
+    """
+    if name == DEPTH:
+        depth = depth_of(record)
+        return None if depth is None else format_x(depth)
+    if name == OBJECTIVE:
+        return objective_of(record)
+
+    value = record.get("point", {}).get(name)
+    return None if value is None else str(value)
 
 
 def axis_of(record: dict, x: str) -> float | None:
@@ -202,10 +252,10 @@ def split_series(results: list[dict], x: str, metric: str,
     for record in results:
         if "error" in record:
             continue
-        point = record.get("point", {})
-        if split_by not in point:
+        label = key_of(record, split_by)
+        if label is None:
             continue
-        groups.setdefault(str(point[split_by]), []).append(record)
+        groups.setdefault(label, []).append(record)
 
     return {label: series(groups[label], x, metric)
             for label in sorted(groups, key=_sortable)}
@@ -340,9 +390,11 @@ def plot_tradeoff(results: list[dict], path: Path, label_by: str | None = None,
     else:
         groups: dict[str, list[dict]] = {}
         for record in usable:
-            groups.setdefault(str(record["point"].get(label_by, "?")), []).append(record)
-        for label, rows in sorted(groups.items()):
-            axes.scatter([r[x_metric] for r in rows], [r[y_metric] for r in rows], label=label)
+            groups.setdefault(key_of(record, label_by) or "?", []).append(record)
+        for label in sorted(groups, key=_sortable):
+            rows = groups[label]
+            axes.scatter([r[x_metric] for r in rows], [r[y_metric] for r in rows],
+                         label=label)
         axes.legend(title=label_by.split(".")[-1], fontsize=9)
 
     axes.set_xlabel(f"{x_metric}   (active features per token, lower is sparser)")

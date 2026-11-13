@@ -50,7 +50,7 @@ METRICS=(
 )
 
 mkdir -p grids logs comparisons/main2
-mkdir -p figures/main2/case1 figures/main2/case2 figures/main2/comparison
+mkdir -p figures/main2/case1 figures/main2/case2 figures/main2/both figures/main2/comparison
 
 layers_for() {
   # One entry reads and reconstructs the same layer. Two read the first and
@@ -132,10 +132,44 @@ report_arm() {
       --out "${dir}/by_depth_${metric}.png"
   done
 
+  # Coloured by depth, so the four blocks are told apart rather than drawn as
+  # one undifferentiated cloud.
   echo "=== tradeoff across depths, ${objective}"
   $DRY python scripts/plot.py \
-    --results "${grids[@]}" --tradeoff \
+    --results "${grids[@]}" --tradeoff --label-by depth \
     --out "${dir}/tradeoff_all_depths.png"
+}
+
+# ----------------------------------------------------------------------
+# both arms on one pair of axes
+# ----------------------------------------------------------------------
+
+report_both() {
+  local dir="figures/main2/both"
+  local grids=()
+  for objective in case1 case2; do
+    for block in "${BLOCKS[@]}"; do
+      [[ -f "grids/main2_${objective}_${block}.json" ]] \
+        && grids+=("grids/main2_${objective}_${block}.json")
+    done
+  done
+  [[ ${#grids[@]} -gt 0 ]] || return
+
+  # One line per objective, each carrying its own seed spread. Everything
+  # above draws the two arms into separate files, where the distance between
+  # them is the one thing that cannot be read. This is where it is drawn.
+  for metric in "${METRICS[@]}"; do
+    echo "=== ${metric} across depths, both arms"
+    $DRY python scripts/plot.py \
+      --results "${grids[@]}" \
+      --x depth --metric "$metric" --linear-x --split-by objective \
+      --out "${dir}/by_depth_${metric}.png"
+  done
+
+  echo "=== tradeoff, both arms"
+  $DRY python scripts/plot.py \
+    --results "${grids[@]}" --tradeoff --label-by objective \
+    --out "${dir}/tradeoff_all.png"
 }
 
 # ----------------------------------------------------------------------
@@ -176,13 +210,14 @@ compare_depth() {
 case "$STAGE" in
   case1)   train_arm case1 ;;
   case2)   train_arm case2 ;;
-  report)  report_arm case1; report_arm case2 ;;
+  report)  report_arm case1; report_arm case2; report_both ;;
   compare) for block in "${BLOCKS[@]}"; do compare_depth "$block"; done ;;
   all)
     train_arm case1
     train_arm case2
     report_arm case1
     report_arm case2
+    report_both
     for block in "${BLOCKS[@]}"; do compare_depth "$block"; done
     ;;
   *)
