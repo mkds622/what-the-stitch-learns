@@ -29,7 +29,7 @@ models:
 layer_pairs:
   count: 3
   matched_depth_only: true
-  ranking_file: sweeps/layer_sweep_smoke.json
+  ranking_file: sweeps/layer_sweep_control.json
 
 sweep:
   metric: explained_variance
@@ -37,17 +37,21 @@ sweep:
   out_file: sweeps/layer_sweep_smoke.json
 
 coder:
-  expansion: 8
+  expansion: 16
+  tie_decoder_init: false 
   sparsity:
-    mode: l1
+    mode: topk
+    k_frac: 0.153
     coeff: 30.72
     normalize_decoder: true
   dead_features:
     track_window: 1000
+    aux_loss_coeff: 0.03125
+    aux_k_frac: 0.05
 
 activations:
   mode: on_the_fly
-  layers: ["A@add_14"]
+  layers: ["A@add_12"]
   extraction_batch_size: 32
 
 train:

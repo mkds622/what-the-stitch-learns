@@ -42,26 +42,30 @@ sweep:
   out_file: sweeps/layer_sweep_control.json
 
 coder:
-  expansion: 16                  
+  expansion: 16
+  tie_decoder_init: false                
   sparsity:
-    mode: l1
+    mode: topk
+    k_frac: 0.15
     coeff: 30.72                  
     normalize_decoder: true
   dead_features:
     track_window: 1000
+    aux_loss_coeff: 0.03125
+    aux_k_frac: 0.05
 
 activations:
   mode: on_the_fly
   # One entry: read and reconstruct the same layer.
   # Two entries: read the first, reconstruct the second.
-  layers: ["A@add_14"]           # PENDING: confirm against this model
+  layers: ["A@add_12"]           # PENDING: confirm against this model
   extraction_batch_size: 128
   scaling: unit_norm
   scale_tokens: 100000
   shuffle_buffer_tokens: 500000  # PENDING
 
 train:
-  tokens: 200000000
+  tokens: 400000000
   token_batch: 4096
   lr: 1e-4                       
   optimizer: adam
@@ -83,3 +87,8 @@ logging:
 eval:
   batches: 50
   images: 5000
+  fit_fraction: 0.8         
+  min_l0: 1.0
+  max_l0_frac: 0.5          
+  max_allowed_silent: 0.5   
+  max_feature_frequency: 0.9
