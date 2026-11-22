@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv.broken/
 venv/
 .env
 *.pt
@@ -11,3 +12,18 @@ activations/
 mlruns/
 .ipynb_checkpoints/
 .DS_Store
+
+runs/
+archive/
+crashes/
+logs/
+mlruns/
+mlflow.db
+mlartifacts/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+.tmp/
+
+external/
