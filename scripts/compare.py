@@ -137,7 +137,7 @@ def _activations(config: Path, layer: str, device: str):
     """
     from stitch.activations import build_source
     from stitch.config import load_config
-    from stitch.data import build_dataset, build_loader, build_transform
+    from stitch.data import build_dataset, build_loader, normalizer_for, shared_transform
     from stitch.run import load_models
 
     cfg = load_config(config)
@@ -146,11 +146,11 @@ def _activations(config: Path, layer: str, device: str):
     models, backbones = load_models(cfg)
 
     loader = build_loader(
-        cfg, build_dataset(cfg, cfg.dataset.eval_split,
-                           build_transform(next(iter(backbones.values())))),
+        cfg, build_dataset(cfg, cfg.dataset.eval_split, shared_transform(backbones)),
         cfg.activations.extraction_batch_size, shuffle=False)
 
-    source = build_source(cfg, models, loader)
+    normalizers = {label: normalizer_for(backbone) for label, backbone in backbones.items()}
+    source = build_source(cfg, models, loader, normalizers)
     source.set_scales({layer: 1.0})
     return source
 
@@ -322,22 +322,12 @@ def main(argv=None) -> int:
                              "for the dataset and the backbone. The depth is "
                              "taken from the runs themselves, so this does not "
                              "have to name the one they were trained at")
-    # One pass over the evaluation split, which is what the firing comparison
-    # is meant to read. The stream wraps rather than ending, so a count larger
-    # than the split reads the same tokens twice and overstates how much
-    # independent data the correlation rests on.
-    #
-    # The number is a property of the dataset: images in the evaluation split
-    # times tokens per image, which for a ViT-B/16 at 224 is 196 patches plus
-    # the class token. It sits here as a literal because the stream exposes
-    # neither quantity. Deriving it from len(loader.dataset) and the token
-    # dimension of the first extracted block would remove the need to keep it
-    # in step with the split.
-    parser.add_argument("--firing-tokens", type=int, default=984_803,
+    # Unset, the firing comparison reads the evaluation split once, every token
+    # exactly once, and stops. A number caps it below that, for a quick look.
+    parser.add_argument("--firing-tokens", type=int, default=None,
                         dest="firing_tokens",
-                        help="evaluation tokens the firing comparison reads. "
-                             "The default is one pass over the evaluation "
-                             "split and changes with it")
+                        help="cap on the evaluation tokens the firing comparison "
+                             "reads. Unset reads the whole evaluation split once")
     parser.add_argument("--firing-binary", action="store_true",
                         dest="firing_binary",
                         help="compare whether features fired rather than how "
@@ -408,8 +398,9 @@ def main(argv=None) -> int:
         # same backbone for every pair, since every run here reads the same
         # layer of the same model.
         source = _activations(args.config, source_key, args.device)
-        log.info("firing comparison reads %s over %d tokens on %s",
-                 source_key, args.firing_tokens, args.device)
+        log.info("firing comparison reads %s over %s on %s", source_key,
+                 "the whole evaluation split" if args.firing_tokens is None
+                 else f"{args.firing_tokens} tokens", args.device)
 
     # The per-feature firing figures draw one pair of each kind. Which pair
     # that is is decided here, as the loop reaches it, so the material can be
@@ -439,7 +430,7 @@ def main(argv=None) -> int:
                 pairing = (record["encoder_assigned_rows"],
                            record["encoder_assigned_columns"])
             record.update(compare_firing(
-                a, b, source.batches(), source_key, args.firing_tokens,
+                a, b, source.single_pass(), source_key, args.firing_tokens,
                 close=args.close, binary=args.firing_binary, bands=args.bands,
                 keep_distribution=drawing, assign=assigning,
                 null=not args.no_firing_null, device=args.device,

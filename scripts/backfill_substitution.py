@@ -29,7 +29,7 @@ import torch                                                          # noqa: E4
 from stitch.coder import build_coder                                  # noqa: E402
 from stitch.compare import from_grids, latest_checkpoint              # noqa: E402
 from stitch.config import Config, ModelConfig, load_config            # noqa: E402
-from stitch.data import build_dataset, build_loader, build_transform  # noqa: E402
+from stitch.data import build_dataset, build_loader, shared_transform  # noqa: E402
 from stitch.evaluate import substitution_accuracy                     # noqa: E402
 from stitch.labels import label_map_for                               # noqa: E402
 from stitch.run import build_halves, load_models                      # noqa: E402
@@ -106,9 +106,7 @@ def eval_loader_for(cfg, backbones: dict[str, object]):
     stream. The loader itself is assembled exactly as ``build_streams``
     assembles it, so it sees the same images in the same order.
     """
-    reference = next(iter(backbones.values()))
-    transform = build_transform(reference)
-    dataset = build_dataset(cfg, cfg.dataset.eval_split, transform)
+    dataset = build_dataset(cfg, cfg.dataset.eval_split, shared_transform(backbones))
     return build_loader(cfg, dataset, cfg.activations.extraction_batch_size,
                         shuffle=False)
 
@@ -157,7 +155,7 @@ def redo(run_dir: Path, reference: str | None = None, dry_run: bool = False) -> 
 
     models, backbones = load_models(cfg)
     loader = eval_loader_for(cfg, backbones)
-    upper, lower, reference_upper = build_halves(cfg, models)
+    upper, lower, reference_upper = build_halves(cfg, models, backbones)
 
     result = substitution_accuracy(
         coder, upper, lower, loader,

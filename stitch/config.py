@@ -359,7 +359,7 @@ class EvalConfig:
     "unused".
     """
 
-    batches: int = 50
+    batches: int | None = 50          # held-out token batches; None reads the whole split once
     images: int = 5000
     wider_tokens: int = 2_000_000     # tokens in the second silent-share pass
     linear_fit: float = 1.0           # explained variance of the linear stitch here
@@ -442,8 +442,8 @@ class Config:
                     f"layer key {key!r} must be '<model label>@<node name>', "
                     f"for example 'A@blocks.6'")
 
-        if self.eval.batches < 1:
-            raise ValueError("eval.batches must be at least 1")
+        if self.eval.batches is not None and self.eval.batches < 1:
+            raise ValueError("eval.batches must be at least 1, or unset to read the whole split")
 
         if self.eval.wider_tokens < 1:
             raise ValueError("eval.wider_tokens must be at least 1")

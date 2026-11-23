@@ -257,7 +257,7 @@ class LinearStitch(nn.Module):
 # the sweep
 # ----------------------------------------------------------------------
 
-def accumulate(extractor, loader, pairs, widths, fit_tokens: int,
+def accumulate(extractor, loader, pairs, widths, fit_tokens: int | None,
                device: torch.device | str = "cpu") -> CrossMoments:
     """Run images through the models until enough tokens have been seen.
 
@@ -267,7 +267,8 @@ def accumulate(extractor, loader, pairs, widths, fit_tokens: int,
         loader: images.
         pairs: the pairs being fitted.
         widths: width per node name.
-        fit_tokens: stop once this many tokens have been folded in.
+        fit_tokens: stop once this many tokens have been folded in. None reads
+            the loader to its end, every image once.
         device: where to accumulate.
 
     Returns:
@@ -277,7 +278,7 @@ def accumulate(extractor, loader, pairs, widths, fit_tokens: int,
 
     with torch.no_grad():
         for images, _ in loader:
-            if moments.tokens >= fit_tokens:
+            if fit_tokens is not None and moments.tokens >= fit_tokens:
                 break
             captured = extractor(images.to(device))
             moments.update({name: value.reshape(-1, value.shape[-1])
@@ -457,7 +458,9 @@ def run_sweep(cfg) -> list[dict]:
     Returns:
         The ranking, best first, also written to ``sweep.out_file``.
     """
-    from stitch.data import build_dataset, build_loader, build_transform
+    from torch import nn
+
+    from stitch.data import build_dataset, build_loader, normalizer_for, shared_transform
     from stitch.models import block_outputs, layer_key, load_backbone, make_extractor, trace
 
     if cfg.models.b is None:
@@ -473,7 +476,11 @@ def run_sweep(cfg) -> list[dict]:
         models[label] = trace(backbones[label]).to(device).eval()
         log.info("loaded %s as %s", spec.name, label)
 
-    transform = build_transform(backbones["A"])
+    # One decoded and cropped image for both models, each normalising it its
+    # own way, so neither reads the other's preprocessing.
+    transform = shared_transform(backbones)
+    normalizers = {label: normalizer_for(backbone).to(device)
+                   for label, backbone in backbones.items()}
     loader = build_loader(cfg, build_dataset(cfg, cfg.dataset.split, transform),
                           cfg.activations.extraction_batch_size, shuffle=True)
     held_out_loader = build_loader(
@@ -483,7 +490,7 @@ def run_sweep(cfg) -> list[dict]:
     probe = next(iter(loader))[0][:2].to(device)
     nodes, widths = {}, {}
     for label, model in models.items():
-        found = block_outputs(model, probe)
+        found = block_outputs(model, normalizers[label](probe))
         if cfg.sweep.depths is not None:
             found = [found[index] for index in cfg.sweep.depths]
         nodes[label] = [layer_key(label, info.name) for info in found]
@@ -492,7 +499,9 @@ def run_sweep(cfg) -> list[dict]:
     pairs = candidate_pairs(nodes["A"], nodes["B"], cfg.layer_pairs.matched_depth_only)
     log.info("sweeping %d pairs over %d tokens", len(pairs), cfg.sweep.fit_tokens)
 
-    extractors = {label: make_extractor(model, [key.split("@", 1)[1] for key in nodes[label]])
+    extractors = {label: nn.Sequential(
+                      normalizers[label],
+                      make_extractor(model, [key.split("@", 1)[1] for key in nodes[label]]))
                   for label, model in models.items()}
 
     def extract(images):
@@ -505,8 +514,10 @@ def run_sweep(cfg) -> list[dict]:
 
     moments = accumulate(extract, loader, pairs, widths,
                          cfg.sweep.fit_tokens, cfg.train.device)
+    # Scored on the whole held-out split, every image once, so the fit a coder
+    # is judged against covers every class.
     held_out = accumulate(extract, held_out_loader, pairs, widths,
-                          cfg.sweep.fit_tokens, cfg.train.device)
+                          None, cfg.train.device)
     records = rank(moments, cfg.sweep.ridge, held_out=held_out)
 
     # Kept rather than discarded: every coder trained at any of these depths is

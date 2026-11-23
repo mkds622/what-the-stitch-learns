@@ -130,7 +130,7 @@ def frequency_concentration(frequencies: Tensor) -> dict[str, float]:
 
 @torch.no_grad()
 def reconstruction_metrics(coder: SparseCoder, batches: Iterator[dict[str, Tensor]],
-                           source_key: str, target_key: str, count: int,
+                           source_key: str, target_key: str, count: int | None,
                            device: torch.device | str = "cpu") -> dict[str, float]:
     """How well the coder describes activations it was not trained on.
 
@@ -140,7 +140,9 @@ def reconstruction_metrics(coder: SparseCoder, batches: Iterator[dict[str, Tenso
         source_key: layer the coder reads.
         target_key: layer it reconstructs. The same as ``source_key`` when it
             reproduces its own input.
-        count: batches to average over. More is tighter and slower.
+        count: batches to average over. None reads the stream to its end,
+            which with a single pass over the evaluation split is every token
+            in it.
         device: where to run.
 
     Returns:
@@ -183,7 +185,7 @@ def reconstruction_metrics(coder: SparseCoder, batches: Iterator[dict[str, Tenso
     tokens = 0
 
     for index, batch in enumerate(batches):
-        if index >= count:
+        if count is not None and index >= count:
             break
 
         x = batch[source_key].to(device)
@@ -234,7 +236,7 @@ def reconstruction_metrics(coder: SparseCoder, batches: Iterator[dict[str, Tenso
 
 @torch.no_grad()
 def feature_frequencies(coder: SparseCoder, batches: Iterator[dict[str, Tensor]],
-                        source_key: str, count: int,
+                        source_key: str, count: int | None,
                         device: torch.device | str = "cpu") -> Tensor:
     """Share of tokens each feature fires on.
 
@@ -247,7 +249,7 @@ def feature_frequencies(coder: SparseCoder, batches: Iterator[dict[str, Tensor]]
     fired = torch.zeros(coder.d_latent, device=device)
     tokens = 0
     for index, batch in enumerate(batches):
-        if index >= count:
+        if count is not None and index >= count:
             break
         latents = coder.encode(batch[source_key].to(device))
         fired += (latents > 0).float().sum(dim=0)

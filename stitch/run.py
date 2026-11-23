@@ -29,7 +29,7 @@ import torch
 from stitch.activations import build_source
 from stitch.coder import build_coder
 from stitch.config import load_config
-from stitch.data import build_loader, build_transform, build_dataset
+from stitch.data import build_dataset, build_loader, normalizer_for, shared_transform
 from stitch.evaluate import (evaluate, feature_frequencies,
                              silent_at_wider_window, substitution_accuracy)
 from stitch.labels import label_map_for
@@ -80,6 +80,10 @@ def load_models(cfg) -> tuple[dict[str, object], dict[str, object]]:
 def build_streams(cfg, models: dict[str, object], backbones: dict[str, object]):
     """Activation sources over the training and evaluation splits.
 
+    One loader per split, shared by every model: each image is decoded, resized
+    and cropped once, and each model applies its own normalisation to it before
+    reading it. No model is fed another model's preprocessing.
+
     The evaluation source adopts the training source's scales rather than
     measuring its own. Two sets of scalars would mean the two were measured in
     different units, and every evaluation number would be off by a factor
@@ -90,9 +94,13 @@ def build_streams(cfg, models: dict[str, object], backbones: dict[str, object]):
         models: traced backbones, which is what activations are extracted from.
         backbones: the same models untraced, which is where the preprocessing
             comes from, since tracing does not carry it.
+
+    Returns:
+        ``(training, evaluation, eval_loader)``. The loader yields images in
+        ``[0, 1]``, before any model's normalisation.
     """
-    reference = next(iter(backbones.values()))
-    transform = build_transform(reference)
+    transform = shared_transform(backbones)
+    normalizers = {label: normalizer_for(backbone) for label, backbone in backbones.items()}
     batch_size = cfg.activations.extraction_batch_size
 
     train_loader = build_loader(cfg, build_dataset(cfg, cfg.dataset.split, transform),
@@ -100,11 +108,23 @@ def build_streams(cfg, models: dict[str, object], backbones: dict[str, object]):
     eval_loader = build_loader(cfg, build_dataset(cfg, cfg.dataset.eval_split, transform),
                                batch_size, shuffle=False)
 
-    training = build_source(cfg, models, train_loader)
-    evaluation = build_source(cfg, models, eval_loader)
+    training = build_source(cfg, models, train_loader, normalizers)
+    evaluation = build_source(cfg, models, eval_loader, normalizers)
     evaluation.set_scales(training.scales())
 
     return training, evaluation, eval_loader
+
+
+def held_out(evaluation, cfg):
+    """The evaluation tokens the held-out metrics read.
+
+    With ``eval.batches`` unset, every token of the evaluation split exactly
+    once. With a number, that many batches from the shuffled stream, which is
+    what a generated control, having no split to exhaust, has to use.
+    """
+    if cfg.eval.batches is None:
+        return evaluation.single_pass()
+    return evaluation.batches()
 
 
 def resolve_linear_fit(cfg) -> float:
@@ -244,12 +264,14 @@ def resolve_baseline_map(cfg, source_key: str, target_key: str,
     return LinearStitch(weight, bias)
 
 
-def build_halves(cfg, models: dict[str, object]):
+def build_halves(cfg, models: dict[str, object], backbones: dict[str, object]):
     """The parts of the model above and below the cut, for substitution.
 
     The upper half comes from the model the coder reads. The lower half comes
     from the model it reconstructs, which is the same one when the coder
-    reproduces its own input and a different one otherwise.
+    reproduces its own input and a different one otherwise. Each upper half
+    starts with its own model's normalisation, so both take the images the
+    shared loader yields, in ``[0, 1]``.
 
     Returns:
         ``(upper, lower, reference_upper)``. The third is the target model's own
@@ -258,16 +280,20 @@ def build_halves(cfg, models: dict[str, object]):
         rejoined, rather than the source model's activation handed to the target
         model's layers, which is not a model and predicts at chance.
     """
+    from torch import nn
+
     from stitch.models import downstream, upstream
 
     source_key, target_key = resolve_layers(cfg)
     source_label, source_node = parse_layer_key(source_key)
     target_label, target_node = parse_layer_key(target_key)
 
-    upper = upstream(models[source_label], source_node)
+    upper = nn.Sequential(normalizer_for(backbones[source_label]),
+                          upstream(models[source_label], source_node))
     lower = downstream(models[target_label], target_node)
     reference_upper = (None if source_label == target_label
-                       else upstream(models[target_label], target_node))
+                       else nn.Sequential(normalizer_for(backbones[target_label]),
+                                          upstream(models[target_label], target_node)))
 
     return upper, lower, reference_upper
 
@@ -335,7 +361,7 @@ def run(cfg, resume: Path | None = None) -> dict:
                     "centres.json")
 
     def hook(current, step):
-        return evaluate(current, evaluation.batches(), source_key, target_key,
+        return evaluate(current, held_out(evaluation, cfg), source_key, target_key,
                         cfg, cfg.train.device)
 
     final = train(cfg, training, coder, tracker, logger, run_dir,
@@ -345,9 +371,9 @@ def run(cfg, resume: Path | None = None) -> dict:
     # These carry the linear fit the coder was judged against and the ratio
     # between the two, so the summary records the comparison and not only the
     # side of it the coder produced.
-    held_out = evaluate(coder, evaluation.batches(), source_key, target_key,
-                        cfg, cfg.train.device)
-    logger.log_metrics(held_out, step=int(final.get("tokens", 0)))
+    held_out_metrics = evaluate(coder, held_out(evaluation, cfg), source_key, target_key,
+                                cfg, cfg.train.device)
+    logger.log_metrics(held_out_metrics, step=int(final.get("tokens", 0)))
 
     # What the evaluation window cannot say. It reads a few hundred thousand
     # tokens, so a feature rarer than that reads there as one that never fired,
@@ -367,15 +393,15 @@ def run(cfg, resume: Path | None = None) -> dict:
 
     # What a fixed basis of the same size per token reaches here, so the
     # dictionary is read against something rather than against nothing.
-    baseline = resolve_baseline(cfg, source_key, target_key, held_out["eval_l0"])
+    baseline = resolve_baseline(cfg, source_key, target_key, held_out_metrics["eval_l0"])
     if baseline.get("baseline_explained_variance"):
-        baseline["baseline_ratio"] = (held_out["eval_explained_variance"]
+        baseline["baseline_ratio"] = (held_out_metrics["eval_explained_variance"]
                                       / baseline["baseline_explained_variance"])
     logger.log_metrics(baseline, step=int(final.get("tokens", 0)))
 
     # The distribution behind eval_frequency_gini, kept because the shape is
     # the thing and a summary number cannot show it.
-    frequencies = feature_frequencies(coder, evaluation.batches(), source_key,
+    frequencies = feature_frequencies(coder, held_out(evaluation, cfg), source_key,
                                       cfg.eval.batches, cfg.train.device)
     logger.log_dict({"frequencies": frequencies.tolist()}, "feature_frequencies.json")
 
@@ -384,7 +410,7 @@ def run(cfg, resume: Path | None = None) -> dict:
     # put a reconstruction back into.
     substitution: dict[str, float] = {}
     if not synthetic:
-        upper, lower, reference_upper = build_halves(cfg, models)
+        upper, lower, reference_upper = build_halves(cfg, models, backbones)
         substitution = substitution_accuracy(
             coder, upper, lower, eval_loader,
             scale_in=scales[source_key], scale_out=scales[target_key],
@@ -396,7 +422,7 @@ def run(cfg, resume: Path | None = None) -> dict:
         logger.log_metrics(substitution, step=int(final.get("tokens", 0)))
 
     summary = {"hash": config_hash, "run_name": name, "scales": scales,
-               **final, **held_out, **train_dead, **wider, **baseline,
+               **final, **held_out_metrics, **train_dead, **wider, **baseline,
                **substitution}
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     logger.end_run()

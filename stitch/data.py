@@ -7,7 +7,8 @@ activations that are quietly wrong. The backbone carries that information, so
 the transform is built from the model and nothing about preprocessing appears
 in the configuration. From the point where two models are involved this also
 stops being a choice: one setting cannot be correct for two checkpoints that
-disagree.
+disagree. Two backbones that agree on size, interpolation and crop share one
+decoded image, and each applies its own normalisation to it.
 
 Preprocessing is deterministic for every split, training included. Augmentation
 exists to make a classifier generalise; here the classifier is frozen and what
@@ -43,14 +44,8 @@ log = logging.getLogger(__name__)
 # preprocessing
 # ----------------------------------------------------------------------
 
-def build_transform(model: nn.Module):
-    """The preprocessing pipeline the backbone was trained with.
-
-    Args:
-        model: a loaded backbone carrying its own data configuration.
-
-    Returns:
-        A callable turning a PIL image into a normalised tensor.
+def data_config(model: nn.Module) -> dict:
+    """What the backbone declares about its own preprocessing.
 
     Raises:
         ValueError: if the model does not declare what it expects. Guessing
@@ -64,13 +59,93 @@ def build_transform(model: nn.Module):
 
     try:
         from timm.data import resolve_model_data_config
-        config = resolve_model_data_config(model)
+        return dict(resolve_model_data_config(model))
     except ImportError:
         from timm.data import resolve_data_config
-        config = resolve_data_config(model=model)
+        return dict(resolve_data_config(model=model))
+
+
+def build_transform(model: nn.Module, normalize: bool = True):
+    """The preprocessing pipeline the backbone was trained with.
+
+    Args:
+        model: a loaded backbone carrying its own data configuration.
+        normalize: apply the backbone's own mean and standard deviation. Off,
+            the pipeline stops at pixel values in ``[0, 1]``, and the
+            normalisation is applied separately per model by
+            :func:`normalizer_for`.
+
+    Returns:
+        A callable turning a PIL image into a tensor.
+
+    Raises:
+        ValueError: if the model does not declare what it expects.
+    """
+    config = data_config(model)
+    if not normalize:
+        config["mean"] = (0.0, 0.0, 0.0)
+        config["std"] = (1.0, 1.0, 1.0)
 
     from timm.data import create_transform
     return create_transform(**config, is_training=False)
+
+
+# What decides which pixels a model sees, as opposed to how they are scaled.
+# Models that agree on these can share one decoded and cropped image, each
+# normalising it its own way.
+SHARED_PREPARATION = ("input_size", "interpolation", "crop_pct", "crop_mode")
+
+
+def shared_transform(backbones: dict[str, nn.Module]):
+    """One transform for several backbones, stopping before normalisation.
+
+    Every backbone sees the same pixels and applies its own normalisation
+    afterwards, through :func:`normalizer_for`. One image is read once, and no
+    model is fed another model's preprocessing.
+
+    Args:
+        backbones: the untraced backbones, by label, which carry their data
+            configurations.
+
+    Returns:
+        A callable turning a PIL image into a tensor in ``[0, 1]``.
+
+    Raises:
+        ValueError: if the backbones disagree on size, interpolation or crop,
+            since then no single image is the right one for all of them.
+    """
+    if not backbones:
+        raise ValueError("shared_transform needs at least one backbone")
+
+    configs = {label: data_config(model) for label, model in backbones.items()}
+    first_label = next(iter(configs))
+    for label, config in configs.items():
+        for key in SHARED_PREPARATION:
+            if config.get(key) != configs[first_label].get(key):
+                raise ValueError(
+                    f"{first_label} and {label} disagree on {key} "
+                    f"({configs[first_label].get(key)!r} and {config.get(key)!r}), "
+                    f"so one image cannot be prepared correctly for both")
+
+    return build_transform(backbones[first_label], normalize=False)
+
+
+class Normalize(nn.Module):
+    """A backbone's own normalisation, applied to a batch of ``[0, 1]`` images."""
+
+    def __init__(self, mean, std):
+        super().__init__()
+        self.register_buffer("mean", torch.tensor(mean, dtype=torch.float32).view(1, -1, 1, 1))
+        self.register_buffer("std", torch.tensor(std, dtype=torch.float32).view(1, -1, 1, 1))
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        return (images - self.mean) / self.std
+
+
+def normalizer_for(model: nn.Module) -> Normalize:
+    """The normalisation one backbone was trained with, as a module."""
+    config = data_config(model)
+    return Normalize(config["mean"], config["std"])
 
 
 # ----------------------------------------------------------------------

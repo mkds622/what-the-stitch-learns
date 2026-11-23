@@ -1249,7 +1249,7 @@ def load_coder(path: Path, device: torch.device | str = "cpu"):
 
 
 @torch.no_grad()
-def firing_correlation(coder_a, coder_b, batches, source_key: str, tokens: int,
+def firing_correlation(coder_a, coder_b, batches, source_key: str, tokens: int | None,
                        scale_a: float = 1.0, scale_b: float = 1.0,
                        binary: bool = False, null: bool = False,
                        device: torch.device | str = "cpu",
@@ -1271,7 +1271,9 @@ def firing_correlation(coder_a, coder_b, batches, source_key: str, tokens: int,
         batches: an activation stream, usually over the evaluation split.
         source_key: the layer both coders read. The tokens must arrive
             unscaled, since each coder has its own scale applied below.
-        tokens: how many to read before stopping.
+        tokens: how many to read before stopping. None reads the stream to
+            its end, which for a single pass over the evaluation split is
+            every token in it, once.
         scale_a: the scalar ``coder_a``'s layer was divided by during its run.
         scale_b: the same for ``coder_b``. Separate rather than shared,
             because the scalars are measured from the first tokens of a
@@ -1338,7 +1340,7 @@ def firing_correlation(coder_a, coder_b, batches, source_key: str, tokens: int,
     seen = 0
 
     for batch in batches:
-        if seen >= tokens:
+        if tokens is not None and seen >= tokens:
             break
         x = batch[source_key].to(device)
 
@@ -1556,7 +1558,7 @@ def detail_from_scores(scores: Tensor, rows: Tensor, columns: Tensor,
 
 
 def compare_firing(path_a: Path, path_b: Path, batches, source_key: str,
-                   tokens: int, close: float = 0.9, binary: bool = False,
+                   tokens: int | None, close: float = 0.9, binary: bool = False,
                    bands: int = 4, keep_distribution: bool = False,
                    assign: bool = True, null: bool = True,
                    device: torch.device | str = "cpu",
@@ -1579,7 +1581,7 @@ def compare_firing(path_a: Path, path_b: Path, batches, source_key: str,
         path_b: the run it is compared against.
         batches: an activation stream over the evaluation split.
         source_key: the layer both coders read.
-        tokens: how many to read.
+        tokens: how many to read. None reads the stream to its end.
         close: the correlation above which two features count as responding to
             the same inputs.
         binary: compare whether features fired rather than how hard.

@@ -84,7 +84,7 @@ logging:
   csv_mirror: true
 
 eval:
-  batches: 50
+  batches: null            # every token of the evaluation split, once
   images: 5000
   fit_fraction: 0.8         
   min_l0: 1.0

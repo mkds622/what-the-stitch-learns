@@ -96,6 +96,16 @@ class ActivationSource(ABC):
     def batches(self) -> Iterator[TokenBatch]:
         """Yield ``{layer key: (token_batch, width)}`` forever."""
 
+    def single_pass(self) -> Iterator[TokenBatch]:
+        """Every token of a finite split exactly once, then stop.
+
+        Only a source reading real images has an end to reach. A generated
+        stream has none, so asking it for one is an error.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} is endless and has no single pass; "
+            f"set eval.batches to a number of batches")
+
     @abstractmethod
     def widths(self) -> dict[str, int]:
         """Activation width per layer key, which sets the coder's dimensions."""
@@ -136,16 +146,22 @@ class OnTheFlyActivations(ActivationSource):
     requested from it, so asking for six layers costs what asking for one costs.
     """
 
-    def __init__(self, cfg, models: dict[str, nn.Module], loader: DataLoader):
+    def __init__(self, cfg, models: dict[str, nn.Module], loader: DataLoader,
+                 normalizers: dict[str, nn.Module] | None = None):
         """
         Args:
             cfg: the run configuration.
             models: traced backbones by label, matching the labels in
                 ``activations.layers``.
             loader: images to run through them.
+            normalizers: each model's own normalisation, by label, applied to
+                the images before that model sees them, for a loader that stops
+                before normalising. None for a loader that already normalises,
+                which is only correct when a single model reads it.
 
         Raises:
-            KeyError: if a layer names a model that was not supplied.
+            KeyError: if a layer names a model that was not supplied, or
+                normalizers are given and one of the models has none.
             ValueError: on an unknown scaling mode.
         """
         self.cfg = cfg
@@ -170,7 +186,12 @@ class OnTheFlyActivations(ActivationSource):
                 raise KeyError(
                     f"activations.layers names model {label!r}, which was not supplied")
             nodes = [node for other, node in parsed if other == label]
-            self.extractors[label] = make_extractor(models[label], nodes).to(self.device).eval()
+            extractor = make_extractor(models[label], nodes)
+            if normalizers is not None:
+                if label not in normalizers:
+                    raise KeyError(f"no normalisation supplied for model {label!r}")
+                extractor = nn.Sequential(normalizers[label], extractor)
+            self.extractors[label] = extractor.to(self.device).eval()
 
         self.generator = torch.Generator().manual_seed(cfg.train.seed)
         self._widths: dict[str, int] = {}
@@ -179,20 +200,60 @@ class OnTheFlyActivations(ActivationSource):
 
     # ------------------------------------------------------------------
 
+    def _extract(self, images: torch.Tensor) -> TokenBatch:
+        """Every requested layer for one batch of images, flattened to tokens."""
+        images = images.to(self.device, non_blocking=True)
+        block = {}
+        with torch.no_grad():
+            for label, extractor in self.extractors.items():
+                for node, value in extractor(images).items():
+                    block[layer_key(label, node)] = value.reshape(-1, value.shape[-1])
+
+        if not self._widths:
+            self._widths = {key: value.shape[-1] for key, value in block.items()}
+        return block
+
     def _blocks(self) -> Iterator[TokenBatch]:
         """One entry per image batch, flattened to tokens, unscaled."""
         while True:
             for images, _ in self.loader:
-                images = images.to(self.device, non_blocking=True)
-                block = {}
-                with torch.no_grad():
-                    for label, extractor in self.extractors.items():
-                        for node, value in extractor(images).items():
-                            block[layer_key(label, node)] = value.reshape(-1, value.shape[-1])
+                yield self._extract(images)
 
-                if not self._widths:
-                    self._widths = {key: value.shape[-1] for key, value in block.items()}
-                yield block
+    def single_pass(self) -> Iterator[TokenBatch]:
+        """Every token of the loader exactly once, in loader order, scaled.
+
+        For evaluation, which reads a whole split. No shuffle buffer and no
+        wrapping: the stream ends when the loader does, so every image counts
+        once and no token is skipped or repeated. Batches are ``token_batch``
+        tokens, except the last, which holds what remains.
+        """
+        self._measure_scales()
+
+        held: list[TokenBatch] = []
+        count = 0
+
+        def take(rows: int) -> TokenBatch:
+            merged = {key: torch.cat([entry[key] for entry in held]) for key in held[0]}
+            out = {key: value[:rows] for key, value in merged.items()}
+            rest = {key: value[rows:] for key, value in merged.items()}
+            held.clear()
+            if next(iter(rest.values())).shape[0]:
+                held.append(rest)
+            return out
+
+        for images, _ in self.loader:
+            block = self._extract(images)
+            for key, value in block.items():
+                value.mul_(self._scales[key])
+            held.append(block)
+            count += next(iter(block.values())).shape[0]
+
+            while count >= self.token_batch:
+                yield take(self.token_batch)
+                count -= self.token_batch
+
+        if count:
+            yield take(count)
 
     def _measure_scales(self) -> None:
         """Fix one scalar per layer from the opening tokens of the run.
@@ -336,12 +397,18 @@ class OnTheFlyActivations(ActivationSource):
         return dict(self._centres)
 
 
-def build_source(cfg, models: dict[str, nn.Module], loader: DataLoader) -> ActivationSource:
-    """Pick an implementation from ``activations.mode``."""
+def build_source(cfg, models: dict[str, nn.Module], loader: DataLoader,
+                 normalizers: dict[str, nn.Module] | None = None) -> ActivationSource:
+    """Pick an implementation from ``activations.mode``.
+
+    Args:
+        normalizers: each model's own normalisation, by label, for a loader
+            that stops before normalising. See :class:`OnTheFlyActivations`.
+    """
     mode = cfg.activations.mode
 
     if mode == "on_the_fly":
-        return OnTheFlyActivations(cfg, models, loader)
+        return OnTheFlyActivations(cfg, models, loader, normalizers)
 
     if mode == "cached":
         # Writes one pass to activations.cache_dir and streams it back, behind the
