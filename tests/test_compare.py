@@ -883,6 +883,62 @@ def test_detail_returns_one_score_per_feature(tmp_path):
     assert len(out["squares"]) == 24
 
 
+def test_detail_carries_every_feature_in_its_own_order(tmp_path):
+    """The full figure draws this list, so it holds every live feature, in
+    the dictionary's own order, each with the score of its own pair."""
+    from stitch.compare import assignment, detail, load_dictionary
+    a = write_run(tmp_path / "a", unit(16, 24, seed=0))
+    b = write_run(tmp_path / "b", unit(16, 24, seed=1))
+    out = detail(a, b, side="decoder")
+    rows, _, scores = assignment(load_dictionary(a)[0], load_dictionary(b)[0])
+    wanted = torch.full((24,), float("nan"))
+    wanted[rows] = scores.float()
+    assert len(out["full"]) == 24
+    assert torch.equal(torch.tensor(out["full"]), wanted)
+
+
+def test_detail_samples_evenly_across_the_dictionary(tmp_path):
+    """The sampled figure takes its features from the whole dictionary,
+    first and last included, not from the front."""
+    from stitch.compare import detail
+    a = write_run(tmp_path / "a", unit(16, 40, seed=0))
+    b = write_run(tmp_path / "b", unit(16, 40, seed=1))
+    out = detail(a, b, side="decoder", squares=10)
+    taken = torch.linspace(0, 39, 10).round().long()
+    assert out["squares"] == [out["full"][index] for index in taken.tolist()]
+    assert taken[0] == 0 and taken[-1] == 39
+
+
+def test_a_feature_without_a_counterpart_has_no_score(tmp_path):
+    """When the other dictionary is smaller, the features the pairing leaves
+    out are kept in the full list, as having no score."""
+    import math
+    from stitch.compare import detail
+    a = write_run(tmp_path / "a", unit(16, 30, seed=0))
+    b = write_run(tmp_path / "b", unit(16, 24, seed=1))
+    out = detail(a, b, side="decoder")
+    assert len(out["full"]) == 30
+    assert sum(math.isnan(value) for value in out["full"]) == 6
+    assert out["features"] == 24
+
+
+def test_the_dictionary_figures_state_the_comparison_s_own_numbers(tmp_path):
+    """The mean and matched share each dictionary panel states are the
+    pair's ``assigned_mean`` and ``assigned_matched`` in the comparison file,
+    worked out from every feature."""
+    pytest.importorskip("matplotlib")
+    from stitch.compare import detail
+    from stitch.plots import match_summary
+    a = write_run(tmp_path / "a", unit(16, 40, seed=0))
+    b = write_run(tmp_path / "b", unit(16, 40, seed=1))
+    record = compare_runs(a, b, close=0.3)
+    stated = match_summary(detail(a, b, side="decoder")["full"], close=0.3)
+    # The comparison takes both in single precision, so they agree to that.
+    assert stated["mean"] == pytest.approx(record["assigned_mean"], abs=1e-6)
+    assert stated["matched"] == pytest.approx(record["assigned_matched"], abs=1e-6)
+    assert stated["paired"] == 40 and stated["unpaired"] == 0
+
+
 def test_detail_scores_a_dictionary_against_itself_at_one(tmp_path):
     from stitch.compare import detail
     weight = unit(16, 20, seed=0)
@@ -1596,6 +1652,18 @@ def test_the_detail_comes_out_of_the_matrix():
     assert out["features"] == 20
 
 
+def test_the_firing_detail_carries_every_feature_and_an_even_sample():
+    from stitch.compare import detail_from_scores
+    scores = torch.rand(30, 30, generator=torch.Generator().manual_seed(0))
+    rows = torch.arange(30)
+    columns = torch.randperm(30, generator=torch.Generator().manual_seed(1))
+    rates = torch.rand(30)
+    out = detail_from_scores(scores, rows, columns, rates, rates, squares=7)
+    assert torch.equal(torch.tensor(out["full"]), scores[rows, columns])
+    taken = torch.linspace(0, 29, 7).round().long().tolist()
+    assert out["squares"] == [out["full"][index] for index in taken]
+
+
 def test_the_detail_block_carries_the_pairing_on_its_diagonal():
     """What the matrix figure relies on, for the firing reading as for the
     weight one."""
@@ -1618,7 +1686,7 @@ def test_the_detail_is_asked_for_rather_than_always_built(tmp_path):
     kept = compare_firing(a, b, activation_stream(), "A@add_12", tokens=640,
                           null=False, keep_detail=True)
     assert "firing_detail" not in plain
-    assert set(kept["firing_detail"]) == {"squares", "pairs", "block", "features"}
+    assert set(kept["firing_detail"]) == {"full", "squares", "pairs", "block", "features"}
 
 
 def test_the_pairing_is_not_left_in_the_record(tmp_path):

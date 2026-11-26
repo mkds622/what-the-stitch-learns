@@ -498,6 +498,131 @@ def test_squares_without_scores_raise(tmp_path):
         plot_feature_squares({"within": [], "across": []}, tmp_path / "s.png")
 
 
+def test_the_squares_figure_draws_a_feature_without_a_counterpart(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_feature_squares
+    values = per_feature()
+    values[3] = float("nan")
+    assert plot_feature_squares({"within": values}, tmp_path / "nan.png").exists()
+
+
+# ----------------------------------------------------------------------
+# the full dictionary figure
+#
+# Every feature, one block of whole pixels each, drawn exactly. Checked down to
+# the pixel: the image read back from the file is the image that was built.
+# ----------------------------------------------------------------------
+
+def test_the_full_grid_holds_every_feature_once_in_order():
+    pytest.importorskip("numpy")
+    import numpy as np
+    from stitch.plots import full_grid
+    values = [index / 100 for index in range(23)]
+    grid, filled = full_grid(values, columns=5)
+    assert grid.shape == (5, 5)
+    assert int(filled.sum()) == 23
+    assert np.array_equal(grid.ravel()[:23], np.array(values))
+    # Only the last row holds cells past the last feature.
+    assert filled[:4].all() and filled[4].tolist() == [True, True, True, False, False]
+
+
+def test_the_full_pixels_give_each_feature_a_uniform_block():
+    pytest.importorskip("matplotlib")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.colors import to_rgb
+    from stitch.plots import _MATCH_MAP, _NO_FEATURE, _NO_PARTNER, full_pixels
+    values = [0.0, 0.25, float("nan"), 0.75, 1.0, 0.5, 0.1]
+    pixels = full_pixels(values, columns=3, cell=4)
+    assert pixels.shape == (3 * 4, 3 * 4, 3)
+    for index in range(9):
+        row, column = divmod(index, 3)
+        block = pixels[row * 4:(row + 1) * 4, column * 4:(column + 1) * 4]
+        assert (block == block[0, 0]).all()
+        if index >= len(values):
+            wanted = to_rgb(_NO_FEATURE)
+        elif np.isnan(values[index]):
+            wanted = to_rgb(_NO_PARTNER)
+        else:
+            wanted = plt.get_cmap(_MATCH_MAP)(values[index])[:3]
+        assert np.allclose(block[0, 0], wanted)
+
+
+def test_the_full_figure_is_drawn_pixel_for_pixel(tmp_path):
+    """The image in the file is the image that was built, unscaled and
+    unblended: read back, the first panel matches it pixel for pixel."""
+    pytest.importorskip("matplotlib")
+    import matplotlib.image
+    import numpy as np
+    from stitch.plots import full_pixels, plot_feature_squares_full
+    values = [((index * 37) % 100) / 100 for index in range(301)]
+    path = plot_feature_squares_full({"across": values, "case1": values[:150]},
+                                     tmp_path / "full.png", columns=16, cell=3)
+    written = matplotlib.image.imread(path)[..., :3]
+    built = full_pixels(values, columns=16, cell=3)
+    # The panels are stacked in the order the other figures use, which puts
+    # an objective's own pair before the comparison; the comparison is second.
+    first = full_pixels(values[:150], columns=16, cell=3)
+    top = 70 + 28
+    assert np.allclose(written[top:top + first.shape[0], 40:40 + first.shape[1]],
+                       first, atol=1 / 255)
+    second_top = top + first.shape[0] + 28 + 22 + 28
+    assert np.allclose(written[second_top:second_top + built.shape[0],
+                               40:40 + built.shape[1]], built, atol=1 / 255)
+
+
+def test_a_panel_states_its_mean_and_matched_share():
+    from stitch.plots import match_summary
+    values = [0.95, 0.5, float("nan"), 0.9, 0.1]
+    stated = match_summary(values, close=0.9)
+    assert stated["mean"] == pytest.approx((0.95 + 0.5 + 0.9 + 0.1) / 4)
+    # At or above the threshold counts, over the features with a counterpart.
+    assert stated["matched"] == pytest.approx(2 / 4)
+    assert stated["paired"] == 4 and stated["unpaired"] == 1
+
+
+def test_the_numbers_under_a_panel():
+    from stitch.plots import _stated, match_summary
+    stated = _stated(match_summary([0.95, 0.5, float("nan")], 0.9), 0.9, 3)
+    assert stated == "3 features, mean 0.725, 50.0% matched at 0.9, 1 without a counterpart"
+
+
+def test_a_panel_title_leaves_out_what_every_main_run_shares():
+    from stitch.plots import _short_label
+    assert _short_label("case1-main-x16-topk") == "two runs of case1-x16"
+    assert _short_label("across") == "different goals"
+
+
+def test_the_threshold_is_marked_on_the_colour_bar(tmp_path):
+    pytest.importorskip("matplotlib")
+    import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+    from stitch.plots import _mark_threshold
+    figure, axis = plt.subplots()
+    bar = figure.colorbar(ScalarMappable(norm=Normalize(0, 1)), ax=axis)
+    _mark_threshold(bar, 0.9)
+    labels = [tick.get_text() for tick in bar.ax.get_yticklabels()]
+    assert "0.9 matched" in labels
+    assert any(abs(line.get_ydata()[0] - 0.9) < 1e-9 for line in bar.ax.lines)
+    plt.close(figure)
+
+
+def test_the_sampled_figure_states_the_whole_dictionary(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_feature_squares
+    whole = per_feature() * 3
+    assert plot_feature_squares({"within": whole[::3]}, tmp_path / "s.png",
+                                whole={"within": whole}).exists()
+
+
+def test_the_full_figure_without_scores_raises(tmp_path):
+    pytest.importorskip("matplotlib")
+    from stitch.plots import plot_feature_squares_full
+    with pytest.raises(ValueError, match="nothing to plot"):
+        plot_feature_squares_full({"within": []}, tmp_path / "f.png")
+
+
 def test_the_pairing_figure_is_written(tmp_path):
     pytest.importorskip("matplotlib")
     from stitch.plots import plot_pairing

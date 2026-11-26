@@ -734,6 +734,15 @@ def shapes_of(summary: dict) -> dict[str, list[float]]:
 #: matched, so a colour means the same thing in every figure that uses one.
 _MATCH_MAP = "magma"
 
+#: A feature the one-to-one pairing left without a counterpart, which only
+#: happens when the other dictionary is smaller. Outside the match colours, so
+#: it is never read as a score.
+_NO_PARTNER = "#4fa3d9"
+
+#: A cell of the full dictionary figure past the last feature, in the last row.
+#: Outside the match colours, so it is never read as a feature.
+_NO_FEATURE = "#d4d4d4"
+
 
 def _figure_out(figure, path: Path) -> Path:
     """Write a finished figure where it was asked for."""
@@ -747,8 +756,65 @@ def _figure_out(figure, path: Path) -> Path:
     return path
 
 
+def match_summary(values: list[float], close: float) -> dict:
+    """What a dictionary figure states about one pair, from every feature.
+
+    The same two numbers the comparison records for the one-to-one pairing,
+    ``assigned_mean`` and ``assigned_matched``: the mean matched score and the
+    share of features at or above ``close``, both over the features that have
+    a counterpart.
+
+    Returns:
+        ``mean``, ``matched``, ``paired`` and ``unpaired``.
+    """
+    import math
+
+    paired = [value for value in values if not math.isnan(value)]
+    count = len(paired)
+    return {
+        "mean": sum(paired) / count if count else float("nan"),
+        "matched": sum(value >= close for value in paired) / count if count else float("nan"),
+        "paired": count,
+        "unpaired": len(values) - count,
+    }
+
+
+#: Parts of an objective's name that every main run shares, left out of the
+#: dictionary figures' panel titles, which have to fit above a panel.
+_SHARED_NAME_PARTS = ("main", "topk")
+
+
+def _short_label(kind: str) -> str:
+    """A panel's title in the dictionary figures: which pair, briefly."""
+    if kind in _PANEL_LABELS:
+        return _label(kind)
+    return _label("-".join(part for part in kind.split("-")
+                           if part not in _SHARED_NAME_PARTS))
+
+
+def _stated(summary: dict, close: float, features: int | None = None) -> str:
+    """The numbers a dictionary panel stands for, written under it."""
+    count = f"{features:,} features, " if features is not None else ""
+    missing = (f", {summary['unpaired']:,} without a counterpart"
+               if summary["unpaired"] else "")
+    return (f"{count}mean {summary['mean']:.3f}, "
+            f"{summary['matched']:.1%} matched at {close:g}{missing}")
+
+
+def _mark_threshold(bar, close: float) -> None:
+    """The match threshold on a colour bar, so a reader can see which colours
+    count as matched."""
+    bar.ax.axhline(close, color="#19c3a6", linewidth=2.2)
+    ticks = [tick for tick in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0) if abs(tick - close) > 0.05]
+    ticks = sorted(ticks + [close])
+    bar.set_ticks(ticks, labels=[f"{tick:g} matched" if tick == close else f"{tick:g}"
+                                 for tick in ticks])
+
+
 def plot_feature_squares(scores: dict[str, list[float]], path: Path,
-                         title: str | None = None, columns: int = 40) -> Path:
+                         title: str | None = None, columns: int = 40,
+                         whole: dict[str, list[float]] | None = None,
+                         close: float = 0.9) -> Path:
     """One square per feature, shaded by how well that feature matched.
 
     The figure to show first, because it is the only one whose subject is the
@@ -756,17 +822,28 @@ def plot_feature_squares(scores: dict[str, list[float]], path: Path,
     dictionary can see from it that the thing being compared is a few thousand
     separate parts, and that the question is asked of each part on its own.
 
+    Drawn from an even sample across the dictionary, so a square is still a
+    square on a slide. :func:`plot_feature_squares_full` draws every feature.
+    A feature left without a counterpart is drawn in a colour of its own.
+
     Nothing is sorted. A sorted version reads as a smooth gradient, which is a
     picture of a distribution; left in the dictionary's own order it reads as
     individual features, some of which found a counterpart and some of which
     did not.
 
     Args:
-        scores: kind to per-feature matched scores, from
-            ``stitch.compare.detail``.
+        scores: kind to per-feature matched scores, the ``squares`` of
+            ``stitch.compare.detail``. NaN is a feature without a counterpart.
         path: where the image goes.
         title: a heading, usually which depth this is.
         columns: squares per row.
+        whole: kind to every feature's matched score, the ``full`` of
+            ``stitch.compare.detail``. Each panel states the mean and the
+            matched share of the whole dictionary, which a sample would only
+            estimate; without it they are worked out from the sample, and the
+            label says so.
+        close: the score a feature counts as matched at, marked on the colour
+            bar and used for the matched share.
 
     Returns:
         The path written.
@@ -779,13 +856,18 @@ def plot_feature_squares(scores: dict[str, list[float]], path: Path,
     import matplotlib.pyplot as plt
     import numpy as np
 
+    from matplotlib.patches import Patch
+
     kinds = _panels(scores)
     if not kinds:
         raise ValueError("nothing to plot: no per-feature scores")
 
+    colours = plt.get_cmap(_MATCH_MAP).with_extremes(bad=_NO_PARTNER)
+
+    # Room between panels for each one's two-line label.
     figure, axes = plt.subplots(len(kinds), 1,
-                                figsize=(11, 2.7 * len(kinds) + 0.6),
-                                squeeze=False)
+                                figsize=(11, 3.3 * len(kinds) + 0.6),
+                                squeeze=False, gridspec_kw={"hspace": 0.55})
 
     image = None
     for axis, kind in zip(axes[:, 0], kinds):
@@ -794,9 +876,10 @@ def plot_feature_squares(scores: dict[str, list[float]], path: Path,
         # row padded out with squares that stand for no feature.
         width = min(columns, len(values))
         rows = max(len(values) // width, 1)
-        grid = np.array(values[:rows * width]).reshape(rows, width)
+        grid = np.ma.masked_invalid(
+            np.array(values[:rows * width], dtype=float).reshape(rows, width))
 
-        image = axis.imshow(grid, cmap=_MATCH_MAP, vmin=0, vmax=1,
+        image = axis.imshow(grid, cmap=colours, vmin=0, vmax=1,
                             interpolation="nearest")
         # Borders between the cells, so the eye reads discrete features rather
         # than a surface.
@@ -804,17 +887,165 @@ def plot_feature_squares(scores: dict[str, list[float]], path: Path,
         axis.set_yticks(np.arange(-0.5, rows, 1), minor=True)
         axis.grid(which="minor", color="white", linewidth=1.1)
         axis.tick_params(which="minor", length=0)
-        axis.set_title(_label(kind), fontsize=11, pad=8)
+        axis.set_title(_short_label(kind), fontsize=11, pad=8)
+        if whole is not None and whole.get(kind):
+            stated = _stated(match_summary(list(whole[kind]), close), close,
+                             len(whole[kind]))
+        else:
+            stated = (_stated(match_summary(values, close), close)
+                      + f", over these {len(values)}")
+        axis.set_xlabel(stated, fontsize=10, labelpad=6)
         axis.set_xticks([])
         axis.set_yticks([])
         for spine in axis.spines.values():
             spine.set_visible(False)
 
-    figure.colorbar(image, ax=axes, fraction=0.02, pad=0.02,
-                    label="how well this feature matched")
-    figure.suptitle(title or "Every feature in the dictionary, one square each",
-                    fontsize=13)
+    bar = figure.colorbar(image, ax=axes, fraction=0.02, pad=0.02,
+                          label="how well this feature matched")
+    _mark_threshold(bar, close)
+    # Under the last panel's numbers, at its left edge.
+    axes[-1, 0].legend(handles=[Patch(color=_NO_PARTNER, label="no counterpart")],
+                       loc="upper left", bbox_to_anchor=(0.0, -0.2), frameon=False,
+                       fontsize=10, borderaxespad=0)
+    # Just above the first panel's title, wherever its fixed shape has put it.
+    first = axes[0, 0]
+    first.apply_aspect()
+    figure.suptitle(title or "Features sampled evenly across the dictionary, "
+                             "one square each", fontsize=13, va="bottom",
+                    y=first.get_position().y1 + 0.45 / figure.get_figheight())
     return _figure_out(figure, path)
+
+
+def full_grid(values: list[float], columns: int):
+    """Every feature's score laid out in rows, in the dictionary's own order.
+
+    Returns:
+        ``(grid, filled)``, both ``(rows, columns)``: the scores, NaN for a
+        feature without a counterpart and for the cells past the last
+        feature, and which cells hold a feature at all. Every feature is in
+        exactly one cell; only the last row can hold empty cells.
+    """
+    import numpy as np
+
+    count = len(values)
+    rows = max(-(-count // columns), 1)
+    grid = np.full(rows * columns, np.nan)
+    grid[:count] = np.asarray(values, dtype=float)
+    filled = np.zeros(rows * columns, dtype=bool)
+    filled[:count] = True
+    return grid.reshape(rows, columns), filled.reshape(rows, columns)
+
+
+def full_pixels(values: list[float], columns: int, cell: int):
+    """The full dictionary as an image, every feature a block of whole pixels.
+
+    Each cell is its feature's colour on the match scale, or the colour for
+    no counterpart, or the colour for no feature past the end. Each cell is
+    then repeated into a ``cell`` by ``cell`` block, so nothing between two
+    cells is blended and no feature is merged with another.
+
+    Returns:
+        ``(rows * cell, columns * cell, 3)``, RGB values in ``[0, 1]``.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.colors import Normalize, to_rgb
+
+    grid, filled = full_grid(values, columns)
+    colours = plt.get_cmap(_MATCH_MAP)(Normalize(0, 1, clip=True)(
+        np.nan_to_num(grid, nan=0.0)))[..., :3]
+    colours[filled & np.isnan(grid)] = to_rgb(_NO_PARTNER)
+    colours[~filled] = to_rgb(_NO_FEATURE)
+    return np.repeat(np.repeat(colours, cell, axis=0), cell, axis=1)
+
+
+def plot_feature_squares_full(scores: dict[str, list[float]], path: Path,
+                              title: str | None = None, columns: int = 128,
+                              cell: int = 4, close: float = 0.9) -> Path:
+    """Every feature of the dictionary, one block of pixels each, exactly.
+
+    The full version of :func:`plot_feature_squares`. Every live feature is
+    drawn, none dropped, merged or sampled, in the dictionary's own order. Each
+    is a ``cell`` by ``cell`` block of whole pixels, placed onto the canvas
+    unscaled, so two neighbouring features never blend. Cells past the last
+    feature, in the last row, are in a colour of their own, and so is a feature
+    the pairing left without a counterpart. The colour scale is the same 0 to
+    1 as the sampled figure.
+
+    Saved at the figure's own resolution and not cropped, since cropping can
+    shift the image by a fraction of a pixel.
+
+    Args:
+        scores: kind to every feature's matched score, the ``full`` of
+            ``stitch.compare.detail``. NaN is a feature without a counterpart.
+        path: where the image goes.
+        title: a heading, usually which depth this is.
+        columns: features per row. 128 lays a dictionary of 12,288 out as 96
+            full rows.
+        cell: the side of each feature's block, in pixels.
+        close: the score a feature counts as matched at, marked on the colour
+            bar and used for the matched share each panel states.
+
+    Returns:
+        The path written.
+
+    Raises:
+        ValueError: if no kind carries any scores.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+    from matplotlib.patches import Patch
+
+    kinds = _panels(scores)
+    if not kinds:
+        raise ValueError("nothing to plot: no per-feature scores")
+
+    dpi = 100
+    images = [full_pixels(list(scores[kind]), columns, cell) for kind in kinds]
+    width = max(image.shape[1] for image in images)
+
+    # Everything is laid out in whole pixels from the top: a heading, then for
+    # each panel its title, its image and its numbers, then the key.
+    left, right, heading, label, below, gap, key = 40, 170, 70, 28, 28, 22, 60
+    height = (heading + sum(label + image.shape[0] + below + gap for image in images)
+              + key)
+    figure = plt.figure(figsize=((left + width + right) / dpi, height / dpi), dpi=dpi)
+
+    top = height - heading
+    for kind, image in zip(kinds, images):
+        figure.text(left / figure.bbox.width, (top - label / 2) / height,
+                    _short_label(kind), fontsize=11, va="center")
+        top -= label + image.shape[0]
+        # Drawn pixel for pixel, at a whole-pixel offset from the corner.
+        figure.figimage(image, xo=left, yo=top, origin="upper")
+        figure.text(left / figure.bbox.width, (top - below / 2) / height,
+                    _stated(match_summary(list(scores[kind]), close), close,
+                            len(scores[kind])),
+                    fontsize=10, va="center")
+        top -= below + gap
+
+    bar = figure.add_axes([(left + width + 30) / figure.bbox.width,
+                           (key + 20) / height, 15 / figure.bbox.width,
+                           (height - heading - key - 40) / height])
+    _mark_threshold(figure.colorbar(ScalarMappable(norm=Normalize(0, 1), cmap=_MATCH_MAP),
+                                    cax=bar, label="how well this feature matched"),
+                    close)
+    figure.legend(handles=[Patch(color=_NO_PARTNER, label="no counterpart"),
+                           Patch(color=_NO_FEATURE, label="no feature")],
+                  loc="lower left", bbox_to_anchor=(left / figure.bbox.width, 0.0),
+                  ncol=2, frameon=False, fontsize=10)
+    figure.suptitle(title or "Every feature in the dictionary, one block each",
+                    fontsize=13, y=1 - 25 / height)
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=dpi)
+    plt.close(figure)
+    log.info("wrote %s", path)
+    return path
 
 
 def plot_pairing(pairs: dict[str, list], path: Path,

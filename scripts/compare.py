@@ -72,7 +72,8 @@ log = logging.getLogger("compare")
 
 #: What each figure is called inside the directory ``--figures`` names.
 FIGURES = {
-    "dictionary": "dictionary.png",
+    "dictionary_sampled": "dictionary_sampled.png",
+    "dictionary_full": "dictionary_full.png",
     "pairing": "pairing.png",
     "matrix": "matrix.png",
     "distributions": "distributions.png",
@@ -208,27 +209,27 @@ def _chain(summary: dict, reading: str, assigning: bool) -> dict:
 
 def _draw(directory: Path, chain: dict, bands: dict | None,
           detailed: dict | None, close: float, title: str | None) -> None:
-    """One set of eight, from one reading.
+    """One set of nine, from one reading.
 
     Five of them are a function of the three-number chain and its
     distributions, so they can be drawn from a comparison file long after the
-    runs are gone. The other three draw individual features and need the
+    runs are gone. The other four draw individual features and need the
     per-feature material, which is never written to disk.
 
     Args:
-        directory: where the eight images go.
+        directory: where the nine images go.
         chain: a floor, a ceiling, an across number and their distributions,
             all from one pairing and one reading.
         bands: ``within`` and ``across`` per-band means, or None.
         detailed: per-feature material for one pair of each kind, or None,
-            in which case the three that draw features are skipped.
+            in which case the four that draw features are skipped.
         close: the threshold a feature counts as matched at.
         title: a heading, usually which depth this is.
     """
     from stitch.plots import (
         plot_comparison, plot_distributions, plot_feature_squares,
-        plot_frequency_bands, plot_match_matrix, plot_match_shares,
-        plot_pairing, plot_position,
+        plot_feature_squares_full, plot_frequency_bands, plot_match_matrix,
+        plot_match_shares, plot_pairing, plot_position,
     )
 
     directory = Path(directory)
@@ -255,7 +256,12 @@ def _draw(directory: Path, chain: dict, bands: dict | None,
         return
 
     plot_feature_squares({kind: value["squares"] for kind, value in detailed.items()},
-                         directory / FIGURES["dictionary"], title=title)
+                         directory / FIGURES["dictionary_sampled"], title=title,
+                         whole={kind: value["full"] for kind, value in detailed.items()},
+                         close=close)
+    plot_feature_squares_full({kind: value["full"] for kind, value in detailed.items()},
+                              directory / FIGURES["dictionary_full"], title=title,
+                              close=close)
     plot_pairing({kind: value["pairs"] for kind, value in detailed.items()},
                  directory / FIGURES["pairing"], title=title)
     plot_match_matrix({kind: value["block"] for kind, value in detailed.items()},
@@ -285,7 +291,7 @@ def _figures(directory: Path, summary: dict, records: list[dict],
              firing_detail: dict | None = None) -> None:
     """Draw a set from the weights, and a second set from the firing.
 
-    Two independent sets of the same eight figures, in their own directories.
+    Two independent sets of the same nine figures, in their own directories.
     Nothing is shared between them and nothing is replaced: the weight set says
     what the features look for, the firing set says what they respond to, and
     the project's question needs both.

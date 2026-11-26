@@ -1135,9 +1135,10 @@ def write_comparison(records: list[dict], summary: dict, path: Path) -> None:
 # their deletion.
 # ----------------------------------------------------------------------
 
-#: How many features the one-square-per-feature figure draws. Enough to read as
-#: a dictionary rather than a sample, few enough that a square is still a
-#: square on a slide.
+#: How many features the sampled one-square-per-feature figure draws, spread
+#: evenly across the whole dictionary. Enough to read as a dictionary, few
+#: enough that a square is still a square on a slide. The full figure draws
+#: every feature.
 SQUARES = 640
 
 #: How many pairs the ribbon figure draws. A line per feature would be a solid
@@ -1184,6 +1185,28 @@ def _ranks(frequencies: Tensor | None, count: int) -> Tensor:
     return place / span
 
 
+def _per_feature(rows: Tensor, paired: Tensor, count: int) -> Tensor:
+    """Every feature's matched score, in the dictionary's own order.
+
+    A feature the pairing left without a counterpart, which only happens when
+    the other dictionary is smaller, gets NaN, so it is drawn as having no
+    partner and never as a score.
+    """
+    out = torch.full((count,), float("nan"))
+    out[rows] = paired.float()
+    return out
+
+
+def _spread(count: int, wanted: int) -> Tensor:
+    """``wanted`` indices spread evenly over ``count``, first and last included.
+
+    All of them when there are no more than ``wanted``.
+    """
+    if count <= wanted:
+        return torch.arange(count)
+    return torch.linspace(0, count - 1, wanted).round().long()
+
+
 def detail(path_a: Path, path_b: Path, side: str = "encoder",
            drop_dead: bool = True, squares: int = SQUARES,
            ribbons: int = RIBBONS, block: int = BLOCK) -> dict:
@@ -1200,13 +1223,16 @@ def detail(path_a: Path, path_b: Path, side: str = "encoder",
             two objectives; see :func:`compare_runs` for why the decoder
             reading has no content there.
         drop_dead: leave out features that never fired, as the numbers do.
-        squares: how many per-feature scores to return, in dictionary order.
+        squares: how many per-feature scores to sample, spread evenly across
+            the dictionary.
         ribbons: how many pairs to return.
         block: the side of the similarity block to return.
 
     Returns:
-        ``squares``, one matched score per feature in the dictionary's own
-        order; ``pairs``, triples of where the feature sits in its own
+        ``full``, the matched score of every live feature of ``path_a`` in the
+        dictionary's own order, NaN for a feature left without a counterpart;
+        ``squares``, ``squares`` of those taken evenly across the dictionary,
+        in the same order; ``pairs``, triples of where the feature sits in its own
         dictionary by firing rate, where its counterpart sits in the other, and
         how well they matched; and ``block``, a square piece of the similarity
         matrix over the most active features, ordered so that the pairing lies
@@ -1230,8 +1256,13 @@ def detail(path_a: Path, path_b: Path, side: str = "encoder",
     # the first hundred and forty slots instead would draw an arbitrary corner.
     active = rank_a[rows].argsort()[:block]
 
+    # Every feature of A, and an even sample of them for the figure that draws
+    # a part of the dictionary, both in the dictionary's own order.
+    every = _per_feature(rows, scores, a.shape[1])
+
     return {
-        "squares": [float(value) for value in scores[:squares]],
+        "full": every.tolist(),
+        "squares": every[_spread(every.numel(), squares)].tolist(),
         "pairs": [[float(rank_a[rows[index]]), float(rank_b[columns[index]]),
                    float(scores[index])] for index in chosen.tolist()],
         "block": (a[:, rows[active]].T @ b[:, columns[active]]).tolist(),
@@ -1712,7 +1743,8 @@ def detail_from_scores(scores: Tensor, rows: Tensor, columns: Tensor,
         columns: the matching indices into ``b``.
         rate_a: how often each feature of ``a`` fired, for the ordering.
         rate_b: the same for ``b``.
-        squares: how many per-feature scores to return.
+        squares: how many per-feature scores to sample, spread evenly across
+            the dictionary.
         ribbons: how many pairs to return.
         block: the side of the square piece of ``scores`` to return.
 
@@ -1727,8 +1759,11 @@ def detail_from_scores(scores: Tensor, rows: Tensor, columns: Tensor,
     chosen = torch.arange(0, rows.numel(), step)[:ribbons]
     active = rank_a[rows].argsort()[:block]
 
+    every = _per_feature(rows, paired, scores.shape[0])
+
     return {
-        "squares": [float(value) for value in paired[:squares]],
+        "full": every.tolist(),
+        "squares": every[_spread(every.numel(), squares)].tolist(),
         "pairs": [[float(rank_a[rows[index]]), float(rank_b[columns[index]]),
                    float(paired[index])] for index in chosen.tolist()],
         "block": scores[rows[active]][:, columns[active]].tolist(),
