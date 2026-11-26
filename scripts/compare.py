@@ -26,6 +26,12 @@ comparison, and a set containing both gives all three numbers at once.
         --out comparisons/main_add_12.json --reading encoder \
         --firing --config configs/case1_main.yaml --device cuda
 
+Soft matching is measured alongside the other readings unless --no-soft is
+given: the soft matching score of Khosla and Williams (2024), an exact linear
+program over the whole matrix, on the decoder, the encoder and, with --firing,
+the firing. It gets its own floor, ceilings and across number, and a summary
+and a distribution figure in each set.
+
 Three of the figures draw individual features, which means reading them back
 out of the checkpoints of one pair of runs of each kind. Nothing about them is
 written to the comparison file, so those three can only be drawn while the
@@ -74,6 +80,8 @@ FIGURES = {
     "position": "position.png",
     "summary": "summary.png",
     "bands": "frequency_bands.png",
+    "soft_summary": "soft_summary.png",
+    "soft_distributions": "soft_distributions.png",
 }
 
 
@@ -101,6 +109,16 @@ def _assigned(baseline: dict | None) -> dict | None:
     out = {"mean": baseline["assigned_mean"]}
     if "assigned_histogram" in baseline:
         out["histogram"] = baseline["assigned_histogram"]
+    return out
+
+
+def _soft(baseline: dict | None) -> dict | None:
+    """The random floor under its soft matching names, read as ``summarise`` wants it."""
+    if baseline is None or "soft_mean" not in baseline:
+        return None
+    out = {"mean": baseline["soft_mean"]}
+    if "soft_histogram" in baseline:
+        out["histogram"] = baseline["soft_histogram"]
     return out
 
 
@@ -244,6 +262,23 @@ def _draw(directory: Path, chain: dict, bands: dict | None,
                       directory / FIGURES["matrix"], title=title)
 
 
+def _draw_soft(directory: Path, chain: dict | None, title: str | None) -> None:
+    """The summary and distribution figures of the soft matching chain.
+
+    The same two figures the other chains draw, from the soft matching's own
+    floor, ceilings and across number, under their own names in the same
+    directory.
+    """
+    if not chain or not any(key.endswith("_shape") for key in chain):
+        return
+
+    from stitch.plots import plot_comparison, plot_distributions
+
+    directory = Path(directory)
+    plot_comparison(chain, directory / FIGURES["soft_summary"], title=title)
+    plot_distributions(chain, directory / FIGURES["soft_distributions"], title=title)
+
+
 def _figures(directory: Path, summary: dict, records: list[dict],
              pairs: list[tuple[Path, Path]], reading: str, assigning: bool,
              close: float, title: str | None,
@@ -278,6 +313,8 @@ def _figures(directory: Path, summary: dict, records: list[dict],
 
     _draw(directory, _chain(summary, reading, assigning), weight_bands,
           detailed or None, close, title)
+    _draw_soft(directory, summary.get("soft" if reading == "decoder" else "encoder_soft"),
+               title)
 
     if "firing" not in summary:
         return
@@ -286,6 +323,7 @@ def _figures(directory: Path, summary: dict, records: list[dict],
     _draw(directory / "firing", firing,
           by_kind(records, "firing_assigned_by_frequency") if assigning else None,
           firing_detail or None, close, title)
+    _draw_soft(directory / "firing", summary.get("firing_soft"), title)
 
 
 def main(argv=None) -> int:
@@ -311,6 +349,10 @@ def main(argv=None) -> int:
                              "bands, leaving only the best match. The pairing "
                              "is the slow half, so this is for looking at a "
                              "large set of comparisons roughly")
+    parser.add_argument("--no-soft", action="store_true", dest="no_soft",
+                        help="skip the soft matching. Each solve is an exact "
+                             "linear program over the whole matrix, the "
+                             "slowest step of the comparison")
     parser.add_argument("--firing", action="store_true",
                         help="also compare what the features respond to, by "
                              "running both coders over the evaluation split "
@@ -381,6 +423,7 @@ def main(argv=None) -> int:
     drawing = args.figure is not None or args.figures is not None
 
     assigning = not args.no_assignment
+    softening = not args.no_soft
 
     # Kept alongside the records, in the same order, because the figures that
     # draw features need the run directories back and a record carries only
@@ -412,7 +455,8 @@ def main(argv=None) -> int:
     for a, b in pairs:
         record = compare_runs(a, b, args.close, drop_dead=not args.keep_dead,
                               keep_distribution=drawing, assign=assigning,
-                              bands=args.bands, with_pairing=args.firing)
+                              bands=args.bands, with_pairing=args.firing,
+                              soft=softening)
 
         if args.firing:
             # Keyed the same way the weight figures are, so each objective's
@@ -434,7 +478,7 @@ def main(argv=None) -> int:
                 close=args.close, binary=args.firing_binary, bands=args.bands,
                 keep_distribution=drawing, assign=assigning,
                 null=not args.no_firing_null, device=args.device,
-                pairing=pairing, keep_detail=wanted))
+                pairing=pairing, keep_detail=wanted, soft=softening))
 
             if wanted:
                 log.info("keeping the firing panel for %s from %s and %s",
@@ -464,7 +508,8 @@ def main(argv=None) -> int:
         features = kept[len(kept) // 2] if kept else info["kept"]
 
         baseline = random_baseline(directions.shape[0], features,
-                                   keep_distribution=drawing, assign=assigning)
+                                   keep_distribution=drawing, assign=assigning,
+                                   soft=softening)
         log.info("random dictionaries of %d live features: %.4f",
                  features, baseline["mean"])
 
@@ -477,7 +522,7 @@ def main(argv=None) -> int:
         encoder_baseline = (baseline if encoder_width == directions.shape[0]
                             else random_baseline(encoder_width, features,
                                                  keep_distribution=drawing,
-                                                 assign=assigning))
+                                                 assign=assigning, soft=softening))
 
     summary = summarise(records, baseline)
     summary["encoder"] = summarise(records, encoder_baseline, key="encoder_mean",
@@ -499,6 +544,11 @@ def main(argv=None) -> int:
             summary["firing_along_weights"] = summarise(
                 records, None, key="firing_along_weights",
                 shape_key="firing_along_weights_histogram")
+        if softening:
+            summary["firing_soft"] = summarise(
+                records, _firing_floor(records, "firing_null_soft_mean",
+                                       "firing_null_soft_histogram"),
+                key="firing_soft_mean", shape_key="firing_soft_histogram")
 
     if assigning:
         # The same three-number chain, read off the one-to-one pairing. Kept
@@ -511,6 +561,15 @@ def main(argv=None) -> int:
         summary["encoder_assigned"] = summarise(
             records, _assigned(encoder_baseline), key="encoder_assigned_mean",
             shape_key="encoder_assigned_histogram")
+
+    if softening:
+        # Soft matching, its own chain for the same reason: its floor, ceilings
+        # and across number are all soft matching scores.
+        summary["soft"] = summarise(records, _soft(baseline), key="soft_mean",
+                                    shape_key="soft_histogram")
+        summary["encoder_soft"] = summarise(
+            records, _soft(encoder_baseline), key="encoder_soft_mean",
+            shape_key="encoder_soft_histogram")
     write_comparison(records, summary, args.out)
 
     def report(heading: str, chain: dict) -> None:
@@ -555,6 +614,10 @@ def main(argv=None) -> int:
                   "learned.\nA gap only in the rare bands is a difference in "
                   "how heavily the\ndictionary was used.")
 
+    if softening:
+        report("decoder, soft matching", summary["soft"])
+        report("encoder, soft matching", summary["encoder_soft"])
+
     if args.firing:
         report("firing, what a feature responds to", summary["firing"])
         if assigning:
@@ -576,6 +639,8 @@ def main(argv=None) -> int:
             print("How alike the features paired by direction actually behave.\n"
                   "Far below the firing pairing's own number means the\n"
                   "directions paired features that do not fire together.")
+        if softening:
+            report("firing, soft matching", summary["firing_soft"])
 
     print("\nOnly the encoder reading is comparable across the two objectives:\n"
           "the decoders write into different models' spaces.\n"

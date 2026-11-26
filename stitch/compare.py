@@ -23,8 +23,8 @@ The measure is one-sided and the two sides differ, so both are reported. A
 small dictionary contained inside a large one scores high read one way and low
 read the other.
 
-Two ways of pairing features
-----------------------------
+Three ways of pairing features
+------------------------------
 
 Taking each feature's closest counterpart lets several features in one
 dictionary all name the same feature in the other. A dictionary that collapsed
@@ -41,6 +41,15 @@ Both are reported, because the gap between them is itself a reading: it is how
 much of the best-match score came from features crowding onto the same
 counterpart. They coincide exactly when the best matches already happen to form
 a one-to-one pairing.
+
+Soft matching is the third. Every feature carries the same total weight, and
+the weight is moved between the two dictionaries so that the weighted total
+similarity is as large as it can be, solved exactly. The weight may divide, so
+a feature can be paired with more than one counterpart. When the two
+dictionaries are the same size the best plan is a one-to-one pairing and the
+score equals the one-to-one pairing's; when they differ it accounts for every
+feature on both sides, where the one-to-one pairing leaves the surplus of the
+larger one unpaired.
 
 Firing frequency
 ----------------
@@ -533,9 +542,157 @@ def assigned_similarity(a: Tensor, b: Tensor, close: float = 0.9,
     return out
 
 
+# ----------------------------------------------------------------------
+# soft matching
+#
+# The soft matching score of Khosla and Williams (2024), "Soft Matching
+# Distance: A Metric on Neural Representations That Captures Single-Neuron
+# Tuning", which Longon, Klindt and Khosla (2025) use as soft-matching
+# correlation. For a score matrix S between features_a and features_b
+# features:
+#
+#     max over P of  sum_ij P_ij S_ij
+#     subject to     P_ij >= 0,
+#                    every row of P sums to 1 / features_a,
+#                    every column of P sums to 1 / features_b.
+#
+# An exact linear program, the optimal transport problem between two sets of
+# equally weighted points, with no regularisation and no temperature. Solved by
+# the network simplex, the solver the paper uses, from the POT library.
+#
+# At equal sizes the feasible plans are the doubly stochastic matrices scaled
+# by 1 / features, whose corners are the one-to-one pairings, so the optimum is
+# a one-to-one pairing and the score is the one-to-one pairing's mean. At
+# unequal sizes it is a different number, and the one-to-one pairing cannot
+# produce it. Nothing here treats the two cases differently: the same program
+# is solved either way.
+#
+# The paper defines it on activations, as correlations between units. The
+# firing reading is that. On the encoder and decoder directions it is the same
+# program over cosines, applied the way the one-to-one pairing is applied.
+# ----------------------------------------------------------------------
+
+#: The cap on network simplex iterations. Far above what a solve at these sizes
+#: takes; a solve that reaches it has not been shown optimal, and raises.
+SOFT_ITERATIONS = 10 ** 12
+
+
+def soft_plan(scores: Tensor):
+    """The optimal transport plan between the two sets of features.
+
+    Args:
+        scores: ``(features_a, features_b)``, the similarity of every pair.
+
+    Returns:
+        ``(rows, columns, weights)``, the entries of the plan that are not
+        zero. An optimal plan from the network simplex is a corner of the
+        feasible set, so it has at most ``features_a + features_b - 1`` of
+        them, and nothing else about the plan needs keeping.
+
+    Raises:
+        ValueError: if either side is empty.
+        RuntimeError: if the solver does not report the plan optimal.
+    """
+    if scores.numel() == 0:
+        raise ValueError("an empty dictionary cannot be compared")
+
+    import numpy as np
+    import ot
+
+    features_a, features_b = scores.shape
+    # The solver minimises, so it is handed the negated similarities, in the
+    # double precision it requires. Always a copy, so negating it in place
+    # never touches the scores, and copied once and not twice, which matters at
+    # twelve thousand features by twelve thousand.
+    cost = np.ascontiguousarray(scores.to(torch.float64, copy=True).neg_().numpy())
+    plan, info = ot.emd(np.full(features_a, 1.0 / features_a),
+                        np.full(features_b, 1.0 / features_b),
+                        cost, numItermax=SOFT_ITERATIONS, log=True)
+    del cost
+    if info["result_code"] != 1:
+        raise RuntimeError(f"the soft matching was not solved to optimality: "
+                           f"{info['warning']}")
+
+    rows, columns = np.nonzero(plan)
+    weights = plan[rows, columns]
+    return (torch.as_tensor(rows), torch.as_tensor(columns),
+            torch.as_tensor(weights, dtype=torch.float64))
+
+
+def scores_soft_similarity(scores: Tensor, close: float = 0.9,
+                           keep_distribution: bool = False) -> dict:
+    """Soft matching, read off a matrix that is already built.
+
+    Every feature's own score is the average similarity to its partners,
+    weighted by the share of its weight each one received. Its mean over either
+    dictionary is the soft matching score, so the distribution is taken over
+    both sides at once, every feature counted once.
+
+    Args:
+        scores: ``(features_a, features_b)``.
+        close: the score above which a feature counts as matched.
+        keep_distribution: also return the shape of the per-feature scores.
+
+    Returns:
+        ``soft_mean``, the soft matching score; ``soft_median`` and
+        ``soft_matched`` over the per-feature scores of both sides;
+        ``soft_features``, how many features that is; and ``soft_histogram``
+        when asked for.
+    """
+    rows, columns, weights = soft_plan(scores)
+    features_a, features_b = scores.shape
+
+    paired = scores[rows, columns].double()
+    score = float((weights * paired).sum())
+
+    # Each feature's weights sum to its share, 1 / features_a or 1 / features_b,
+    # so dividing by the share is multiplying by the size.
+    own_a = torch.zeros(features_a, dtype=torch.float64).index_add_(
+        0, rows, weights * paired) * features_a
+    own_b = torch.zeros(features_b, dtype=torch.float64).index_add_(
+        0, columns, weights * paired) * features_b
+    each = torch.cat([own_a, own_b])
+
+    out = {
+        "soft_mean": score,
+        "soft_median": float(each.median()),
+        "soft_matched": float((each >= close).double().mean()),
+        "soft_features": int(each.numel()),
+    }
+    if keep_distribution:
+        out["soft_histogram"] = histogram(each.float())
+    return out
+
+
+def soft_similarity(a: Tensor, b: Tensor, close: float = 0.9,
+                    keep_distribution: bool = False) -> dict:
+    """Soft matching between two dictionaries of directions.
+
+    The cosines are built the way the one-to-one pairing builds them, so the
+    two readings are solved over the same matrix.
+
+    Args:
+        a: ``(width, features_a)``, unit columns.
+        b: ``(width, features_b)``, unit columns.
+        close: cosine above which a feature counts as matched.
+        keep_distribution: also return the shape of the per-feature scores.
+
+    Returns:
+        The fields of :func:`scores_soft_similarity`.
+
+    Raises:
+        ValueError: if the two are not in the same space, or either is empty.
+    """
+    if a.shape[0] != b.shape[0]:
+        raise ValueError(f"different widths, {a.shape[0]} and {b.shape[0]}")
+    if a.shape[1] == 0 or b.shape[1] == 0:
+        raise ValueError("an empty dictionary cannot be compared")
+    return scores_soft_similarity(a.T @ b, close, keep_distribution)
+
+
 def random_baseline(width: int, features: int, trials: int = 3,
                     seed: int = 0, keep_distribution: bool = False,
-                    assign: bool = False) -> dict:
+                    assign: bool = False, soft: bool = False) -> dict:
     """The same measure on dictionaries that learned nothing.
 
     Two sets of random unit directions still match better than zero, and the
@@ -558,15 +715,19 @@ def random_baseline(width: int, features: int, trials: int = 3,
             one-to-one reading has to be read against. Off by default because
             it is the slow half: a pairing at the sizes used here takes minutes
             per trial where the best match takes seconds.
+        soft: also measure the floor under soft matching, which the soft
+            reading has to be read against. Off by default, for the same
+            reason.
 
     Returns:
         The same fields ``similarity`` returns, averaged over the trials, and
-        the ``assigned_`` fields alongside when asked for.
+        the ``assigned_`` and ``soft_`` fields alongside when asked for.
     """
     generator = torch.Generator().manual_seed(seed)
     totals: dict[str, float] = {}
     shape = [0.0] * BINS
     assigned_shape = [0.0] * BINS
+    soft_shape = [0.0] * BINS
 
     for _ in range(trials):
         a = torch.randn(width, features, generator=generator)
@@ -576,11 +737,16 @@ def random_baseline(width: int, features: int, trials: int = 3,
         scores = similarity(a, b, keep_distribution=keep_distribution)
         if assign:
             scores.update(assigned_similarity(a, b, keep_distribution=keep_distribution))
+        if soft:
+            scores.update(soft_similarity(a, b, keep_distribution=keep_distribution))
         if keep_distribution:
             shape = [held + new for held, new in zip(shape, scores.pop("histogram"))]
             if assign:
                 assigned_shape = [held + new for held, new
                                   in zip(assigned_shape, scores.pop("assigned_histogram"))]
+            if soft:
+                soft_shape = [held + new for held, new
+                              in zip(soft_shape, scores.pop("soft_histogram"))]
         for key, value in scores.items():
             totals[key] = totals.get(key, 0.0) + value
 
@@ -589,6 +755,8 @@ def random_baseline(width: int, features: int, trials: int = 3,
         out["histogram"] = [value / trials for value in shape]
         if assign:
             out["assigned_histogram"] = [value / trials for value in assigned_shape]
+        if soft:
+            out["soft_histogram"] = [value / trials for value in soft_shape]
     return out
 
 
@@ -635,7 +803,7 @@ def from_grids(paths: list[Path], run_root: Path) -> list[Path]:
 def compare_runs(path_a: Path, path_b: Path, close: float = 0.9,
                  drop_dead: bool = True, keep_distribution: bool = False,
                  assign: bool = True, bands: int = 4,
-                 with_pairing: bool = False) -> dict:
+                 with_pairing: bool = False, soft: bool = False) -> dict:
     """Two runs, read from disk and compared on both sides of the coder.
 
     The decoder reading is the one the unprefixed fields carry, and it is the
@@ -673,11 +841,14 @@ def compare_runs(path_a: Path, path_b: Path, close: float = 0.9,
             ``encoder_assigned_rows`` and ``encoder_assigned_columns``. Only
             the encoder's, since it is the only side comparable across the two
             objectives and so the only one worth asking a second reading about.
+        soft: also soft match the dictionaries, under ``soft_`` names, on both
+            sides. Off by default: each solve is an exact linear program over
+            the whole matrix, the slowest step here.
 
     Returns:
         The similarity fields for the decoder, the same fields prefixed
-        ``encoder_``, the ``assigned_`` fields for both readings when asked
-        for, and what was loaded from each run.
+        ``encoder_``, the ``assigned_`` and ``soft_`` fields for both readings
+        when asked for, and what was loaded from each run.
     """
     sides_a = load_sides(path_a, drop_dead)
     sides_b = load_sides(path_b, drop_dead)
@@ -704,6 +875,12 @@ def compare_runs(path_a: Path, path_b: Path, close: float = 0.9,
         for key, value in assigned_similarity(encoder_a, encoder_b, close,
                                               keep_distribution, frequencies,
                                               bands, with_pairing).items():
+            record[f"encoder_{key}"] = value
+
+    if soft:
+        record.update(soft_similarity(a, b, close, keep_distribution))
+        for key, value in soft_similarity(encoder_a, encoder_b, close,
+                                          keep_distribution).items():
             record[f"encoder_{key}"] = value
 
     record.update({
@@ -920,6 +1097,8 @@ DROPPED = (
     "firing_null_histogram", "firing_null_assigned_histogram",
     "firing_along_weights_histogram",
     "firing_assigned_rows", "firing_assigned_columns", "firing_detail",
+    "soft_histogram", "encoder_soft_histogram",
+    "firing_soft_histogram", "firing_null_soft_histogram",
 )
 
 
@@ -1563,7 +1742,8 @@ def compare_firing(path_a: Path, path_b: Path, batches, source_key: str,
                    assign: bool = True, null: bool = True,
                    device: torch.device | str = "cpu",
                    pairing: tuple[Tensor, Tensor] | None = None,
-                   keep_detail: bool = False, seed: int = 0) -> dict:
+                   keep_detail: bool = False, seed: int = 0,
+                   soft: bool = False) -> dict:
     """Two runs compared by what their features respond to.
 
     One stream feeds both coders, so every number here is measured on the same
@@ -1603,6 +1783,10 @@ def compare_firing(path_a: Path, path_b: Path, batches, source_key: str,
             stripped before anything is written out. Needs ``assign``, since
             those figures are drawn against the pairing.
         seed: for the shuffle the floor uses.
+        soft: also soft match the two, under ``firing_soft_`` names, and the
+            floor under ``firing_null_soft_`` names. This is the reading the
+            soft matching score was defined on: correlations between units
+            over the same inputs.
 
     Returns:
         ``firing_`` fields mirroring the weight reading's, the
@@ -1640,6 +1824,11 @@ def compare_firing(path_a: Path, path_b: Path, batches, source_key: str,
         for key, value in assigned.items():
             record[f"firing_{key}"] = value
 
+    if soft:
+        for key, value in scores_soft_similarity(scores, close,
+                                                 keep_distribution).items():
+            record[f"firing_{key}"] = value
+
     if "null" in measured:
         floor = measured["null"]
         for key, value in scores_similarity(floor, close,
@@ -1648,6 +1837,10 @@ def compare_firing(path_a: Path, path_b: Path, batches, source_key: str,
         if assign:
             for key, value in scores_assigned_similarity(
                     floor, close, keep_distribution).items():
+                record[f"firing_null_{key}"] = value
+        if soft:
+            for key, value in scores_soft_similarity(floor, close,
+                                                     keep_distribution).items():
                 record[f"firing_null_{key}"] = value
 
     if pairing is not None:

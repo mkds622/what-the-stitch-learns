@@ -1784,3 +1784,262 @@ def test_two_objectives_sharing_a_name_stay_apart():
     summary = summarise(records)
     assert len(summary["within"]) == 2
     assert all("case1-main-x16-topk (" in name for name in summary["within"])
+
+# ----------------------------------------------------------------------
+# soft matching
+#
+# The soft matching score of Khosla and Williams: the best weighted total over
+# transport plans that give every feature on each side the same share, solved
+# exactly. Checked against an independent linear program solver, against the
+# one-to-one pairing where the two must agree, and against cases whose answer
+# is known by construction.
+# ----------------------------------------------------------------------
+
+def linear_program_score(scores):
+    """The same optimum from a general linear program solver, built directly
+    from the definition: a different solver reaching the same number."""
+    import numpy as np
+    from scipy.optimize import linprog
+    matrix = scores.double().numpy()
+    rows, columns = matrix.shape
+    equalities, targets = [], []
+    for row in range(rows):
+        line = np.zeros((rows, columns))
+        line[row, :] = 1
+        equalities.append(line.ravel())
+        targets.append(1 / rows)
+    for column in range(columns):
+        line = np.zeros((rows, columns))
+        line[:, column] = 1
+        equalities.append(line.ravel())
+        targets.append(1 / columns)
+    # Held to tolerances far tighter than its defaults, so it pins the optimum
+    # to the precision the comparison below asks for.
+    solved = linprog(-matrix.ravel(), A_eq=np.array(equalities), b_eq=targets,
+                     bounds=(0, None), method="highs",
+                     options={"primal_feasibility_tolerance": 1e-10,
+                              "dual_feasibility_tolerance": 1e-10})
+    assert solved.success
+    return -solved.fun
+
+
+def test_the_soft_matching_score_is_the_linear_program_optimum():
+    """Both solvers are handed the same matrix, so they agree to 1e-9."""
+    from stitch.compare import scores_soft_similarity
+    for features_a, features_b, seed in ((12, 12, 0), (12, 9, 1), (7, 11, 2)):
+        scores = unit(6, features_a, seed=seed).T @ unit(6, features_b, seed=seed + 10)
+        assert scores_soft_similarity(scores)["soft_mean"] == pytest.approx(
+            linear_program_score(scores), abs=1e-9)
+
+
+def test_the_soft_plan_gives_every_feature_its_share():
+    from stitch.compare import soft_plan
+    scores = unit(6, 12, seed=0).T @ unit(6, 9, seed=1)
+    rows, columns, weights = soft_plan(scores)
+    out_a = torch.zeros(12, dtype=torch.float64).index_add_(0, rows, weights)
+    out_b = torch.zeros(9, dtype=torch.float64).index_add_(0, columns, weights)
+    assert torch.allclose(out_a, torch.full((12,), 1 / 12, dtype=torch.float64))
+    assert torch.allclose(out_b, torch.full((9,), 1 / 9, dtype=torch.float64))
+    assert bool((weights > 0).all())
+
+
+def test_soft_matching_equals_the_one_to_one_pairing_at_equal_sizes():
+    """Equal sizes: the best plan is a one-to-one pairing, so the score is
+    the one-to-one pairing's mean. Not special-cased; the program finds it.
+    Agreement to single precision, the precision the one-to-one mean is
+    taken in."""
+    from stitch.compare import assigned_similarity, soft_plan, soft_similarity
+    a, b = unit(16, 40, seed=0), unit(16, 40, seed=1)
+    assert soft_similarity(a, b)["soft_mean"] == pytest.approx(
+        assigned_similarity(a, b)["assigned_mean"], abs=1e-6)
+    rows, _, _ = soft_plan(a.T @ b)
+    assert rows.numel() == 40
+
+
+def test_soft_matching_differs_from_the_one_to_one_pairing_at_unequal_sizes():
+    """Unequal sizes: every feature of the larger side carries weight, where
+    the one-to-one pairing leaves the surplus unpaired."""
+    from stitch.compare import assigned_similarity, soft_plan, soft_similarity
+    a, b = unit(16, 40, seed=0), unit(16, 37, seed=1)
+    rows, columns, _ = soft_plan(a.T @ b)
+    assert set(rows.tolist()) == set(range(40))
+    assert set(columns.tolist()) == set(range(37))
+    assert soft_similarity(a, b)["soft_mean"] != pytest.approx(
+        assigned_similarity(a, b)["assigned_mean"], abs=1e-6)
+
+
+def test_a_dictionary_soft_matches_itself_and_its_shuffle_perfectly():
+    from stitch.compare import soft_similarity
+    a = unit(64, 32)
+    shuffled = a[:, torch.randperm(32, generator=torch.Generator().manual_seed(3))]
+    for other in (a, shuffled):
+        out = soft_similarity(a, other)
+        assert out["soft_mean"] == pytest.approx(1.0, abs=1e-6)
+        assert out["soft_matched"] == 1.0
+
+
+def test_soft_matching_is_symmetric():
+    """Solved over the matrix and over its transpose, the same numbers.
+    Building b.T @ a separately would round differently from a.T @ b, which
+    tests the matrix product and not the matching."""
+    from stitch.compare import scores_soft_similarity
+    scores = unit(16, 30, seed=0).T @ unit(16, 22, seed=1)
+    forward = scores_soft_similarity(scores)
+    backward = scores_soft_similarity(scores.T.contiguous())
+    assert forward["soft_mean"] == pytest.approx(backward["soft_mean"], abs=1e-12)
+    assert forward["soft_features"] == backward["soft_features"] == 52
+
+
+def test_soft_matching_does_not_depend_on_order():
+    """The same scores with their columns reordered. Reordering the
+    directions and rebuilding the product would round differently."""
+    from stitch.compare import scores_soft_similarity
+    scores = unit(16, 30, seed=0).T @ unit(16, 25, seed=1)
+    order = torch.randperm(25, generator=torch.Generator().manual_seed(5))
+    assert scores_soft_similarity(scores)["soft_mean"] == pytest.approx(
+        scores_soft_similarity(scores[:, order].contiguous())["soft_mean"], abs=1e-12)
+
+
+def test_soft_matching_never_beats_the_best_match():
+    """Every feature's score is a weighted average of its scores, which is
+    never above its best one."""
+    from stitch.compare import soft_similarity
+    a, b = unit(16, 30, seed=0), unit(16, 24, seed=1)
+    best = similarity(a, b)
+    assert soft_similarity(a, b)["soft_mean"] <= min(best["mean_a_to_b"],
+                                                     best["mean_b_to_a"]) + 1e-9
+
+
+def test_every_feature_score_averages_to_the_soft_matching_score():
+    """Over either side alone the per-feature scores average to the score, so
+    the distribution over both sides has the score as its mean."""
+    from stitch.compare import bin_centres, soft_similarity
+    a, b = unit(16, 30, seed=0), unit(16, 24, seed=1)
+    out = soft_similarity(a, b, keep_distribution=True)
+    centres = torch.tensor(bin_centres())
+    shape = torch.tensor(out["soft_histogram"])
+    assert float((centres * shape).sum()) == pytest.approx(out["soft_mean"], abs=0.01)
+    assert sum(out["soft_histogram"]) == pytest.approx(1.0)
+
+
+def test_a_soft_matching_that_is_not_shown_optimal_raises(monkeypatch):
+    import stitch.compare as compare
+    monkeypatch.setattr(compare, "SOFT_ITERATIONS", 1)
+    scores = unit(16, 60, seed=0).T @ unit(16, 50, seed=1)
+    with pytest.warns(UserWarning), pytest.raises(RuntimeError, match="optimality"):
+        compare.soft_plan(scores)
+
+
+def test_the_soft_plan_leaves_the_scores_alone():
+    from stitch.compare import soft_plan
+    for dtype in (torch.float32, torch.float64):
+        scores = (unit(16, 20, seed=0).T @ unit(16, 18, seed=1)).to(dtype)
+        kept = scores.clone()
+        soft_plan(scores)
+        assert torch.equal(scores, kept)
+
+
+def test_an_empty_dictionary_raises_for_soft_matching():
+    from stitch.compare import scores_soft_similarity, soft_similarity
+    with pytest.raises(ValueError, match="empty"):
+        scores_soft_similarity(torch.empty(0, 4))
+    with pytest.raises(ValueError, match="empty"):
+        soft_similarity(unit(8, 4), torch.empty(8, 0))
+
+
+def test_mismatched_widths_raise_for_soft_matching():
+    from stitch.compare import soft_similarity
+    with pytest.raises(ValueError, match="different widths"):
+        soft_similarity(unit(16, 8), unit(12, 8))
+
+
+def test_the_random_floor_carries_soft_matching_when_asked():
+    out = random_baseline(32, 40, trials=2, soft=True, keep_distribution=True)
+    assert 0.0 < out["soft_mean"] < out["mean"]
+    assert sum(out["soft_histogram"]) == pytest.approx(1.0)
+    assert not any(key.startswith("soft_") for key in random_baseline(32, 40, trials=1))
+
+
+def test_the_soft_floor_leaves_every_other_floor_number_alone():
+    plain = random_baseline(32, 40, trials=2, assign=True, keep_distribution=True)
+    soft = random_baseline(32, 40, trials=2, assign=True, keep_distribution=True,
+                           soft=True)
+    for key, value in plain.items():
+        assert soft[key] == value
+
+
+def test_the_soft_floor_at_equal_sizes_is_the_one_to_one_floor():
+    out = random_baseline(32, 40, trials=2, assign=True, soft=True)
+    assert out["soft_mean"] == pytest.approx(out["assigned_mean"], abs=1e-6)
+
+
+def test_a_comparison_soft_matches_both_sides_when_asked(tmp_path):
+    from stitch.compare import soft_similarity
+    decoder_a, decoder_b = unit(16, 32, seed=0), unit(16, 32, seed=1)
+    encoder_a, encoder_b = unit(16, 32, seed=2), unit(16, 32, seed=3)
+    a = write_run(tmp_path / "case1-main-x16-topk-s0-aaaaaa", decoder_a,
+                  encoder=encoder_a.T.clone())
+    b = write_run(tmp_path / "case1-main-x16-topk-s1-bbbbbb", decoder_b,
+                  encoder=encoder_b.T.clone())
+    record = compare_runs(a, b, soft=True)
+    # Loading normalises the directions again in single precision, so the two
+    # agree to that precision.
+    assert record["soft_mean"] == pytest.approx(
+        soft_similarity(decoder_a, decoder_b)["soft_mean"], abs=1e-6)
+    assert record["encoder_soft_mean"] == pytest.approx(
+        soft_similarity(encoder_a, encoder_b)["soft_mean"], abs=1e-6)
+    assert not any("soft" in key for key in compare_runs(a, b))
+
+
+def test_soft_matching_drops_dead_features_first(tmp_path):
+    """The weight readings compare live features only, so a run with dead
+    features is soft matched at the live size, which is then unequal."""
+    silence = torch.zeros(32, dtype=torch.long)
+    silence[:4] = 10 ** 9
+    a = write_run(tmp_path / "case1-main-x16-topk-s0-aaaaaa", unit(16, 32, seed=0),
+                  silence=silence)
+    b = write_run(tmp_path / "case1-main-x16-topk-s1-bbbbbb", unit(16, 32, seed=1))
+    record = compare_runs(a, b, soft=True)
+    assert record["soft_features"] == record["a_kept"] + record["b_kept"]
+    assert record["a_kept"] < record["b_kept"]
+
+
+def test_the_soft_distributions_are_not_written_out(tmp_path):
+    import json
+    a = write_run(tmp_path / "case1-main-x16-topk-s0-aaaaaa", unit(16, 32, seed=0))
+    b = write_run(tmp_path / "case1-main-x16-topk-s1-bbbbbb", unit(16, 32, seed=1))
+    records = [compare_runs(a, b, keep_distribution=True, soft=True)]
+    out = tmp_path / "comparison.json"
+    write_comparison(records, summarise(records), out)
+    written = json.loads(out.read_text())["pairs"][0]
+    assert "soft_histogram" not in written and "encoder_soft_histogram" not in written
+    assert "soft_mean" in written and "encoder_soft_mean" in written
+
+
+def test_a_firing_comparison_soft_matches_the_correlations_and_the_floor(tmp_path):
+    from stitch.compare import compare_firing
+    a = runnable(tmp_path / "a", seed=0)
+    b = runnable(tmp_path / "b", seed=1)
+    record = compare_firing(a, b, activation_stream(), "A@add_12", tokens=640,
+                            soft=True)
+    for key in ("firing_soft_mean", "firing_null_soft_mean"):
+        assert key in record
+    # Both coders keep every feature on the firing reading, so the sizes are
+    # equal and the score is the one-to-one pairing's.
+    assert record["firing_soft_mean"] == pytest.approx(
+        record["firing_assigned_mean"], abs=1e-6)
+    assert record["firing_null_soft_mean"] == pytest.approx(
+        record["firing_null_assigned_mean"], abs=1e-6)
+    plain = compare_firing(a, b, activation_stream(), "A@add_12", tokens=640)
+    assert not any("soft" in key for key in plain)
+
+
+def test_a_coder_soft_matches_its_own_copy_perfectly_on_firing(tmp_path):
+    import shutil
+    from stitch.compare import compare_firing
+    a = runnable(tmp_path / "a", seed=0)
+    shutil.copytree(a, tmp_path / "b")
+    record = compare_firing(a, tmp_path / "b", activation_stream(), "A@add_12",
+                            tokens=640, null=False, soft=True)
+    assert record["firing_soft_mean"] == pytest.approx(
+        record["firing_assigned_mean"], abs=1e-6)
